@@ -54,6 +54,7 @@ import {
   COARSE_POINTER_GLYPH_BOX_CLASS,
   COARSE_POINTER_ICON_SIZE_CLASS,
   COARSE_POINTER_ROW_ACTION_SIZE_CLASS,
+  COARSE_POINTER_TEXT_SM_CLASS,
 } from "@bb/shared-ui/coarse-pointer-sizing";
 import {
   SIDEBAR_HOVER_ACTIONS_CLASS,
@@ -64,6 +65,8 @@ import {
 } from "@/components/ui/sidebar-hover-actions.js";
 import {
   getCollapsedChildActivity,
+  isBusyThread,
+  isUnreadDoneThread,
   NO_COLLAPSED_CHILD_ACTIVITY,
   type CollapsedChildActivity,
 } from "@/lib/thread-activity";
@@ -1909,11 +1912,30 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
       ? threadListState.threads
       : EMPTY_PROJECT_THREADS;
   const draftThreadIds = usePromptDraftInputThreadIds(projectThreads);
-  const rootItems = useMemo(
+  const [isExpanded, setIsExpanded] = useState(false);
+  const allRootItems = useMemo(
     () =>
       buildProjectThreadGroups(projectThreads, compareThreads, draftThreadIds),
     [compareThreads, draftThreadIds, projectThreads],
   );
+  const limitedRootItems = useMemo(() => {
+    if (allRootItems.length <= 5) {
+      return allRootItems;
+    }
+
+    const extraItems = allRootItems.slice(5).filter((item) => {
+      const descendants = getProjectThreadItemDescendants([item]);
+      return (
+        descendants.some(isBusyThread) ||
+        descendants.some(isUnreadDoneThread) ||
+        (selectedThreadId !== undefined &&
+          projectThreadItemContainsThread(item, selectedThreadId))
+      );
+    });
+    return [...allRootItems.slice(0, 5), ...extraItems];
+  }, [allRootItems, selectedThreadId]);
+  const rootItems = isExpanded ? allRootItems : limitedRootItems;
+  const hasAdditionalItems = limitedRootItems.length < allRootItems.length;
 
   if (threadListState.status === "loading") {
     return <ThreadTreeLoadingSkeleton />;
@@ -1948,19 +1970,36 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
   // Per-project trees never contain section items or enable section drag-and-drop;
   // sections live only in the cross-project Sections view below.
   return (
-    <SectionThreadTreeItems
-      items={rootItems}
-      sectionDnd={null}
-      variant={variant}
-      projectId={projectId}
-      sortableParentKey={projectId}
-      selectedThreadId={selectedThreadId}
-      collapsedThreadIds={collapsedThreadIds}
-      collapsedEnvironmentIds={collapsedEnvironmentIds}
-      onProjectSelect={onProjectSelect}
-      onToggleThreadCollapsed={onToggleThreadCollapsed}
-      onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
-    />
+    <>
+      <SectionThreadTreeItems
+        items={rootItems}
+        sectionDnd={null}
+        variant={variant}
+        projectId={projectId}
+        sortableParentKey={projectId}
+        selectedThreadId={selectedThreadId}
+        collapsedThreadIds={collapsedThreadIds}
+        collapsedEnvironmentIds={collapsedEnvironmentIds}
+        onProjectSelect={onProjectSelect}
+        onToggleThreadCollapsed={onToggleThreadCollapsed}
+        onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
+      />
+      {hasAdditionalItems ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-expanded={isExpanded}
+          onClick={() => setIsExpanded((expanded) => !expanded)}
+          className={cn(
+            "mt-0.5 w-full justify-start px-2 text-subtle-foreground",
+            COARSE_POINTER_TEXT_SM_CLASS,
+          )}
+        >
+          {isExpanded ? "Show less" : "Show more"}
+        </Button>
+      ) : null}
+    </>
   );
 });
 
