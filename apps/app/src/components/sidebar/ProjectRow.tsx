@@ -1895,6 +1895,22 @@ function SectionThreadTreeItems({
   );
 }
 
+const THREAD_ITEMS_ATTENTION_LIMIT = 5;
+const THREAD_ITEMS_EXPAND_SIZE = 10;
+
+function isAttentionProjectThreadItem(
+  item: ProjectThreadItem,
+  selectedThreadId: string | undefined,
+): boolean {
+  const descendants = getProjectThreadItemDescendants([item]);
+  return (
+    descendants.some(isBusyThread) ||
+    descendants.some(isUnreadDoneThread) ||
+    (selectedThreadId !== undefined &&
+      projectThreadItemContainsThread(item, selectedThreadId))
+  );
+}
+
 export const ProjectThreadTree = memo(function ProjectThreadTree({
   projectId,
   threadListState,
@@ -1912,30 +1928,34 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
       ? threadListState.threads
       : EMPTY_PROJECT_THREADS;
   const draftThreadIds = usePromptDraftInputThreadIds(projectThreads);
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [extraVisibleCount, setExtraVisibleCount] = useState(0);
   const allRootItems = useMemo(
     () =>
       buildProjectThreadGroups(projectThreads, compareThreads, draftThreadIds),
     [compareThreads, draftThreadIds, projectThreads],
   );
-  const limitedRootItems = useMemo(() => {
-    if (allRootItems.length <= 5) {
-      return allRootItems;
-    }
-
-    const extraItems = allRootItems.slice(5).filter((item) => {
-      const descendants = getProjectThreadItemDescendants([item]);
-      return (
-        descendants.some(isBusyThread) ||
-        descendants.some(isUnreadDoneThread) ||
-        (selectedThreadId !== undefined &&
-          projectThreadItemContainsThread(item, selectedThreadId))
-      );
+  const { items: rootItems, hasHiddenItems: hasMoreItems } = useMemo(() => {
+    const items: ProjectThreadItem[] = [];
+    let extraSlots = extraVisibleCount;
+    let hasHiddenItems = false;
+    allRootItems.forEach((item, index) => {
+      if (index < THREAD_ITEMS_ATTENTION_LIMIT) {
+        items.push(item);
+        return;
+      }
+      const isAttention = isAttentionProjectThreadItem(item, selectedThreadId);
+      if (isAttention || extraSlots > 0) {
+        items.push(item);
+        if (!isAttention) {
+          extraSlots -= 1;
+        }
+        return;
+      }
+      hasHiddenItems = true;
     });
-    return [...allRootItems.slice(0, 5), ...extraItems];
-  }, [allRootItems, selectedThreadId]);
-  const rootItems = isExpanded ? allRootItems : limitedRootItems;
-  const hasAdditionalItems = limitedRootItems.length < allRootItems.length;
+    return { items, hasHiddenItems };
+  }, [allRootItems, selectedThreadId, extraVisibleCount]);
+  const isExpanded = extraVisibleCount > 0;
 
   if (threadListState.status === "loading") {
     return <ThreadTreeLoadingSkeleton />;
@@ -1984,20 +2004,44 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
         onToggleThreadCollapsed={onToggleThreadCollapsed}
         onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
       />
-      {hasAdditionalItems ? (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          aria-expanded={isExpanded}
-          onClick={() => setIsExpanded((expanded) => !expanded)}
-          className={cn(
-            "mt-0.5 w-full justify-start px-2 text-subtle-foreground",
-            COARSE_POINTER_TEXT_SM_CLASS,
-          )}
-        >
-          {isExpanded ? "Show less" : "Show more"}
-        </Button>
+      {(hasMoreItems || isExpanded) ? (
+        <div className="mt-0.5 flex items-center justify-between">
+          {hasMoreItems ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              aria-expanded={isExpanded}
+              onClick={() =>
+                setExtraVisibleCount(
+                  (count) => count + THREAD_ITEMS_EXPAND_SIZE,
+                )
+              }
+              className={cn(
+                "justify-start px-2 text-subtle-foreground",
+                COARSE_POINTER_TEXT_SM_CLASS,
+              )}
+            >
+              <Icon name="ChevronDown" />
+              Show more
+            </Button>
+          ) : null}
+          {isExpanded ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setExtraVisibleCount(0)}
+              className={cn(
+                "ml-auto justify-start px-2 text-subtle-foreground",
+                COARSE_POINTER_TEXT_SM_CLASS,
+              )}
+            >
+              <Icon name="ChevronUp" />
+              Collapse
+            </Button>
+          ) : null}
+        </div>
       ) : null}
     </>
   );
