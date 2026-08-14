@@ -138,6 +138,7 @@ function renderProjectRow(
   isActive = false,
   collapsedEnvironmentIds: Set<string> = new Set(),
   isCollapsed = false,
+  selectedThreadId?: string,
 ) {
   const onToggleEnvironmentCollapsed = vi.fn();
   const result = render(
@@ -145,6 +146,7 @@ function renderProjectRow(
       <ProjectRow
         project={makeProject()}
         threadListState={threadListState}
+        selectedThreadId={selectedThreadId}
         isActive={isActive}
         isCollapsed={isCollapsed}
         compareThreads={() => 0}
@@ -523,5 +525,53 @@ describe("ProjectRow interactions", () => {
     await waitFor(() => {
       expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
     });
+  });
+
+  it("keeps ongoing and selected project items visible when collapsed", () => {
+    const threads = Array.from({ length: 8 }, (_, index) => {
+      const thread = makeThread({
+        id: `thr_cap_${index}`,
+        title: `Cap thread ${index}`,
+        titleFallback: `Cap thread ${index}`,
+        createdAt: index,
+        updatedAt: index,
+      });
+      return index === 6
+        ? {
+            ...thread,
+            activity: { ...thread.activity, activeBackgroundAgentCount: 1 },
+          }
+        : thread;
+    });
+    renderProjectRow(
+      vi.fn(),
+      { status: "ready", threads },
+      false,
+      new Set(),
+      false,
+      "thr_cap_7",
+    );
+
+    expect(screen.getByText("Cap thread 0")).not.toBeNull();
+    expect(screen.getByText("Cap thread 4")).not.toBeNull();
+    expect(screen.queryByText("Cap thread 5")).toBeNull();
+    expect(screen.getByText("Cap thread 6")).not.toBeNull();
+    expect(screen.getByText("Cap thread 7")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(screen.getByText("Cap thread 5")).not.toBeNull();
+    expect(screen.getByText("Cap thread 6")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Collapse" })).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByText("Cap thread 5")).toBeNull();
+    expect(screen.getByText("Cap thread 6")).not.toBeNull();
+    expect(screen.getByText("Cap thread 7")).not.toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Show more" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
   });
 });
