@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Button } from "@bb/shared-ui/button";
 import {
   DropdownMenu,
@@ -8,6 +9,9 @@ import {
   DropdownMenuTrigger,
 } from "@bb/shared-ui/dropdown-menu";
 import { Icon } from "@bb/shared-ui/icon";
+import { Input } from "@bb/shared-ui/input";
+import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
+import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import { cn } from "@bb/shared-ui/lib/utils";
 import {
   OPTION_BASE_CLASS_NAME,
@@ -41,6 +45,8 @@ interface ProjectSelectorProps {
   modal?: boolean;
 }
 
+const PROJECT_SEARCH_MIN_OPTIONS = 5;
+
 export function ProjectSelector({
   projects,
   value,
@@ -55,6 +61,16 @@ export function ProjectSelector({
   modal,
 }: ProjectSelectorProps) {
   const disabled = disabledProp || isLoading;
+  const isCompactViewport = useIsCompactViewport();
+  const isPointerCoarse = usePointerCoarse();
+  const [searchQuery, setSearchQuery] = useState("");
+  const showSearch = projects.length > PROJECT_SEARCH_MIN_OPTIONS;
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+  const filteredProjects = showSearch
+    ? projects.filter((project) =>
+        project.name.toLowerCase().includes(normalizedQuery),
+      )
+    : projects;
   const selected = value !== null ? projects.find((p) => p.id === value) : null;
   const fallback = !allowNoProject && !selected ? projects[0] : null;
   const triggerLabel = isLoading
@@ -70,10 +86,16 @@ export function ProjectSelector({
     ? "Creating..."
     : "New project";
   const showActionSeparator =
-    projects.length > 0 && (Boolean(createProjectAction) || allowNoProject);
+    projects.length > 0 && (Boolean(createProject) || allowNoProject);
 
   return (
-    <DropdownMenu defaultOpen={defaultOpen} modal={modal}>
+    <DropdownMenu
+      defaultOpen={defaultOpen}
+      onOpenChange={(open) => {
+        if (open) setSearchQuery("");
+      }}
+      modal={modal}
+    >
       <DropdownMenuTrigger asChild disabled={disabled}>
         <Button
           type="button"
@@ -114,8 +136,36 @@ export function ProjectSelector({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="bottom" className="w-52">
-        <DropdownMenuLabel>Project</DropdownMenuLabel>
-        {projects.map((project) => (
+        {showSearch ? (
+          <div
+            className={cn(
+              "border-b border-border px-1.5 py-1",
+              isCompactViewport ? "-mx-2 -mt-2" : "-mx-1 -mt-1",
+            )}
+          >
+            <div className="relative">
+              <Icon
+                name="Search"
+                className="pointer-events-none absolute left-1.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                autoFocus={!isCompactViewport && !isPointerCoarse}
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape") event.stopPropagation();
+                }}
+                placeholder="Search projects"
+                aria-label="Search projects"
+                className="h-7 border-0 bg-transparent pl-8 pr-2 text-xs shadow-none focus-visible:ring-0"
+              />
+            </div>
+          </div>
+        ) : null}
+        <DropdownMenuLabel className={showSearch ? "pt-2" : undefined}>
+          Project
+        </DropdownMenuLabel>
+        {filteredProjects.map((project) => (
           <DropdownMenuItem
             key={project.id}
             onSelect={() => onChange(project.id)}
@@ -136,6 +186,11 @@ export function ProjectSelector({
             />
           </DropdownMenuItem>
         ))}
+        {showSearch && filteredProjects.length === 0 ? (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
+            No projects found
+          </div>
+        ) : null}
         {showActionSeparator ? <DropdownMenuSeparator /> : null}
         {createProjectAction ? (
           <DropdownMenuItem
