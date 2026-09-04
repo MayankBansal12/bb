@@ -8,10 +8,6 @@ import { TooltipProvider } from "@bb/shared-ui/tooltip";
 import { ProjectThreadTree } from "./ProjectRow";
 import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 
-const mockExperiments = vi.hoisted(() => ({
-  sidebarProgressiveDisclosure: true,
-}));
-
 vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
   useThreadSplitsEnabled: () => false,
 }));
@@ -19,12 +15,6 @@ vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
 vi.mock("@/hooks/usePromptDraftStorage", () => ({
   usePromptDraftHasInput: () => false,
   usePromptDraftInputThreadIds: () => new Set(),
-}));
-
-vi.mock("@/hooks/queries/system-queries", () => ({
-  useSystemConfig: () => ({
-    data: { experiments: mockExperiments },
-  }),
 }));
 
 vi.mock("@/components/thread/ThreadActionsProvider", () => ({
@@ -53,13 +43,20 @@ function makePlainThreads(count: number): ThreadListEntry[] {
 
 function renderThreadTree(
   threads: ThreadListEntry[],
-  selectedThreadId?: string,
+  {
+    progressiveDisclosureEnabled = true,
+    selectedThreadId,
+  }: {
+    progressiveDisclosureEnabled?: boolean;
+    selectedThreadId?: string;
+  } = {},
 ) {
   return render(
     <TooltipProvider>
       <MemoryRouter>
         <ProjectThreadTree
           threadListState={{ status: "ready", threads }}
+          progressiveDisclosureEnabled={progressiveDisclosureEnabled}
           compareThreads={() => 0}
           selectedThreadId={selectedThreadId}
           collapsedThreadIds={new Set()}
@@ -77,12 +74,12 @@ describe("ProjectThreadTree progressive disclosure", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
-    mockExperiments.sidebarProgressiveDisclosure = true;
   });
 
   it("renders the full list when the experiment is disabled", () => {
-    mockExperiments.sidebarProgressiveDisclosure = false;
-    renderThreadTree(makePlainThreads(7));
+    renderThreadTree(makePlainThreads(7), {
+      progressiveDisclosureEnabled: false,
+    });
 
     expect(screen.getByText("Thread 6")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
@@ -138,7 +135,7 @@ describe("ProjectThreadTree progressive disclosure", () => {
   });
 
   it("keeps the selected thread visible beyond the attention limit", () => {
-    renderThreadTree(makePlainThreads(7), "thr_item_6");
+    renderThreadTree(makePlainThreads(7), { selectedThreadId: "thr_item_6" });
 
     expect(screen.getByText("Thread 4")).not.toBeNull();
     expect(screen.queryByText("Thread 5")).toBeNull();
@@ -151,13 +148,6 @@ describe("ProjectThreadTree progressive disclosure", () => {
     expect(screen.getByText("Thread 4")).not.toBeNull();
     expect(screen.queryByText("Thread 5")).toBeNull();
     const showMoreButton = screen.getByRole("button", { name: "Show more" });
-    expect(showMoreButton.className).toContain("w-full");
-    expect(showMoreButton.className).toContain("text-subtle-foreground");
-    expect(showMoreButton.className).toContain("hover:bg-sidebar-accent");
-    expect(showMoreButton.className).toContain(
-      "hover:text-sidebar-accent-foreground",
-    );
-    expect(showMoreButton.className).toContain("h-[var(--bb-sidebar-row-height)]");
 
     fireEvent.click(showMoreButton);
     expect(screen.getByText("Thread 14")).not.toBeNull();

@@ -113,9 +113,9 @@ every window and client sees the same value.
 
 - The `sidebarProgressiveDisclosure` experiment defaults to false.
 - Enable it with `bb settings experiment sidebarProgressiveDisclosure true`.
-- It limits project and machine groups to five recent items, keeps attention
-  items visible, and reveals ten more per **Show more** click. Manual sections
-  and Unorganized are unchanged.
+- In **By project** and **By machine**, it shows the first five groups in the
+  current sort order, keeps attention groups visible, and reveals ten more per
+  **Show more** click. **Manually** is unchanged.
 
 ## Timeline windowing
 

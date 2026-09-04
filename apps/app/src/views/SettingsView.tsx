@@ -1006,7 +1006,7 @@ export function ExperimentsSettingsSection({
 
         <SettingsWithControl
           label={SIDEBAR_PROGRESSIVE_DISCLOSURE_EXPERIMENT_LABEL}
-          description="Show five recent thread groups per project or machine, keep attention items visible, and reveal older groups in batches."
+          description="In By project and By machine, show the first five groups in the current sort order, keep attention groups visible, and reveal ten more per click. Manually is unchanged."
         >
           <Switch
             checked={sidebarProgressiveDisclosureEnabled}

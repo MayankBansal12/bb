@@ -18,7 +18,6 @@ import { PERSONAL_PROJECT_ID, type ThreadListEntry } from "@bb/domain";
 import type { ProjectResponse } from "@bb/server-contract";
 import { NavLink } from "react-router-dom";
 import { useCreateThreadInWorktree } from "@/hooks/useCreateThreadInWorktree";
-import { useSystemConfig } from "@/hooks/queries/system-queries";
 import {
   usePromptDraftHasInput,
   usePromptDraftInputThreadIds,
@@ -157,6 +156,7 @@ export type ProjectThreadListState =
 export interface ProjectRowProps {
   project: ProjectResponse;
   threadListState: ProjectThreadListState;
+  progressiveDisclosureEnabled: boolean;
   selectedThreadId?: string;
   isActive: boolean;
   isCollapsed: boolean;
@@ -180,6 +180,7 @@ export interface ProjectRowProps {
 interface ProjectThreadTreeProps {
   projectId?: string;
   threadListState: ProjectThreadListState;
+  progressiveDisclosureEnabled: boolean;
   compareThreads: ThreadComparator;
   selectedThreadId?: string;
   collapsedThreadIds: Set<string>;
@@ -1856,6 +1857,7 @@ function isAttentionProjectThreadItem(
 export const ProjectThreadTree = memo(function ProjectThreadTree({
   projectId,
   threadListState,
+  progressiveDisclosureEnabled,
   compareThreads,
   selectedThreadId,
   collapsedThreadIds,
@@ -1865,9 +1867,6 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
   onToggleThreadCollapsed,
   onToggleEnvironmentCollapsed,
 }: ProjectThreadTreeProps) {
-  const systemConfigQuery = useSystemConfig();
-  const progressiveDisclosureEnabled =
-    systemConfigQuery.data?.experiments.sidebarProgressiveDisclosure ?? false;
   const projectThreads =
     threadListState.status === "ready"
       ? threadListState.threads
@@ -2261,6 +2260,7 @@ export const ChronologicalSectionThreadSections = memo(
 function ProjectRowComponent({
   project,
   threadListState,
+  progressiveDisclosureEnabled,
   selectedThreadId,
   isCollapsed,
   compareThreads,
@@ -2408,6 +2408,7 @@ function ProjectRowComponent({
           <ProjectThreadTree
             projectId={project.id}
             threadListState={threadListState}
+            progressiveDisclosureEnabled={progressiveDisclosureEnabled}
             selectedThreadId={selectedThreadId}
             collapsedThreadIds={collapsedThreadIds}
             collapsedEnvironmentIds={collapsedEnvironmentIds}
@@ -2501,6 +2502,7 @@ function areProjectRowPropsEqual(
   if (
     prev.project !== next.project ||
     prev.threadListState !== next.threadListState ||
+    prev.progressiveDisclosureEnabled !== next.progressiveDisclosureEnabled ||
     prev.isActive !== next.isActive ||
     prev.isCollapsed !== next.isCollapsed ||
     prev.compareThreads !== next.compareThreads ||
