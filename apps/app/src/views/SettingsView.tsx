@@ -189,10 +189,12 @@ interface ExperimentsSettingsSectionProps {
   changelogPreviewEnabled: boolean;
   editMessagesEnabled: boolean;
   mobileAppEnabled: boolean;
+  sidebarProgressiveDisclosureEnabled: boolean;
   timelineWindowingEnabled: boolean;
   onChangelogPreviewEnabledChange: (enabled: boolean) => void;
   onEditMessagesEnabledChange: (enabled: boolean) => void;
   onMobileAppEnabledChange: (enabled: boolean) => void;
+  onSidebarProgressiveDisclosureEnabledChange: (enabled: boolean) => void;
   onTimelineWindowingEnabledChange: (enabled: boolean) => void;
 }
 
@@ -944,16 +946,20 @@ export function DebugSettingsSection({
 const CHANGELOG_PREVIEW_EXPERIMENT_LABEL = "Changelog preview";
 const EDIT_MESSAGES_EXPERIMENT_LABEL = "Edit messages";
 const MOBILE_APP_EXPERIMENT_LABEL = "Mobile app";
+const SIDEBAR_PROGRESSIVE_DISCLOSURE_EXPERIMENT_LABEL =
+  "Sidebar progressive disclosure";
 const TIMELINE_WINDOWING_EXPERIMENT_LABEL = "Timeline windowing";
 export function ExperimentsSettingsSection({
   changelogPreviewEnabled,
   disabled,
   editMessagesEnabled,
   mobileAppEnabled,
+  sidebarProgressiveDisclosureEnabled,
   timelineWindowingEnabled,
   onChangelogPreviewEnabledChange,
   onEditMessagesEnabledChange,
   onMobileAppEnabledChange,
+  onSidebarProgressiveDisclosureEnabledChange,
   onTimelineWindowingEnabledChange,
 }: ExperimentsSettingsSectionProps) {
   return (
@@ -995,6 +1001,18 @@ export function ExperimentsSettingsSection({
             disabled={disabled}
             onCheckedChange={onMobileAppEnabledChange}
             aria-label={MOBILE_APP_EXPERIMENT_LABEL}
+          />
+        </SettingsWithControl>
+
+        <SettingsWithControl
+          label={SIDEBAR_PROGRESSIVE_DISCLOSURE_EXPERIMENT_LABEL}
+          description="Show five recent thread groups per project or machine, keep attention items visible, and reveal older groups in batches."
+        >
+          <Switch
+            checked={sidebarProgressiveDisclosureEnabled}
+            disabled={disabled}
+            onCheckedChange={onSidebarProgressiveDisclosureEnabledChange}
+            aria-label={SIDEBAR_PROGRESSIVE_DISCLOSURE_EXPERIMENT_LABEL}
           />
         </SettingsWithControl>
 
@@ -1153,6 +1171,15 @@ export function SettingsView() {
           updateExperimentsMutation.mutate({
             ...experiments,
             mobileApp: enabled,
+          })
+        }
+        sidebarProgressiveDisclosureEnabled={
+          experiments.sidebarProgressiveDisclosure
+        }
+        onSidebarProgressiveDisclosureEnabledChange={(enabled) =>
+          updateExperimentsMutation.mutate({
+            ...experiments,
+            sidebarProgressiveDisclosure: enabled,
           })
         }
         timelineWindowingEnabled={experiments.timelineWindowing}

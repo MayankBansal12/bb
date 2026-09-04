@@ -763,6 +763,12 @@ BB releases restorable provider sessions after 30 idle minutes. The daemon
 checks for these sessions every five minutes. Active turns, commands, agents,
 workflows, and monitors keep their sessions loaded.
 
+The `sidebarProgressiveDisclosure` experiment is off by default. When enabled,
+project and machine grouping show five recent thread groups, always retain
+threads waiting for input, busy, unread-finished, and selected threads, and
+reveal ten more groups per **Show more** click. Manual sections and Unorganized are unchanged. Toggle it with
+`bb settings experiment sidebarProgressiveDisclosure <true|false>`.
+
 The `timelineWindowing` experiment is off by default. When enabled, long
 timelines and large expanded timeline details retain stable height-preserving
 wrappers while mounting only rows near their active scrollport. Toggle it with

@@ -18,6 +18,7 @@ import { PERSONAL_PROJECT_ID, type ThreadListEntry } from "@bb/domain";
 import type { ProjectResponse } from "@bb/server-contract";
 import { NavLink } from "react-router-dom";
 import { useCreateThreadInWorktree } from "@/hooks/useCreateThreadInWorktree";
+import { useSystemConfig } from "@/hooks/queries/system-queries";
 import {
   usePromptDraftHasInput,
   usePromptDraftInputThreadIds,
@@ -54,7 +55,7 @@ import {
   COARSE_POINTER_GLYPH_BOX_CLASS,
   COARSE_POINTER_ICON_SIZE_CLASS,
   COARSE_POINTER_ROW_ACTION_SIZE_CLASS,
-  COARSE_POINTER_TEXT_SM_CLASS,
+  COARSE_POINTER_ROW_HEIGHT_CLASS,
 } from "@bb/shared-ui/coarse-pointer-sizing";
 import {
   SIDEBAR_HOVER_ACTIONS_CLASS,
@@ -1843,12 +1844,12 @@ function isAttentionProjectThreadItem(
   item: ProjectThreadItem,
   selectedThreadId: string | undefined,
 ): boolean {
-  const descendants = getProjectThreadItemDescendants([item]);
-  return (
-    descendants.some(isBusyThread) ||
-    descendants.some(isUnreadDoneThread) ||
-    (selectedThreadId !== undefined &&
-      projectThreadItemContainsThread(item, selectedThreadId))
+  return getProjectThreadItemDescendants([item]).some(
+    (thread) =>
+      thread.hasPendingInteraction ||
+      isBusyThread(thread) ||
+      isUnreadDoneThread(thread) ||
+      thread.id === selectedThreadId,
   );
 }
 
@@ -1864,6 +1865,9 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
   onToggleThreadCollapsed,
   onToggleEnvironmentCollapsed,
 }: ProjectThreadTreeProps) {
+  const systemConfigQuery = useSystemConfig();
+  const progressiveDisclosureEnabled =
+    systemConfigQuery.data?.experiments.sidebarProgressiveDisclosure ?? false;
   const projectThreads =
     threadListState.status === "ready"
       ? threadListState.threads
@@ -1875,28 +1879,25 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
       buildProjectThreadGroups(projectThreads, compareThreads, draftThreadIds),
     [compareThreads, draftThreadIds, projectThreads],
   );
-  const { items: rootItems, hasHiddenItems: hasMoreItems } = useMemo(() => {
-    const items: ProjectThreadItem[] = [];
+  const rootItems = useMemo(() => {
+    if (!progressiveDisclosureEnabled) {
+      return allRootItems;
+    }
     let extraSlots = extraVisibleCount;
-    let hasHiddenItems = false;
-    allRootItems.forEach((item, index) => {
-      if (index < THREAD_ITEMS_ATTENTION_LIMIT) {
-        items.push(item);
-        return;
-      }
-      const isAttention = isAttentionProjectThreadItem(item, selectedThreadId);
-      if (isAttention || extraSlots > 0) {
-        items.push(item);
-        if (!isAttention) {
-          extraSlots -= 1;
-        }
-        return;
-      }
-      hasHiddenItems = true;
+    return allRootItems.filter((item, index) => {
+      if (index < THREAD_ITEMS_ATTENTION_LIMIT) return true;
+      if (isAttentionProjectThreadItem(item, selectedThreadId)) return true;
+      if (extraSlots === 0) return false;
+      extraSlots -= 1;
+      return true;
     });
-    return { items, hasHiddenItems };
-  }, [allRootItems, selectedThreadId, extraVisibleCount]);
-  const isExpanded = extraVisibleCount > 0;
+  }, [
+    allRootItems,
+    selectedThreadId,
+    extraVisibleCount,
+    progressiveDisclosureEnabled,
+  ]);
+  const hasMoreItems = rootItems.length < allRootItems.length;
 
   if (threadListState.status === "loading") {
     return <ThreadTreeLoadingSkeleton />;
@@ -1943,44 +1944,22 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
         onToggleThreadCollapsed={onToggleThreadCollapsed}
         onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
       />
-      {(hasMoreItems || isExpanded) ? (
-        <div className="mt-0.5 flex items-center justify-between">
-          {hasMoreItems ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              aria-expanded={isExpanded}
-              onClick={() =>
-                setExtraVisibleCount(
-                  (count) => count + THREAD_ITEMS_EXPAND_SIZE,
-                )
-              }
-              className={cn(
-                "justify-start px-2 text-subtle-foreground",
-                COARSE_POINTER_TEXT_SM_CLASS,
-              )}
-            >
-              <Icon name="ChevronDown" />
-              Show more
-            </Button>
-          ) : null}
-          {isExpanded ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setExtraVisibleCount(0)}
-              className={cn(
-                "ml-auto justify-start px-2 text-subtle-foreground",
-                COARSE_POINTER_TEXT_SM_CLASS,
-              )}
-            >
-              <Icon name="ChevronUp" />
-              Collapse
-            </Button>
-          ) : null}
-        </div>
+      {hasMoreItems ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() =>
+            setExtraVisibleCount((count) => count + THREAD_ITEMS_EXPAND_SIZE)
+          }
+          className={cn(
+            "mt-0.5 w-full justify-start px-2 font-normal text-subtle-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            COARSE_POINTER_ROW_HEIGHT_CLASS,
+          )}
+        >
+          <Icon name="ChevronDown" />
+          Show more
+        </Button>
       ) : null}
     </>
   );

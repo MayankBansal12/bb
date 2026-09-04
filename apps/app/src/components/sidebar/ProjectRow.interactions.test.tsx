@@ -30,6 +30,12 @@ const mockDraftThreadIds = vi.hoisted(() => ({
   current: new Set<string>(),
 }));
 
+vi.mock("@/hooks/queries/system-queries", () => ({
+  useSystemConfig: () => ({
+    data: { experiments: { sidebarProgressiveDisclosure: true } },
+  }),
+}));
+
 vi.mock("@/hooks/useLocalPathPicker", () => ({
   usePathPickerHost: () => ({ hostId: null, hostName: null }),
 }));
@@ -102,10 +108,10 @@ function renderProjectRow(
         <ProjectRow
           project={makeProjectResponse()}
           threadListState={threadListState}
-          selectedThreadId={selectedThreadId}
           isActive={isActive}
           isCollapsed={isCollapsed}
           compareThreads={() => 0}
+          selectedThreadId={selectedThreadId}
           collapsedThreadIds={new Set()}
           collapsedEnvironmentIds={collapsedEnvironmentIds}
           isLocalPathInvalid={false}
@@ -534,16 +540,6 @@ describe("ProjectRow interactions", () => {
     expect(screen.getByText("Cap thread 5")).not.toBeNull();
     expect(screen.getByText("Cap thread 6")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Collapse" })).not.toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
-    expect(screen.queryByText("Cap thread 5")).toBeNull();
-    expect(screen.getByText("Cap thread 6")).not.toBeNull();
-    expect(screen.getByText("Cap thread 7")).not.toBeNull();
-    expect(
-      screen
-        .getByRole("button", { name: "Show more" })
-        .getAttribute("aria-expanded"),
-    ).toBe("false");
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
   });
 });

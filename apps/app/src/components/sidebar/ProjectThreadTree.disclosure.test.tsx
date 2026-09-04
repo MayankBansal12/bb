@@ -4,8 +4,13 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ThreadListEntry } from "@bb/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import { TooltipProvider } from "@bb/shared-ui/tooltip";
 import { ProjectThreadTree } from "./ProjectRow";
-import { makeThreadListEntry } from "@/test/fixtures/thread-list-entries";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
+
+const mockExperiments = vi.hoisted(() => ({
+  sidebarProgressiveDisclosure: true,
+}));
 
 vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
   useThreadSplitsEnabled: () => false,
@@ -14,6 +19,24 @@ vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
 vi.mock("@/hooks/usePromptDraftStorage", () => ({
   usePromptDraftHasInput: () => false,
   usePromptDraftInputThreadIds: () => new Set(),
+}));
+
+vi.mock("@/hooks/queries/system-queries", () => ({
+  useSystemConfig: () => ({
+    data: { experiments: mockExperiments },
+  }),
+}));
+
+vi.mock("@/components/thread/ThreadActionsProvider", () => ({
+  useThreadActions: () => ({
+    renameThread: vi.fn(),
+    requestRename: vi.fn(),
+    requestDelete: vi.fn(),
+    archiveThreadAndChildren: vi.fn(),
+    unarchiveThread: vi.fn(),
+    togglePin: vi.fn(),
+    toggleRead: vi.fn(),
+  }),
 }));
 
 function makePlainThreads(count: number): ThreadListEntry[] {
@@ -33,18 +56,20 @@ function renderThreadTree(
   selectedThreadId?: string,
 ) {
   return render(
-    <MemoryRouter>
-      <ProjectThreadTree
-        threadListState={{ status: "ready", threads }}
-        compareThreads={() => 0}
-        selectedThreadId={selectedThreadId}
-        collapsedThreadIds={new Set()}
-        collapsedEnvironmentIds={new Set()}
-        variant="section"
-        onToggleThreadCollapsed={vi.fn()}
-        onToggleEnvironmentCollapsed={vi.fn()}
-      />
-    </MemoryRouter>,
+    <TooltipProvider>
+      <MemoryRouter>
+        <ProjectThreadTree
+          threadListState={{ status: "ready", threads }}
+          compareThreads={() => 0}
+          selectedThreadId={selectedThreadId}
+          collapsedThreadIds={new Set()}
+          collapsedEnvironmentIds={new Set()}
+          variant="section"
+          onToggleThreadCollapsed={vi.fn()}
+          onToggleEnvironmentCollapsed={vi.fn()}
+        />
+      </MemoryRouter>
+    </TooltipProvider>,
   );
 }
 
@@ -52,6 +77,15 @@ describe("ProjectThreadTree progressive disclosure", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    mockExperiments.sidebarProgressiveDisclosure = true;
+  });
+
+  it("renders the full list when the experiment is disabled", () => {
+    mockExperiments.sidebarProgressiveDisclosure = false;
+    renderThreadTree(makePlainThreads(7));
+
+    expect(screen.getByText("Thread 6")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
   });
 
   it("renders every item without controls when the list fits the attention limit", () => {
@@ -60,7 +94,6 @@ describe("ProjectThreadTree progressive disclosure", () => {
     expect(screen.getByText("Thread 0")).not.toBeNull();
     expect(screen.getByText("Thread 4")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
   });
 
   it("keeps busy threads visible beyond the attention limit", () => {
@@ -68,6 +101,20 @@ describe("ProjectThreadTree progressive disclosure", () => {
     threads[6] = {
       ...threads[6],
       activity: { ...threads[6].activity, activeBackgroundAgentCount: 1 },
+    };
+    renderThreadTree(threads);
+
+    expect(screen.getByText("Thread 4")).not.toBeNull();
+    expect(screen.queryByText("Thread 5")).toBeNull();
+    expect(screen.getByText("Thread 6")).not.toBeNull();
+  });
+
+  it("keeps threads waiting for input visible beyond the attention limit", () => {
+    const threads = makePlainThreads(7);
+    threads[6] = {
+      ...threads[6],
+      hasPendingInteraction: true,
+      runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
     };
     renderThreadTree(threads);
 
@@ -103,13 +150,20 @@ describe("ProjectThreadTree progressive disclosure", () => {
 
     expect(screen.getByText("Thread 4")).not.toBeNull();
     expect(screen.queryByText("Thread 5")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
+    const showMoreButton = screen.getByRole("button", { name: "Show more" });
+    expect(showMoreButton.className).toContain("w-full");
+    expect(showMoreButton.className).toContain("text-subtle-foreground");
+    expect(showMoreButton.className).toContain("hover:bg-sidebar-accent");
+    expect(showMoreButton.className).toContain(
+      "hover:text-sidebar-accent-foreground",
+    );
+    expect(showMoreButton.className).toContain("h-[var(--bb-sidebar-row-height)]");
 
-    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    fireEvent.click(showMoreButton);
     expect(screen.getByText("Thread 14")).not.toBeNull();
     expect(screen.queryByText("Thread 15")).toBeNull();
     expect(screen.getByRole("button", { name: "Show more" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "Collapse" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Show more" }));
     expect(screen.getByText("Thread 16")).not.toBeNull();
@@ -134,18 +188,5 @@ describe("ProjectThreadTree progressive disclosure", () => {
     expect(screen.getByText("Thread 15")).not.toBeNull();
     expect(screen.getByText("Thread 17")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
-  });
-
-  it("collapses back to the attention set", () => {
-    renderThreadTree(makePlainThreads(17));
-
-    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
-    expect(screen.getByText("Thread 14")).not.toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
-    expect(screen.getByText("Thread 4")).not.toBeNull();
-    expect(screen.queryByText("Thread 5")).toBeNull();
-    expect(screen.getByRole("button", { name: "Show more" })).not.toBeNull();
-    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
   });
 });
