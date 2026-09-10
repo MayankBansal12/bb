@@ -1000,6 +1000,7 @@ const ConversationRowContent = memo(function ConversationRowContent({
     return (
       <ConversationMessageContent
         attachments={row.attachments}
+        sentAt={row.startedAt}
         originKind={originKind}
         initiator={row.initiator}
         mentions={row.mentions}
@@ -1052,6 +1053,7 @@ const ConversationRowContent = memo(function ConversationRowContent({
   return (
     <ConversationMessageContent
       attachments={row.attachments}
+      sentAt={row.startedAt}
       id={row.id}
       onAddToChat={onMessageAddToChat}
       onFork={onFork}

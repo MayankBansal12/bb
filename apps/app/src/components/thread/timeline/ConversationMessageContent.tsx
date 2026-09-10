@@ -1,3 +1,4 @@
+import { MessageTimestamp } from "./MessageTimestamp.js";
 import { useMemo, useRef, useState, type CSSProperties } from "react";
 import remend from "remend";
 import type {
@@ -72,6 +73,7 @@ import type { PromptDraftAttachment } from "@bb/client-core";
 import { buildMarkdownMessageLinkRouting } from "@/components/ui/markdown-message-link-routing";
 
 interface ConversationMessageContentBaseProps {
+  sentAt?: number;
   attachments: TimelineConversationAttachments | null;
   onOpenLocalFileLink?: ThreadTimelineLocalFileLinkHandler;
   onOpenPluginPanel?: MarkdownMessageDirectives["openThreadPanel"];
@@ -147,6 +149,7 @@ type ConversationMessageContentProps =
   | ConversationMessageContentAssistantProps;
 
 interface UserConversationMessageProps {
+  sentAt: number | undefined;
   addToChatAttachments: readonly PromptDraftAttachment[];
   attachmentItems: ConversationAttachmentItems;
   originKind: ThreadOriginKind | null;
@@ -175,6 +178,7 @@ interface UserConversationMessageProps {
 }
 
 interface AssistantConversationMessageProps extends AssistantMessageRowIdentity {
+  sentAt: number | undefined;
   addToChatAttachments: readonly PromptDraftAttachment[];
   attachmentItems: ConversationAttachmentItems;
   pluginActions?: readonly ThreadTimelinePluginMessageAction[];
@@ -327,6 +331,7 @@ function buildAddToChatAttachments(
 }
 
 function UserConversationMessage({
+  sentAt,
   addToChatAttachments,
   attachmentItems,
   originKind,
@@ -471,6 +476,7 @@ function UserConversationMessage({
           </div>
           {}
           <MessageActionBar
+            sentAt={sentAt}
             messageText={messageText}
             alignment="end"
             mobileActionDisplay={mobileActionDisplay}
@@ -487,6 +493,7 @@ function UserConversationMessage({
 }
 
 function AssistantConversationMessage({
+  sentAt,
   addToChatAttachments,
   attachmentItems,
   id,
@@ -632,6 +639,7 @@ function AssistantConversationMessage({
       />
       {showActions ? (
         <MessageActionBar
+          sentAt={sentAt}
           messageText={text}
           alignment="start"
           mobileActionDisplay={mobileActionDisplay}
@@ -643,6 +651,10 @@ function AssistantConversationMessage({
           disabled={forkDisabled}
           pluginActions={pluginActions}
         />
+      ) : sentAt !== undefined ? (
+        <div className="mt-1 h-5">
+          <MessageTimestamp at={sentAt} />
+        </div>
       ) : null}
     </div>
   );
@@ -676,6 +688,7 @@ export function ConversationMessageContent(
   if (props.role === "user") {
     return (
       <UserConversationMessage
+        sentAt={props.sentAt}
         addToChatAttachments={addToChatAttachments}
         attachmentItems={attachmentItems}
         originKind={props.originKind}
@@ -707,6 +720,7 @@ export function ConversationMessageContent(
 
   return (
     <AssistantConversationMessage
+      sentAt={props.sentAt}
       addToChatAttachments={addToChatAttachments}
       attachmentItems={attachmentItems}
       id={props.id}

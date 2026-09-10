@@ -1,3 +1,4 @@
+import { MessageTimestamp } from "./MessageTimestamp.js";
 import {
   createContext,
   useCallback,
@@ -54,6 +55,7 @@ function PluginActionIcon({
 }
 
 interface MessageActionBarProps {
+  sentAt?: number;
   messageText: string;
   alignment: "start" | "end";
   mobileActionDisplay: "inline" | "overflow";
@@ -381,6 +383,7 @@ function MessageActionMenuItems({
 }
 
 export function MessageActionBar({
+  sentAt,
   messageText,
   alignment,
   mobileActionDisplay,
@@ -534,12 +537,13 @@ export function MessageActionBar({
     })),
   ];
 
-  if (actions.length === 0) {
+  if (actions.length === 0 && sentAt === undefined) {
     return null;
   }
 
   const rowClass = cn(
     ACTION_ROW_CLASS,
+    sentAt !== undefined && "overflow-visible",
     alignment === "end"
       ? BUBBLE_ALIGN_OFFSET_CLASS
       : cn("left-0", PROSE_ALIGN_INSET_CLASS),
@@ -587,6 +591,11 @@ export function MessageActionBar({
     return (
       <div ref={slotRef} className={cn(slotClass, "h-7")}>
         <div className={rowClass}>
+          {sentAt !== undefined && alignment === "end" ? (
+            <span className="absolute right-full mr-2">
+              <MessageTimestamp at={sentAt} />
+            </span>
+          ) : null}
           {layout.inlineCount > 0 ? (
             <MobileInlineActions
               actions={actions.slice(0, layout.inlineCount)}
@@ -625,6 +634,11 @@ export function MessageActionBar({
               />
             )
           ) : null}
+          {sentAt !== undefined && alignment === "start" ? (
+            <span className="absolute left-full ml-2">
+              <MessageTimestamp at={sentAt} />
+            </span>
+          ) : null}
         </div>
       </div>
     );
@@ -644,6 +658,11 @@ export function MessageActionBar({
         className={cn(slotClass, "h-5 max-md:pointer-coarse:h-7")}
       >
         <div className={rowClass}>
+          {sentAt !== undefined && alignment === "end" ? (
+            <span className="absolute right-full mr-2">
+              <MessageTimestamp at={sentAt} />
+            </span>
+          ) : null}
           {actions.slice(0, layout.inlineCount).map((action) => (
             <DesktopMessageAction
               key={action.key ?? action.label}
@@ -680,7 +699,7 @@ export function MessageActionBar({
               </DropdownMenuContent>
             </DropdownMenu>
           ) : null}
-          {mobileActionDisplay === "overflow" ? (
+          {mobileActionDisplay === "overflow" && actions.length > 0 ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -700,6 +719,11 @@ export function MessageActionBar({
                 <MessageActionMenuItems actions={actions} />
               </DropdownMenuContent>
             </DropdownMenu>
+          ) : null}
+          {sentAt !== undefined && alignment === "start" ? (
+            <span className="absolute left-full ml-2">
+              <MessageTimestamp at={sentAt} />
+            </span>
           ) : null}
         </div>
       </div>
