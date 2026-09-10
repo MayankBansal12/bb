@@ -1,3 +1,4 @@
+import { MessageTimestamp } from "./MessageTimestamp.js";
 import { useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
@@ -47,6 +48,7 @@ function PluginActionIcon({
 }
 
 interface MessageActionBarProps {
+  sentAt?: number;
   messageText: string;
   alignment: "start" | "end";
   mobileActionDisplay: "inline" | "overflow";
@@ -206,6 +208,7 @@ export function findMessageActionTooltipCollisionBoundary(
  * button (e.g. at the depth cap) while leaving copy and add-to-chat usable.
  */
 export function MessageActionBar({
+  sentAt,
   messageText,
   alignment,
   mobileActionDisplay,
@@ -305,6 +308,7 @@ export function MessageActionBar({
   const useMobileOverflowPopover = isCompactViewport && isPointerCoarse;
 
   if (
+    sentAt === undefined &&
     !hasCopy &&
     !onEdit &&
     !hasAddToChat &&
@@ -324,6 +328,9 @@ export function MessageActionBar({
           alignment === "end" ? "justify-end" : "justify-start",
         )}
       >
+        {sentAt !== undefined && alignment === "end" ? (
+          <MessageTimestamp at={sentAt} />
+        ) : null}
         {hasCopy ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -466,7 +473,7 @@ export function MessageActionBar({
             </TooltipContent>
           </Tooltip>
         ))}
-        {mobileActionDisplay === "overflow" ? (
+        {mobileActionDisplay === "overflow" && overflowActions.length > 0 ? (
           useMobileOverflowPopover ? (
             <MobileMessageOverflowPopover
               actions={overflowActions}
@@ -510,6 +517,9 @@ export function MessageActionBar({
               </DropdownMenuContent>
             </DropdownMenu>
           )
+        ) : null}
+        {sentAt !== undefined && alignment === "start" ? (
+          <MessageTimestamp at={sentAt} />
         ) : null}
       </div>
     </TooltipProvider>

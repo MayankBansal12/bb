@@ -1012,6 +1012,7 @@ function ConversationRow({
     return (
       <ConversationMessageContent
         attachments={row.attachments}
+        sentAt={row.startedAt}
         originKind={originKind}
         initiator={row.initiator}
         mentions={row.mentions}
@@ -1068,6 +1069,7 @@ function ConversationRow({
   return (
     <ConversationMessageContent
       attachments={row.attachments}
+      sentAt={row.startedAt}
       id={row.id}
       onAddToChat={onMessageAddToChat}
       onFork={onFork}

@@ -1,3 +1,4 @@
+import { MessageTimestamp } from "./MessageTimestamp.js";
 import { useMemo, useRef, useState, type CSSProperties } from "react";
 import type {
   TimelineConversationAttachments,
@@ -67,6 +68,7 @@ import type { PromptDraftAttachment } from "@/lib/prompt-draft";
 import { buildThreadHostFileContentUrl } from "@/lib/file-content-urls";
 
 interface ConversationMessageContentBaseProps {
+  sentAt?: number;
   attachments: TimelineConversationAttachments | null;
   onOpenLocalFileLink?: ThreadTimelineLocalFileLinkHandler;
   onOpenPluginPanel?: MarkdownMessageDirectives["openThreadPanel"];
@@ -184,6 +186,7 @@ export type ConversationMessageContentProps =
   | ConversationMessageContentAssistantProps;
 
 interface UserConversationMessageProps {
+  sentAt: number | undefined;
   addToChatAttachments: readonly PromptDraftAttachment[];
   attachmentItems: ConversationAttachmentItems;
   originKind: ThreadOriginKind | null;
@@ -209,6 +212,7 @@ interface UserConversationMessageProps {
 }
 
 interface AssistantConversationMessageProps extends AssistantMessageRowIdentity {
+  sentAt: number | undefined;
   addToChatAttachments: readonly PromptDraftAttachment[];
   attachmentItems: ConversationAttachmentItems;
   pluginActions?: readonly ThreadTimelinePluginMessageAction[];
@@ -383,6 +387,7 @@ function buildAddToChatAttachments(
 }
 
 function UserConversationMessage({
+  sentAt,
   addToChatAttachments,
   attachmentItems,
   originKind,
@@ -504,20 +509,24 @@ function UserConversationMessage({
             projectId={projectId}
           />
         </div>
-        {messageText ||
+        {sentAt !== undefined ||
+        messageText ||
         addToChatAttachments.length > 0 ||
         onEdit !== undefined ||
         pluginActions.length > 0 ? (
-          <div className="mt-1 flex justify-end">
-            <MessageActionBar
-              messageText={messageText}
-              alignment="end"
-              mobileActionDisplay={mobileActionDisplay}
-              addToChatAttachments={addToChatAttachments}
-              onAddToChat={onAddToChat}
-              onEdit={onEdit}
-              pluginActions={pluginActions}
-            />
+          <div className="relative mt-1 h-5 max-md:pointer-coarse:h-7">
+            <div className="absolute right-0 top-0 w-max">
+              <MessageActionBar
+                sentAt={sentAt}
+                messageText={messageText}
+                alignment="end"
+                mobileActionDisplay={mobileActionDisplay}
+                addToChatAttachments={addToChatAttachments}
+                onAddToChat={onAddToChat}
+                onEdit={onEdit}
+                pluginActions={pluginActions}
+              />
+            </div>
           </div>
         ) : null}
       </div>
@@ -526,6 +535,7 @@ function UserConversationMessage({
 }
 
 function AssistantConversationMessage({
+  sentAt,
   addToChatAttachments,
   attachmentItems,
   id,
@@ -659,14 +669,7 @@ function AssistantConversationMessage({
         onOpenLocalFileLink={onOpenLocalFileLink}
         projectId={projectId}
       />
-      {showActions ? (
-        /*
-          Message actions. Each button is dropped entirely (not rendered
-          disabled) when its handler is absent — e.g. fork is omitted for a
-          personal-only source with no host to base a worktree fork on.
-          `disabled` greys both fork and side chat together when the thread is at
-          the spawn-depth cap (both spawn a child thread, one guard).
-        */
+      {showActions || sentAt !== undefined ? (
         <div className="relative h-5 max-md:pointer-coarse:h-7">
           <div
             className={cn(
@@ -674,17 +677,23 @@ function AssistantConversationMessage({
               "max-md:pointer-coarse:top-0",
             )}
           >
-            <MessageActionBar
-              messageText={text}
-              alignment="start"
-              mobileActionDisplay={mobileActionDisplay}
-              addToChatAttachments={addToChatAttachments}
-              onAddToChat={onAddToChat}
-              onFork={onFork}
-              onSendToMain={onSendToMain}
-              disabled={forkDisabled}
-              pluginActions={pluginActions}
-            />
+            {showActions ? (
+              <MessageActionBar
+                sentAt={sentAt}
+                messageText={text}
+                alignment="start"
+                mobileActionDisplay={mobileActionDisplay}
+                addToChatAttachments={addToChatAttachments}
+                onAddToChat={onAddToChat}
+                onFork={onFork}
+                onSendToMain={onSendToMain}
+                disabled={forkDisabled}
+                pluginActions={pluginActions}
+              />
+            ) : null}
+            {!showActions && sentAt !== undefined ? (
+              <MessageTimestamp at={sentAt} />
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -720,6 +729,7 @@ export function ConversationMessageContent(
   if (props.role === "user") {
     return (
       <UserConversationMessage
+        sentAt={props.sentAt}
         addToChatAttachments={addToChatAttachments}
         attachmentItems={attachmentItems}
         originKind={props.originKind}
@@ -748,6 +758,7 @@ export function ConversationMessageContent(
 
   return (
     <AssistantConversationMessage
+      sentAt={props.sentAt}
       addToChatAttachments={addToChatAttachments}
       attachmentItems={attachmentItems}
       id={props.id}
