@@ -18,7 +18,7 @@ export type HostObservedChange =
       sourceType: "data-dir";
     };
 
-export type WorkspaceObservedChange = Extract<
+type WorkspaceObservedChange = Extract<
   HostObservedChange,
   { kind: "workspace-status-changed" }
 >;
@@ -89,8 +89,25 @@ export interface WatchDataDirSkillsRootArgs {
   onWatchError: (error: DataDirSkillsWatchError) => void;
 }
 
+export type HostPathWatchChangeType = "create" | "update" | "delete";
+
+export interface HostPathWatchChange {
+  path: string;
+  type: HostPathWatchChangeType;
+}
+
+export interface WatchPathRootArgs {
+  rootPath: string;
+  ignoredPaths: readonly string[];
+  onChange: (changes: readonly HostPathWatchChange[]) => void;
+  onReady: () => void;
+  onRescanRequired: () => void;
+  onWatchError: (error: { rootPath: string; message: string }) => void;
+}
+
 export interface HostWatcher {
   watchWorkspace(args: WatchWorkspaceArgs): () => void | Promise<void>;
+  watchPathRoot?(args: WatchPathRootArgs): () => void | Promise<void>;
   watchThreadStorageRoot(
     args: WatchThreadStorageRootArgs,
   ): () => void | Promise<void>;

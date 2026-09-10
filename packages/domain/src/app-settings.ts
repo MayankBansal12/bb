@@ -1,58 +1,46 @@
 import { z } from "zod";
+import { isValidGitBranchName } from "./git-checkout.js";
 
-/**
- * App-wide server-backed preferences.
- * Client-local settings stay in the frontend localStorage helpers instead.
- */
+export const MANAGED_BRANCH_PREFIX_MAX_LENGTH = 64;
+
+export const DEFAULT_MANAGED_BRANCH_PREFIX = "bb/";
+
+export const managedBranchPrefixSchema = z
+  .string()
+  .max(MANAGED_BRANCH_PREFIX_MAX_LENGTH)
+  .refine((prefix) => isValidGitBranchName(`${prefix}slug-thr_id`), {
+    message: "Prefix must start a valid git branch name",
+  });
+
 export const appSettingsSchema = z
   .object({
-    /**
-     * macOS-only: keep the machine from idle sleeping while bb is running by
-     * asking the local host daemon to hold a caffeinate assertion.
-     */
-    caffeinate: z.boolean(),
-    /** Show shortcut hints after holding Command or Control. */
     showKeyboardHints: z.boolean(),
-    /**
-     * While a thread is running, make Enter steer the active turn and use
-     * Command+Enter to queue a follow-up.
-     */
     steerActiveThreadOnEnter: z.boolean(),
-    /** Show raw provider events that bb does not yet understand. */
-    showUnhandledProviderEvents: z.boolean(),
-    /** Enable Codex's native memory recall and generation for bb threads. */
-    codexMemoryEnabled: z.boolean(),
-    /** Enable Claude Code's native auto-memory reads and writes for bb threads. */
-    claudeCodeMemoryEnabled: z.boolean(),
-    /** Prevent Codex from exposing its native multi-agent tools to bb threads. */
-    codexSubagentsDisabled: z.boolean(),
-    /** Prevent Claude Code from exposing its native Task tool to bb threads. */
-    claudeCodeSubagentsDisabled: z.boolean(),
-    /** Prevent Claude Code from exposing its native Workflow tool. */
-    claudeCodeWorkflowsDisabled: z.boolean(),
-    /**
-     * ISO timestamp of when first-run onboarding last finished or was
-     * dismissed; null means it has never run. A timestamp rather than a boolean
-     * so we also know *when*, and so "never ran" has an honest value.
-     *
-     * Deliberately not a proxy for "is bb set up": whether an agent is usable is
-     * answered live by `provider.usage`, so dismissing onboarding never claims
-     * the machine is configured. Setting this back to null re-triggers the flow.
-     */
-    onboardingCompletedAt: z.string().nullable(),
+    showDiagnosticEvents: z.boolean(),
+    providerOrder: z.array(z.string().min(1)),
+    defaultProviderId: z.string().min(1).nullable(),
+    streamerMode: z.boolean(),
+    managedBranchPrefix: managedBranchPrefixSchema,
   })
   .strict();
 export type AppSettings = z.infer<typeof appSettingsSchema>;
 
 export const defaultAppSettings: AppSettings = {
-  caffeinate: false,
   showKeyboardHints: true,
-  steerActiveThreadOnEnter: false,
-  showUnhandledProviderEvents: false,
-  codexMemoryEnabled: true,
-  claudeCodeMemoryEnabled: true,
-  codexSubagentsDisabled: false,
-  claudeCodeSubagentsDisabled: false,
-  claudeCodeWorkflowsDisabled: false,
-  onboardingCompletedAt: null,
+  steerActiveThreadOnEnter: true,
+  showDiagnosticEvents: false,
+  providerOrder: [],
+  defaultProviderId: null,
+  streamerMode: false,
+  managedBranchPrefix: DEFAULT_MANAGED_BRANCH_PREFIX,
 };
+
+export const appSettingsUpdateSchema = z.union([
+  appSettingsSchema.extend({
+    showUnhandledProviderEvents: z.boolean().optional(),
+  }),
+  appSettingsSchema.omit({ showDiagnosticEvents: true }).extend({
+    showUnhandledProviderEvents: z.boolean(),
+  }),
+]);
+export type AppSettingsUpdate = z.infer<typeof appSettingsUpdateSchema>;

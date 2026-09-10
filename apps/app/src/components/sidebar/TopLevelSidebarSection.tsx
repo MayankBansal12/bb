@@ -2,6 +2,7 @@ import {
   useCallback,
   type CSSProperties,
   type KeyboardEventHandler,
+  type MouseEvent,
   type MouseEventHandler,
   type PointerEventHandler,
   type ReactNode,
@@ -9,7 +10,7 @@ import {
 import { cn } from "@bb/shared-ui/lib/utils";
 import { Icon } from "@bb/shared-ui/icon";
 import { LIST_HOVER_TRANSITION } from "@bb/shared-ui/motion";
-import { CHROME_SECTION_LABEL_CLASS } from "@/components/ui/chromeStyleTokens";
+import { CHROME_SECTION_LABEL_CLASS } from "@bb/shared-ui/chrome-style-tokens";
 import {
   SidebarStickyGroup,
   SidebarStickyTier,
@@ -24,18 +25,26 @@ import {
 import type { ConsumeDragClickSuppression } from "@/components/ui/use-drag-click-suppression";
 import { SIDEBAR_STANDARD_ROW_PADDING_CLASS } from "./sidebarRowClasses";
 import type { SidebarSortableDragBindings } from "./sortableMotion";
-import type { CollapsedChildActivity } from "@/lib/thread-activity";
+import {
+  NO_COLLAPSED_CHILD_ACTIVITY,
+  type CollapsedChildActivity,
+} from "@bb/client-core";
 import { CollapsedThreadStatusGlyph } from "./ThreadRow";
-import { useThreadSplitsEnabled } from "@/hooks/useThreadSplitsEnabled";
 import {
   useThreadGroupSplitIndicator,
   type ThreadSplitIndicatorTarget,
 } from "./paneContentSplitIndicator";
 import { SplitPaneMiniMap } from "./SplitPaneMiniMap";
+import { COARSE_POINTER_ROW_ACTION_SIZE_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
+import { usePluginThreadRowStatusForThreads } from "@/lib/plugin-thread-row-status";
 
 const EMPTY_SPLIT_INDICATOR_THREADS: readonly ThreadSplitIndicatorTarget[] = [];
 
-export interface TopLevelSidebarSectionCollapseControl {
+function stopActionsClick(event: MouseEvent<HTMLSpanElement>) {
+  event.stopPropagation();
+}
+
+interface TopLevelSidebarSectionCollapseControl {
   isCollapsed: boolean;
   onToggleCollapsed: () => void;
 }
@@ -43,6 +52,7 @@ export interface TopLevelSidebarSectionCollapseControl {
 export interface TopLevelSidebarSectionProps {
   label: string;
   children: ReactNode;
+  sectionId?: string;
   actions?: ReactNode;
   actionsAlwaysVisible?: boolean;
   actionsMobileAlways?: boolean;
@@ -57,13 +67,10 @@ export interface TopLevelSidebarSectionProps {
   isDropTargetActive?: boolean;
 }
 
-/**
- * The single visual and interaction contract for every first-level sidebar
- * group: built-in sections, projects, sections, and machine groups.
- */
 export function TopLevelSidebarSection({
   label,
   children,
+  sectionId,
   actions,
   actionsAlwaysVisible = false,
   actionsMobileAlways = false,
@@ -77,11 +84,42 @@ export function TopLevelSidebarSection({
   consumeClickSuppression,
   isDropTargetActive = false,
 }: TopLevelSidebarSectionProps) {
-  const threadSplitsEnabled = useThreadSplitsEnabled();
   const collapsedSplitIndicator = useThreadGroupSplitIndicator(
     collapsedThreads,
-    threadSplitsEnabled && collapseControl?.isCollapsed === true,
+    collapseControl?.isCollapsed === true,
   );
+  const pluginStatus = usePluginThreadRowStatusForThreads(collapsedThreads);
+  const showCollapsedActivity =
+    collapseControl?.isCollapsed === true &&
+    (collapsedSplitIndicator.miniMap !== null ||
+      collapsedActivity !== undefined ||
+      pluginStatus !== null);
+  const collapsedActivityIndicator = showCollapsedActivity ? (
+    <span
+      data-sidebar-collapsed-activity-edge=""
+      data-sidebar-hover-actions-open={actionsOpen ? "true" : undefined}
+      className={cn(
+        "pointer-events-none absolute right-0 top-1/2 z-20 inline-flex -translate-y-1/2 items-center justify-center text-subtle-foreground max-md:static max-md:shrink-0 max-md:translate-y-0",
+        COARSE_POINTER_ROW_ACTION_SIZE_CLASS,
+        actions && SIDEBAR_HOVER_ACTIONS_FADE_CLASS,
+      )}
+    >
+      {collapsedSplitIndicator.miniMap ? (
+        <SplitPaneMiniMap
+          slots={collapsedSplitIndicator.miniMap}
+          label={`${label} — contains a thread open in split`}
+          isWorking={
+            collapsedActivity?.working || pluginStatus?.tone === "running"
+          }
+        />
+      ) : collapsedActivity || pluginStatus ? (
+        <CollapsedThreadStatusGlyph
+          activity={collapsedActivity ?? NO_COLLAPSED_CHILD_ACTIVITY}
+          pluginStatus={pluginStatus}
+        />
+      ) : null}
+    </span>
+  ) : null;
   const handleClickCapture = useCallback<MouseEventHandler<HTMLDivElement>>(
     (event) => {
       if (!consumeClickSuppression?.()) {
@@ -102,12 +140,6 @@ export function TopLevelSidebarSection({
     },
     [collapseControl],
   );
-  const stopActionsClick = useCallback<MouseEventHandler<HTMLSpanElement>>(
-    (event) => {
-      event.stopPropagation();
-    },
-    [],
-  );
   const stopCollapseControlPointerDown = useCallback<
     PointerEventHandler<HTMLButtonElement>
   >((event) => {
@@ -123,6 +155,7 @@ export function TopLevelSidebarSection({
     <SidebarStickyGroup
       ref={sectionRef}
       style={sectionStyle}
+      data-sidebar-section-id={sectionId}
       className={cn(
         "group/sidebar-section min-w-0 rounded-md transition-colors",
         isDropTargetActive && "bg-sidebar-accent/60",
@@ -178,47 +211,32 @@ export function TopLevelSidebarSection({
             </button>
           ) : null}
         </span>
-        {collapseControl?.isCollapsed &&
-        (collapsedSplitIndicator.miniMap !== null || collapsedActivity) ? (
+        {actions || collapsedActivityIndicator ? (
           <span
-            data-sidebar-collapsed-activity-edge=""
-            data-sidebar-hover-actions-open={actionsOpen ? "true" : undefined}
-            className={cn(
-              "pointer-events-none absolute right-1 top-1/2 z-20 inline-flex -translate-y-1/2 items-center text-subtle-foreground max-md:pointer-coarse:relative max-md:pointer-coarse:right-auto max-md:pointer-coarse:top-auto max-md:pointer-coarse:shrink-0 max-md:pointer-coarse:translate-y-0",
-              actions && SIDEBAR_HOVER_ACTIONS_FADE_CLASS,
-            )}
-          >
-            {collapsedSplitIndicator.miniMap ? (
-              <SplitPaneMiniMap
-                slots={collapsedSplitIndicator.miniMap}
-                label={`${label} — contains a thread open in split`}
-                isWorking={collapsedActivity?.working}
-              />
-            ) : collapsedActivity ? (
-              <CollapsedThreadStatusGlyph activity={collapsedActivity} />
-            ) : null}
-          </span>
-        ) : null}
-        {actions ? (
-          <span
+            data-sidebar-trailing-controls=""
             className="relative z-20 inline-flex h-6 shrink-0 items-center"
-            onClick={stopActionsClick}
+            onClick={actions ? stopActionsClick : undefined}
           >
-            <span
-              data-sidebar-hover-actions-open={actionsOpen ? "true" : undefined}
-              data-sidebar-hover-actions-mobile={
-                actionsMobileAlways
-                  ? SIDEBAR_HOVER_ACTIONS_MOBILE_ALWAYS_VALUE
-                  : undefined
-              }
-              className={cn(
-                "inline-flex shrink-0 items-center",
-                SIDEBAR_HOVER_ACTIONS_GAP_CLASS,
-                !actionsAlwaysVisible && SIDEBAR_HOVER_ACTIONS_CLASS,
-              )}
-            >
-              {actions}
-            </span>
+            {collapsedActivityIndicator}
+            {actions ? (
+              <span
+                data-sidebar-hover-actions-open={
+                  actionsOpen ? "true" : undefined
+                }
+                data-sidebar-hover-actions-mobile={
+                  actionsMobileAlways
+                    ? SIDEBAR_HOVER_ACTIONS_MOBILE_ALWAYS_VALUE
+                    : undefined
+                }
+                className={cn(
+                  "inline-flex shrink-0 items-center",
+                  SIDEBAR_HOVER_ACTIONS_GAP_CLASS,
+                  !actionsAlwaysVisible && SIDEBAR_HOVER_ACTIONS_CLASS,
+                )}
+              >
+                {actions}
+              </span>
+            ) : null}
           </span>
         ) : null}
       </SidebarStickyTier>

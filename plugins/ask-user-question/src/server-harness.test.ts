@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
   type FakePluginHost,
-} from "@bb/plugin-sdk/testing";
-import type { PluginAgentConfigurationContext } from "@bb/plugin-sdk";
+  makePluginAgentConfigurationContext,
+} from "@get-bb/plugin-sdk/testing";
 import plugin, { RENDERER_ID, TOOL_NAME } from "./server.js";
 import { TOOL_INPUT_JSON_SCHEMA } from "./tool-definition.js";
 import type { InteractionPayload, ToolResult } from "./contracts.js";
@@ -16,31 +16,14 @@ function createHost(): FakePluginHost {
 
 function configurationContext(
   providerId: string,
-): PluginAgentConfigurationContext {
-  return {
-    thread: {
-      id: "thr-test",
-      title: null,
-      parentThreadId: null,
-      sourceThreadId: null,
+  supportsNativeUserQuestion = false,
+) {
+  return makePluginAgentConfigurationContext({
+    provider: {
+      id: providerId,
+      capabilities: { supportsNativeUserQuestion },
     },
-    project: {
-      id: "proj-test",
-      kind: "standard",
-      name: "bb",
-      gitRemoteUrl: null,
-    },
-    environment: {
-      id: "env-test",
-      name: null,
-      path: null,
-      workspaceProvisionType: "unmanaged",
-      branchName: null,
-    },
-    host: { id: "host-test", name: "local" },
-    provider: { id: providerId, model: "test-model" },
-    origin: { kind: null, pluginId: null },
-  };
+  });
 }
 
 const questions = [
@@ -69,13 +52,16 @@ async function resultText(
 }
 
 describe("provider gating", () => {
-  it("withholds the tool from claude-code, which has it natively", async () => {
-    const host = createHost();
-    const resolved = await host.harness.resolveAgentConfiguration(
-      configurationContext("claude-code"),
-    );
-    expect(resolved.tools).toEqual([]);
-  });
+  it.each(["claude-code", "some-plugin-provider"])(
+    "withholds the tool from %s, which declares it natively",
+    async (providerId) => {
+      const host = createHost();
+      const resolved = await host.harness.resolveAgentConfiguration(
+        configurationContext(providerId, true),
+      );
+      expect(resolved.tools).toEqual([]);
+    },
+  );
 
   it.each(["codex", "pi", "acp-cursor"])(
     "registers the tool for %s with Claude's exact advertised schema",
@@ -87,8 +73,6 @@ describe("provider gating", () => {
       expect(resolved.tools).toHaveLength(1);
       const [tool] = resolved.tools;
       expect(tool?.name).toBe(TOOL_NAME);
-      // The advertised schema is the hand-written mirror of Claude's, not the
-      // zod-derived one — that is the whole point of the override.
       expect(tool?.inputSchema).toEqual(TOOL_INPUT_JSON_SCHEMA);
     },
   );
@@ -181,9 +165,6 @@ describe("asking a question", () => {
   });
 
   it("explains the collision when a second question races the first", async () => {
-    // A thread holds one interaction at a time; the server rejects the second
-    // with this error. The fake host queues instead of rejecting, so the
-    // server's failure is injected directly.
     const host = createFakePluginHost({ pluginId: "ask-user-question" });
     host.bb.ui.requestInput = () =>
       Promise.reject(

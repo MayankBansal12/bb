@@ -24,8 +24,9 @@ import {
   type WorkspaceOpenTargetsQuery,
 } from "@bb/host-daemon-contract";
 import {
-  listWorkspaceOpenTargets,
-  openPathInTarget,
+  createWorkspaceOpenTargetRuntime,
+  listWorkspaceOpenTargetsWithRuntime,
+  openPathInTargetWithRuntime,
   type OpenPathInTargetArgs,
   WorkspaceOpenTargetError,
 } from "@bb/local-open-targets";
@@ -35,40 +36,25 @@ import { HTTPException } from "hono/http-exception";
 import { isFsErrorWithCode } from "./fs-errors.js";
 import type { HostDaemonLocalApiConfig } from "./local-api-config.js";
 import { resolveHostPlatform } from "./host-platform.js";
+import { userExecutableProcessOptions } from "./user-executable-env.js";
 
-export type WorkspaceOpenTargetListHandler = (
+type WorkspaceOpenTargetListHandler = (
   query: WorkspaceOpenTargetsQuery,
 ) => Promise<WorkspaceOpenTarget[]>;
-export type OpenInTargetHandler = (
-  request: OpenPathInTargetArgs,
-) => Promise<void>;
+type OpenInTargetHandler = (request: OpenPathInTargetArgs) => Promise<void>;
 
-/**
- * Browser-reachable local HTTP API for colocated setups.
- *
- * Route ownership is documented in `@bb/host-daemon-contract/src/local.ts`.
- * Some routes describe the UI/client machine, while others describe the
- * work-host machine. Remote-client support should route work-host operations
- * through the server and connected work host daemon instead of adding them to a
- * client.
- */
-export interface StartLocalApiServerOptions {
+interface StartLocalApiServerOptions {
   dataDir?: string;
   hostId: string;
   localApiConfig: HostDaemonLocalApiConfig;
   serverUrl: string;
-  /** Port the BB server binds on (parsed from `serverUrl` upstream so the
-   * daemon doesn't need to depend on server config). Used to build the CORS
-   * allowlist. */
   serverPort: number;
-  /** Vite dev port for the BB app frontend; allowed origin for CORS when set. */
   devAppPort?: number;
-  /** Optional public app origin (e.g. `https://app.example.com`); allowed
-   * origin for CORS when the frontend is served from a non-localhost domain. */
   appUrl?: string;
   getConnected: () => boolean;
   listWorkspaceOpenTargets?: WorkspaceOpenTargetListHandler;
   openInTarget?: OpenInTargetHandler;
+  shellEnv?: () => NodeJS.ProcessEnv;
 }
 
 export interface LocalApiServer {
@@ -89,8 +75,14 @@ interface ResolveOpenPathInTargetArgs {
 const CLIENT_CONFIG_CACHE_TTL_MS = 1_000;
 const EMPTY_CLIENT_CONFIG: ClientConfig = { servers: {} };
 
-function isNoEntryError(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+function isSelfEvidentLocalHostname(hostname: string): boolean {
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+    return true;
+  }
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return true;
+  }
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname);
 }
 
 function createClientConfigLoader(
@@ -126,7 +118,7 @@ async function readClientConfig(dataDir: string): Promise<ClientConfig> {
       JSON.parse(await fs.readFile(formatClientConfigPath(dataDir), "utf8")),
     );
   } catch (error) {
-    if (!isNoEntryError(error)) {
+    if (!isFsErrorWithCode(error, "ENOENT")) {
       throw error;
     }
     return EMPTY_CLIENT_CONFIG;
@@ -171,7 +163,7 @@ async function resolveOpenPathInTargetArgs({
   if (sshAuthority === null) {
     throw new WorkspaceOpenTargetError({
       code: "remote_mapping_missing",
-      message: `No SSH target configured for host ${request.context.hostId} on ${serverOrigin}. Run: bb-app client ssh-target set ${serverOrigin} <ssh-target>`,
+      message: `No SSH target configured for host ${request.context.hostId} on ${serverOrigin}. Run: bb-app client ssh-target set ${serverOrigin} <ssh-target> --host-id ${request.context.hostId}`,
     });
   }
 
@@ -179,14 +171,18 @@ async function resolveOpenPathInTargetArgs({
     columnNumber: request.columnNumber,
     context: {
       kind: "remote-ssh",
-      serverOrigin,
-      hostId: request.context.hostId,
       sshAuthority,
     },
     lineNumber: request.lineNumber,
     path: request.path,
     targetId: request.targetId,
   };
+}
+
+function workspaceOpenTargetRuntime(options: StartLocalApiServerOptions) {
+  return createWorkspaceOpenTargetRuntime({
+    ...userExecutableProcessOptions(options.shellEnv?.() ?? {}),
+  });
 }
 
 export async function startLocalApiServer(
@@ -208,20 +204,36 @@ export async function startLocalApiServer(
     value: options.devAppPort,
   });
   const allowedCorsOrigins = new Set<string>(buildLocalAppOrigins(originArgs));
+  try {
+    allowedCorsOrigins.add(new URL(options.serverUrl).origin);
+  } catch {}
+  const isAllowedAppOrigin = async (
+    origin: string,
+    requestUrl: string,
+  ): Promise<boolean> => {
+    if (
+      allowedCorsOrigins.has(origin) ||
+      (await isConfiguredClientOrigin(origin, clientConfigLoader))
+    ) {
+      return true;
+    }
+    let originUrl: URL;
+    try {
+      originUrl = new URL(origin);
+    } catch {
+      return false;
+    }
+    return (
+      isSelfEvidentLocalHostname(originUrl.hostname) &&
+      origin === new URL(requestUrl).origin
+    );
+  };
+
   app.use(
     "*",
     cors({
-      origin: async (origin, context) => {
-        const requestOrigin = new URL(context.req.url).origin;
-        if (
-          origin === requestOrigin ||
-          allowedCorsOrigins.has(origin) ||
-          (await isConfiguredClientOrigin(origin, clientConfigLoader))
-        ) {
-          return origin;
-        }
-        return null;
-      },
+      origin: async (origin, context) =>
+        (await isAllowedAppOrigin(origin, context.req.url)) ? origin : null,
     }),
   );
 
@@ -229,8 +241,15 @@ export async function startLocalApiServer(
     c.text(healthResponseSchema.parse(options.localApiConfig.healthValue)),
   );
   app.use("*", async (c, next) => {
-    if (options.localApiConfig.mode === "health-only") {
-      return c.notFound();
+    const origin = c.req.header("origin");
+    if (
+      origin !== undefined &&
+      !(await isAllowedAppOrigin(origin, c.req.url))
+    ) {
+      return c.json(
+        { error: `origin "${origin}" is not a local BB app origin` },
+        403,
+      );
     }
     await next();
   });
@@ -255,14 +274,26 @@ export async function startLocalApiServer(
     async (c, query) =>
       c.json({
         targets: await (
-          options.listWorkspaceOpenTargets ?? listWorkspaceOpenTargets
+          options.listWorkspaceOpenTargets ??
+          ((query) =>
+            listWorkspaceOpenTargetsWithRuntime(
+              workspaceOpenTargetRuntime(options),
+              query,
+            ))
         )(query),
       }),
   );
 
   post("/open-in-target", openInTargetRequestSchema, async (c, payload) => {
     try {
-      await (options.openInTarget ?? openPathInTarget)(
+      await (
+        options.openInTarget ??
+        ((args) =>
+          openPathInTargetWithRuntime(
+            args,
+            workspaceOpenTargetRuntime(options),
+          ))
+      )(
         await resolveOpenPathInTargetArgs({
           configLoader: clientConfigLoader,
           request: payload,

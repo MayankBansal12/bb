@@ -1,10 +1,12 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useMemo } from "react";
+import type { DiffPresentation } from "@/components/code/code-rendering";
 import type { WorkspaceDiffTarget } from "@bb/domain";
 import type { MarkdownLinkRouting } from "@/components/ui/markdown-link-routing.js";
 import { Skeleton } from "@bb/shared-ui/skeleton";
 import { EmptyStatePanel } from "@bb/shared-ui/empty-state";
 import {
   useEnvironmentDiffFiles,
+  useEnvironment,
   useEnvironmentFilePreview,
 } from "@/hooks/queries/environment-queries";
 import { useProjectFilePreview } from "@/hooks/queries/project-queries";
@@ -12,15 +14,19 @@ import {
   useThreadHostFilePreview,
   useThreadStorageFilePreview,
 } from "@/hooks/queries/thread-queries";
+import { useHostFilePreview } from "@/hooks/queries/host-file-preview-query";
 import {
+  buildProjectFileContentUrl,
   buildRawFilesystemHtmlContentUrl,
+  buildThreadHostFileContentUrl,
+  buildThreadStorageRawContentUrl,
   buildThreadWorktreeRawContentUrl,
 } from "@/lib/file-content-urls";
 import type {
   EnvironmentFilePreviewSource,
   FilePreviewLineRange,
   WorkspaceFilePreviewStatusLabel,
-} from "@/lib/file-preview";
+} from "@bb/client-core";
 import { cn } from "@bb/shared-ui/lib/utils";
 import { DiffFilesPanel } from "./git-diff/DiffFilesPanel";
 import { clearDiffFileCardStates } from "./git-diff/diffFilesStore";
@@ -30,20 +36,22 @@ import {
   SecondaryPanelFilePreview,
   ThreadStorageFilePreview,
 } from "./ThreadStorageFilePreview";
+import {
+  buildMarkdownFileImageRouting,
+  buildMarkdownLeaseImageRouting,
+} from "@/components/ui/markdown-file-image-routing";
+import { getAbsoluteDirname } from "@/lib/absolute-file-path";
 
 const GIT_DIFF_SKELETON_FILE_COUNT = 3;
 const PANEL_SCROLL_SLOT_CLASS =
   "min-h-0 flex-1 overflow-x-auto overflow-y-auto";
 
-interface ThreadDiffSkeletonProps {
-  count?: number;
-}
-
-export interface GitDiffTabContentProps {
+interface GitDiffTabContentProps {
   environmentId?: string;
   target: WorkspaceDiffTarget | undefined;
   isDiffPanelActive: boolean;
-  gitDiffViewOptions: Record<string, string | boolean | number>;
+  isPanelOpen: boolean;
+  gitDiffPresentation: DiffPresentation;
   onClearPendingGitDiffIntent?: () => void;
   onOpenFileInEditor?: (path: string) => void;
   onOpenFilePreview?: (path: string) => void;
@@ -52,12 +60,9 @@ export interface GitDiffTabContentProps {
   workspaceRootPath?: string | null;
 }
 
-export interface ThreadInfoTabContentProps {
-  metadataContent: ReactNode;
-}
-
-export interface WorkspaceFilePreviewTabContentProps {
+interface WorkspaceFilePreviewTabContentProps {
   activePath: string;
+  isPanelOpen: boolean;
   copyPath?: string | null;
   environmentId?: string | null;
   lineRange: FilePreviewLineRange | null;
@@ -69,19 +74,24 @@ export interface WorkspaceFilePreviewTabContentProps {
   threadId?: string | null;
 }
 
-export interface ProjectFilePreviewTabContentProps {
+interface ProjectFilePreviewTabContentProps {
   activePath: string;
+  isPanelOpen: boolean;
   copyPath?: string | null;
   environmentId: string | null;
   hostId: string | null;
   lineRange: FilePreviewLineRange | null;
+  markdownLinkRouting?: MarkdownLinkRouting;
   onSelectionAddToChat?: (text: string) => void;
   onOpenInEditor?: (path: string) => void;
   projectId: string;
+  rootPath?: string | null;
+  threadId?: string | null;
 }
 
-export interface HostFilePreviewTabContentProps {
+interface HostFilePreviewTabContentProps {
   activePath: string;
+  isPanelOpen: boolean;
   copyPath: string;
   environmentId?: string | null;
   lineRange: FilePreviewLineRange | null;
@@ -91,8 +101,17 @@ export interface HostFilePreviewTabContentProps {
   threadId: string;
 }
 
-export interface ThreadStorageFilePreviewTabContentProps {
+interface HostScopedFilePreviewTabContentProps {
   activePath: string;
+  hostId: string;
+  isPanelOpen: boolean;
+  lineRange: FilePreviewLineRange | null;
+  onOpenInEditor?: (path: string) => void;
+}
+
+interface ThreadStorageFilePreviewTabContentProps {
+  activePath: string;
+  isPanelOpen: boolean;
   copyPath?: string | null;
   lineRange: FilePreviewLineRange | null;
   markdownLinkRouting?: MarkdownLinkRouting;
@@ -101,12 +120,10 @@ export interface ThreadStorageFilePreviewTabContentProps {
   threadId: string;
 }
 
-function ThreadDiffSkeleton({
-  count = GIT_DIFF_SKELETON_FILE_COUNT,
-}: ThreadDiffSkeletonProps) {
+function ThreadDiffSkeleton() {
   return (
     <div className="space-y-2 pt-2">
-      {Array.from({ length: count }).map((_, index) => (
+      {Array.from({ length: GIT_DIFF_SKELETON_FILE_COUNT }).map((_, index) => (
         <div
           key={`git-diff-skeleton-${index}`}
           className="rounded-lg border border-border bg-surface-raised"
@@ -132,19 +149,12 @@ function ThreadDiffSkeleton({
   );
 }
 
-/**
- * The diff tab body. Fetches the diff's table of contents
- * ({@link useEnvironmentDiffFiles}) and renders it through the virtualized
- * {@link DiffFilesPanel}, which fetches per-file patches on demand as rows
- * scroll into view. Handles the TOC's loading / empty / `not_applicable`
- * (`too_many_files`) / `unavailable` states; per-file patch errors surface as
- * retryable card errors inside the panel.
- */
 export function GitDiffTabContent({
   environmentId,
   target,
   isDiffPanelActive,
-  gitDiffViewOptions,
+  isPanelOpen,
+  gitDiffPresentation,
   onClearPendingGitDiffIntent,
   onOpenFileInEditor,
   onOpenFilePreview,
@@ -153,7 +163,10 @@ export function GitDiffTabContent({
   workspaceRootPath,
 }: GitDiffTabContentProps) {
   const isQueryEnabled =
-    isDiffPanelActive && Boolean(environmentId) && target !== undefined;
+    isDiffPanelActive &&
+    isPanelOpen &&
+    Boolean(environmentId) &&
+    target !== undefined;
   const {
     data: diffFilesResponse,
     dataUpdatedAt: diffFilesUpdatedAt,
@@ -180,17 +193,13 @@ export function GitDiffTabContent({
     mergeBaseRef,
   });
 
-  // Drop per-card UI state belonging to any other diff slice once a new target
-  // / environment resolves, so collapse defaults are re-derived fresh rather
-  // than inheriting a previous diff's choices at a shared path.
   useEffect(() => {
     clearDiffFileCardStates(diffIdentity);
   }, [diffIdentity]);
 
   const isPreparing =
     isQueryEnabled &&
-    (target === undefined ||
-      isDiffFilesLoading ||
+    (isDiffFilesLoading ||
       (diffFilesResponse === undefined && diffFilesError === null));
 
   if (isPreparing) {
@@ -256,8 +265,6 @@ export function GitDiffTabContent({
     );
   }
 
-  // The panel needs a concrete target to drive its patch fetches; `isQueryEnabled`
-  // above already guarantees both once an `available` outcome resolved.
   if (!environmentId || target === undefined) {
     return (
       <div className={cn(PANEL_SCROLL_SLOT_CLASS, "px-4 pb-3")}>
@@ -269,36 +276,43 @@ export function GitDiffTabContent({
   }
 
   return (
-    <DiffFilesPanel
-      environmentId={environmentId}
-      target={target}
-      diffIdentity={diffIdentity}
-      files={diffFilesResponse.files}
-      initialPatches={diffFilesResponse.initialPatches}
-      filesUpdatedAt={diffFilesUpdatedAt}
-      diffViewOptions={gitDiffViewOptions}
-      filePathRoot={workspaceRootPath}
-      isPlaceholderData={isDiffFilesPlaceholder}
-      scrollToPath={pendingGitDiffScrollPath}
-      onScrolledToPath={onClearPendingGitDiffIntent}
-      onOpenFileInEditor={onOpenFileInEditor}
-      onOpenFilePreview={onOpenFilePreview}
-      onRequestFileContents={onRequestFileContents}
-      onSelectionAddToChat={onSelectionAddToChat}
-    />
+    <div className="flex min-h-0 flex-1 flex-col">
+      {diffFilesResponse.truncated ? (
+        <div
+          role="status"
+          className="mx-4 mb-2 rounded-lg border border-border bg-surface-raised px-3 py-2 text-xs text-muted-foreground"
+        >
+          Showing the first {diffFilesResponse.files.length} changed files.
+          Additional changes are omitted.
+        </div>
+      ) : null}
+      <DiffFilesPanel
+        environmentId={environmentId}
+        target={target}
+        diffIdentity={diffIdentity}
+        files={diffFilesResponse.files}
+        initialPatches={diffFilesResponse.initialPatches}
+        filesUpdatedAt={diffFilesUpdatedAt}
+        presentation={gitDiffPresentation}
+        filePathRoot={workspaceRootPath}
+        isPanelOpen={isPanelOpen}
+        isPlaceholderData={isDiffFilesPlaceholder}
+        scrollToPath={pendingGitDiffScrollPath}
+        onScrolledToPath={onClearPendingGitDiffIntent}
+        onOpenFileInEditor={onOpenFileInEditor}
+        onOpenFilePreview={onOpenFilePreview}
+        onRequestFileContents={onRequestFileContents}
+        onSelectionAddToChat={onSelectionAddToChat}
+      />
+    </div>
   );
-}
-
-export function ThreadInfoTabContent({
-  metadataContent,
-}: ThreadInfoTabContentProps) {
-  return <div className="flex min-h-0 flex-1 flex-col">{metadataContent}</div>;
 }
 
 export function WorkspaceFilePreviewTabContent({
   activePath,
   copyPath = null,
   environmentId,
+  isPanelOpen,
   lineRange,
   markdownLinkRouting,
   onSelectionAddToChat,
@@ -307,13 +321,58 @@ export function WorkspaceFilePreviewTabContent({
   statusLabel,
   threadId,
 }: WorkspaceFilePreviewTabContentProps) {
+  const environmentQuery = useEnvironment(environmentId ?? null, {
+    enabled:
+      environmentId !== null &&
+      environmentId !== undefined &&
+      markdownLinkRouting?.localImage === undefined,
+    staleTime: 5_000,
+  });
   const {
     data: workspaceFilePreview,
     error: workspaceFilePreviewError,
     isFetching: isWorkspaceFilePreviewFetching,
     isLoading: isWorkspaceFilePreviewLoading,
     refetch: refetchWorkspaceFilePreview,
-  } = useEnvironmentFilePreview(environmentId, activePath, source);
+  } = useEnvironmentFilePreview(environmentId, activePath, source, {
+    enabled: isPanelOpen,
+  });
+  const environmentRootPath = environmentQuery.data?.path ?? null;
+  const environmentProjectId = environmentQuery.data?.projectId;
+  const resolvedMarkdownLinkRouting = useMemo(() => {
+    if (
+      source === null ||
+      environmentId === null ||
+      environmentId === undefined ||
+      (!threadId && environmentProjectId === undefined)
+    ) {
+      return markdownLinkRouting;
+    }
+    return buildMarkdownFileImageRouting({
+      path: activePath,
+      rootPath: environmentRootPath,
+      threadId: threadId ?? null,
+      linkRouting: markdownLinkRouting,
+      resolveRelativeSrc: (path) => {
+        if (threadId && source.kind === "working-tree") {
+          return buildThreadWorktreeRawContentUrl(threadId, path);
+        }
+        return environmentProjectId === undefined
+          ? path
+          : buildProjectFileContentUrl(environmentProjectId, path, {
+              environmentId,
+            });
+      },
+    });
+  }, [
+    activePath,
+    environmentId,
+    environmentProjectId,
+    environmentRootPath,
+    markdownLinkRouting,
+    source,
+    threadId,
+  ]);
 
   return (
     <SecondaryPanelFilePreview
@@ -329,7 +388,7 @@ export function WorkspaceFilePreviewTabContent({
       isLoading={isWorkspaceFilePreviewLoading}
       isRefreshing={isWorkspaceFilePreviewFetching}
       lineRange={lineRange}
-      markdownLinkRouting={markdownLinkRouting}
+      markdownLinkRouting={resolvedMarkdownLinkRouting}
       onSelectionAddToChat={onSelectionAddToChat}
       onOpenInEditor={onOpenInEditor}
       onRefresh={() => void refetchWorkspaceFilePreview()}
@@ -343,10 +402,14 @@ export function ProjectFilePreviewTabContent({
   copyPath = null,
   environmentId,
   hostId,
+  isPanelOpen,
   lineRange,
+  markdownLinkRouting,
   onSelectionAddToChat,
   onOpenInEditor,
   projectId,
+  rootPath = null,
+  threadId = null,
 }: ProjectFilePreviewTabContentProps) {
   const {
     data: projectFilePreview,
@@ -354,7 +417,36 @@ export function ProjectFilePreviewTabContent({
     isFetching: isProjectFilePreviewFetching,
     isLoading: isProjectFilePreviewLoading,
     refetch: refetchProjectFilePreview,
-  } = useProjectFilePreview(projectId, activePath, { environmentId, hostId });
+  } = useProjectFilePreview(
+    projectId,
+    activePath,
+    { environmentId, hostId },
+    { enabled: isPanelOpen },
+  );
+  const resolvedMarkdownLinkRouting = useMemo(() => {
+    return buildMarkdownFileImageRouting({
+      path: activePath,
+      rootPath,
+      threadId,
+      linkRouting: markdownLinkRouting,
+      resolveRelativeSrc: (path) =>
+        buildProjectFileContentUrl(projectId, path, {
+          ...(environmentId !== null
+            ? { environmentId }
+            : hostId !== null
+              ? { hostId }
+              : {}),
+        }),
+    });
+  }, [
+    activePath,
+    environmentId,
+    hostId,
+    markdownLinkRouting,
+    projectId,
+    rootPath,
+    threadId,
+  ]);
 
   return (
     <SecondaryPanelFilePreview
@@ -365,6 +457,7 @@ export function ProjectFilePreviewTabContent({
       isLoading={isProjectFilePreviewLoading}
       isRefreshing={isProjectFilePreviewFetching}
       lineRange={lineRange}
+      markdownLinkRouting={resolvedMarkdownLinkRouting}
       onSelectionAddToChat={onSelectionAddToChat}
       onOpenInEditor={onOpenInEditor}
       onRefresh={() => void refetchProjectFilePreview()}
@@ -377,6 +470,7 @@ export function HostFilePreviewTabContent({
   activePath,
   copyPath,
   environmentId,
+  isPanelOpen,
   lineRange,
   markdownLinkRouting,
   onSelectionAddToChat,
@@ -389,7 +483,21 @@ export function HostFilePreviewTabContent({
     isFetching: isHostFilePreviewFetching,
     isLoading: isHostFilePreviewLoading,
     refetch: refetchHostFilePreview,
-  } = useThreadHostFilePreview(threadId, environmentId, activePath);
+  } = useThreadHostFilePreview(threadId, environmentId, activePath, {
+    enabled: isPanelOpen,
+  });
+  const resolvedMarkdownLinkRouting = useMemo(() => {
+    return buildMarkdownFileImageRouting({
+      path: activePath,
+      rootPath:
+        markdownLinkRouting?.localFile?.relativeLinks?.rootPath ??
+        getAbsoluteDirname({ path: activePath }),
+      threadId,
+      linkRouting: markdownLinkRouting,
+      resolveRelativeSrc: (_relativePath, path) =>
+        buildThreadHostFileContentUrl(threadId, path),
+    });
+  }, [activePath, markdownLinkRouting, threadId]);
 
   return (
     <SecondaryPanelFilePreview
@@ -401,7 +509,7 @@ export function HostFilePreviewTabContent({
       isLoading={isHostFilePreviewLoading}
       isRefreshing={isHostFilePreviewFetching}
       lineRange={lineRange}
-      markdownLinkRouting={markdownLinkRouting}
+      markdownLinkRouting={resolvedMarkdownLinkRouting}
       onSelectionAddToChat={onSelectionAddToChat}
       onOpenInEditor={onOpenInEditor}
       onRefresh={() => void refetchHostFilePreview()}
@@ -410,9 +518,49 @@ export function HostFilePreviewTabContent({
   );
 }
 
+export function HostScopedFilePreviewTabContent({
+  activePath,
+  hostId,
+  isPanelOpen,
+  lineRange,
+  onOpenInEditor,
+}: HostScopedFilePreviewTabContentProps) {
+  const {
+    data: hostFilePreview,
+    error,
+    isFetching,
+    isLoading,
+    refetch,
+  } = useHostFilePreview(hostId, activePath, { enabled: isPanelOpen });
+  const markdownLinkRouting = useMemo(() => {
+    return buildMarkdownLeaseImageRouting({
+      path: activePath,
+      rootPath: getAbsoluteDirname({ path: activePath }),
+      previewUrl: hostFilePreview?.url,
+    });
+  }, [activePath, hostFilePreview?.url]);
+  return (
+    <SecondaryPanelFilePreview
+      activePath={activePath}
+      copyPath={activePath}
+      error={error}
+      filePreview={hostFilePreview}
+      htmlPreviewUrl={hostFilePreview?.url ?? null}
+      isLoading={isLoading}
+      isRefreshing={isFetching}
+      lineRange={lineRange}
+      markdownLinkRouting={markdownLinkRouting}
+      onOpenInEditor={onOpenInEditor}
+      onRefresh={() => void refetch()}
+      statusLabel={null}
+    />
+  );
+}
+
 export function ThreadStorageFilePreviewTabContent({
   activePath,
   copyPath = null,
+  isPanelOpen,
   lineRange,
   markdownLinkRouting,
   onSelectionAddToChat,
@@ -425,7 +573,19 @@ export function ThreadStorageFilePreviewTabContent({
     isFetching: isThreadStorageFilePreviewFetching,
     isLoading: isThreadStorageFilePreviewLoading,
     refetch: refetchThreadStorageFilePreview,
-  } = useThreadStorageFilePreview(threadId, activePath);
+  } = useThreadStorageFilePreview(threadId, activePath, {
+    enabled: isPanelOpen,
+  });
+  const resolvedMarkdownLinkRouting = useMemo(() => {
+    return buildMarkdownFileImageRouting({
+      path: activePath,
+      rootPath: null,
+      threadId,
+      linkRouting: markdownLinkRouting,
+      resolveRelativeSrc: (path) =>
+        buildThreadStorageRawContentUrl(threadId, path),
+    });
+  }, [activePath, markdownLinkRouting, threadId]);
 
   return (
     <ThreadStorageFilePreview
@@ -436,7 +596,7 @@ export function ThreadStorageFilePreviewTabContent({
       isLoading={isThreadStorageFilePreviewLoading}
       isRefreshing={isThreadStorageFilePreviewFetching}
       lineRange={lineRange}
-      markdownLinkRouting={markdownLinkRouting}
+      markdownLinkRouting={resolvedMarkdownLinkRouting}
       onSelectionAddToChat={onSelectionAddToChat}
       onOpenInEditor={onOpenInEditor}
       onRefresh={() => void refetchThreadStorageFilePreview()}

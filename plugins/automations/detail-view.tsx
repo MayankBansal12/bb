@@ -1,16 +1,23 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode, UIEvent } from "react";
 import type {
+  AgentEnvironment,
   AutomationExecution,
-  AutomationExecutionOptionsResponse,
   AutomationResponse,
   AutomationRunResponse,
   AutomationRunStatus,
   AgentExecutionUpdate,
-  PermissionMode,
 } from "./src/rpc-types";
-import { AUTOMATION_PROMPT_MAX_LENGTH } from "./src/rpc-types";
+import {
+  experimental_PermissionModePicker as PermissionModePicker,
+  experimental_ProviderModelPicker as ProviderModelPicker,
+  type ExperimentalProviderModelPickerRouting,
+  type ExperimentalProviderModelPickerValue,
+} from "@get-bb/plugin-sdk/app";
+import { RUN_STATE_PRESENTATION } from "@bb/domain/update-state";
 import { Button } from "@bb/shared-ui/button";
+import { COARSE_POINTER_HOVER_REVEAL_VISIBLE_CLASS } from "@bb/shared-ui/coarse-pointer-visibility";
+import { DelayedLoading } from "@bb/shared-ui/delayed-loading";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import {
   ResourceActionButton,
@@ -27,21 +34,8 @@ import {
 } from "@bb/shared-ui/resource-list";
 import { Switch } from "@bb/shared-ui/switch";
 import { Textarea } from "@bb/shared-ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@bb/shared-ui/select";
 import { Skeleton } from "@bb/shared-ui/skeleton";
-import {
-  OptionDisplay,
-  OPTION_BASE_CLASS_NAME,
-  OPTION_CONTENT_CLASS_NAME,
-  OPTION_INTERACTIVE_CLASS_NAME,
-  OPTION_MUTED_CLASS_NAME,
-} from "@bb/shared-ui/option-display";
+import { OptionDisplay } from "@bb/shared-ui/option-display";
 import {
   Tooltip,
   TooltipContent,
@@ -57,14 +51,9 @@ import {
   getOneShotLifecycle,
   oneShotLifecycleAllowsToggle,
 } from "./lib/format-schedule";
-import {
-  formatAutomationModelLabel,
-  formatAutomationProviderLabel,
-} from "./lib/model-label";
-import { AutomationProviderIcon } from "./lib/provider-icon";
 import { AutomationMetadataItem } from "./metadata";
 
-export interface AutomationRunsViewState {
+interface AutomationRunsViewState {
   runs: readonly AutomationRunResponse[];
   nextCursor: string | null;
   loading: boolean;
@@ -74,14 +63,11 @@ export interface AutomationRunsViewState {
   retry: () => void;
 }
 
-export interface AutomationDetailViewProps {
+interface AutomationDetailViewProps {
   automation: AutomationResponse;
   projectLabel: string;
   runsState: AutomationRunsViewState;
   actionPending: boolean;
-  executionOptions: AutomationExecutionOptionsResponse | null;
-  executionOptionsError: string | null;
-  permissionModes: readonly PermissionMode[];
   editing: boolean;
   onToggle: (enabled: boolean) => void;
   onEdit: () => void;
@@ -94,6 +80,34 @@ export interface AutomationDetailViewProps {
 }
 
 const PERSONAL_PROJECT_ID = "proj_personal";
+
+function providerModelValue(
+  execution: Extract<AutomationExecution, { mode: "agent" }>,
+): ExperimentalProviderModelPickerValue {
+  return {
+    providerId: execution.providerId,
+    model: execution.model,
+    reasoningLevel: execution.reasoningLevel,
+    ...(execution.serviceTier === undefined
+      ? {}
+      : { serviceTier: execution.serviceTier }),
+  };
+}
+
+function providerModelRouting(
+  environment: AgentEnvironment,
+): ExperimentalProviderModelPickerRouting | undefined {
+  if (environment.type === "reuse") {
+    return { kind: "environment", environmentId: environment.environmentId };
+  }
+  if (environment.type === "host" && environment.hostId !== undefined) {
+    return { kind: "host", hostId: environment.hostId };
+  }
+  return undefined;
+}
+
+function ignoreProviderModelChange(): void {}
+function ignorePermissionModeChange(): void {}
 
 interface AutomationLifecycleControlProps {
   checked: boolean;
@@ -147,22 +161,10 @@ export function automationIconName(automation: AutomationResponse): IconName {
     : "Calendar";
 }
 
-export function automationScheduleLabel(
-  automation: AutomationResponse,
-): string {
-  return formatScheduleStatusLabel({
-    enabled: automation.enabled,
-    nextRunAt: automation.nextRunAt,
-    trigger: automation.trigger,
-    runCount: automation.runCount,
-    lastRunStatus: automation.lastRunStatus,
-  });
-}
-
 function automationDetailNextRun(
   automation: AutomationResponse,
 ): ReactNode | null {
-  const label = automationDetailScheduleLabel(automation);
+  const label = formatDetailScheduleStatusLabel(automation);
   if (label === null) return null;
   if (!label.startsWith("Next ")) return label;
   return (
@@ -170,18 +172,6 @@ function automationDetailNextRun(
       {label.slice("Next ".length)}
     </AutomationMetadataItem>
   );
-}
-
-function automationDetailScheduleLabel(
-  automation: AutomationResponse,
-): string | null {
-  return formatDetailScheduleStatusLabel({
-    enabled: automation.enabled,
-    nextRunAt: automation.nextRunAt,
-    trigger: automation.trigger,
-    runCount: automation.runCount,
-    lastRunStatus: automation.lastRunStatus,
-  });
 }
 
 function automationBodyLabel(execution: AutomationExecution): string {
@@ -294,123 +284,6 @@ function AutomationEnvironmentVariables({
   );
 }
 
-interface AutomationSelectorProps {
-  label: string;
-  accessibleLabel?: string;
-  value: string;
-  options: readonly { value: string; label: string }[];
-  onValueChange: (value: string) => void;
-  disabled?: boolean;
-  leading?: ReactNode;
-  className?: string;
-}
-
-function AutomationSelector({
-  label,
-  accessibleLabel,
-  value,
-  options,
-  onValueChange,
-  disabled = false,
-  leading,
-  className,
-}: AutomationSelectorProps) {
-  return (
-    <Select value={value} onValueChange={onValueChange} disabled={disabled}>
-      <SelectTrigger
-        aria-label={accessibleLabel ?? label}
-        data-automation-selector={label}
-        className={cn(
-          OPTION_BASE_CLASS_NAME,
-          OPTION_INTERACTIVE_CLASS_NAME,
-          "w-auto min-w-0 border-0 bg-transparent shadow-none focus:ring-0",
-          className,
-        )}
-      >
-        <span
-          data-automation-selector-content=""
-          className={OPTION_CONTENT_CLASS_NAME}
-        >
-          {leading}
-          <span className="inline-flex min-w-0 items-center leading-none">
-            <SelectValue />
-          </span>
-        </span>
-      </SelectTrigger>
-      <SelectContent className="w-max min-w-0">
-        {options.map((option) => (
-          <SelectItem
-            key={option.value}
-            value={option.value}
-            className="text-xs"
-          >
-            {option.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
-}
-
-interface DisabledAutomationSelectorProps {
-  label: string;
-  value: string;
-  accessibleValue?: string;
-  compactValue?: string;
-  leading?: ReactNode;
-  title?: string;
-  className?: string;
-}
-
-function DisabledAutomationSelector({
-  label,
-  value,
-  accessibleValue,
-  compactValue,
-  leading,
-  title,
-  className,
-}: DisabledAutomationSelectorProps) {
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="sm"
-      aria-label={`${label}: ${accessibleValue ?? value}. Read only`}
-      disabled
-      data-disabled-automation-selector={label}
-      className={cn(
-        OPTION_BASE_CLASS_NAME,
-        OPTION_INTERACTIVE_CLASS_NAME,
-        OPTION_MUTED_CLASS_NAME,
-        "cursor-not-allowed disabled:cursor-not-allowed disabled:opacity-100",
-        className,
-      )}
-    >
-      <span
-        data-automation-selector-content=""
-        className={OPTION_CONTENT_CLASS_NAME}
-        title={title ?? `${label}: ${value}`}
-      >
-        {leading}
-        <span className="min-w-0 truncate" data-promptbox-full-label="">
-          {value}
-        </span>
-        {compactValue ? (
-          <span className="min-w-0 truncate" data-promptbox-compact-label="">
-            {compactValue}
-          </span>
-        ) : null}
-      </span>
-      <Icon
-        name="ChevronDown"
-        className="size-3.5 shrink-0 text-muted-foreground"
-        aria-hidden
-      />
-    </Button>
-  );
-}
-
 function automationEnvironmentLabel(execution: AutomationExecution): string {
   if (execution.mode !== "agent") return "Host";
   const environment = execution.environment;
@@ -459,28 +332,6 @@ function automationEnvironmentIcon(
   return "Folder";
 }
 
-function formatPermissionMode(
-  permissionMode: Extract<
-    AutomationExecution,
-    { mode: "agent" }
-  >["permissionMode"],
-): string {
-  if (permissionMode === "accept-edits") return "Accept Edits";
-  if (permissionMode === "auto") return "Approve for me";
-  return "Full Access";
-}
-
-function formatPermissionModeCompact(
-  permissionMode: Extract<
-    AutomationExecution,
-    { mode: "agent" }
-  >["permissionMode"],
-): string {
-  if (permissionMode === "accept-edits") return "Edits";
-  if (permissionMode === "auto") return "Auto";
-  return "Full";
-}
-
 function formatRunDuration(run: AutomationRunResponse): string | null {
   if (run.finishedAt === null) return null;
   const seconds = (run.finishedAt - run.startedAt) / 1000;
@@ -496,7 +347,7 @@ function isSilentRun(run: AutomationRunResponse): boolean {
   );
 }
 
-export const AUTOMATION_RUN_STATUS_VISUALS: Record<
+const AUTOMATION_RUN_STATUS_VISUALS: Record<
   AutomationRunStatus,
   {
     label: string;
@@ -506,26 +357,22 @@ export const AUTOMATION_RUN_STATUS_VISUALS: Record<
 > = {
   running: {
     label: "Running",
-    icon: "Loading",
+    icon: RUN_STATE_PRESENTATION["in-progress"].icon as IconName,
     className: "animate-spin text-muted-foreground",
   },
   failed: {
-    label: "Failed",
-    icon: "CircleX",
+    label: RUN_STATE_PRESENTATION.failed.label,
+    icon: RUN_STATE_PRESENTATION.failed.icon as IconName,
     className: "text-destructive",
   },
   skipped: {
-    label: "Skipped",
-    // Not CircleDashed: icon.tsx aliases it to the same DashedLineCircleIcon as
-    // Spinner, so a skipped run rendered an identical shape to a running one.
-    // ArrowTurnForward is the only glyph in the map that reads as "passed
-    // over", and it is shape-distinct from check, x, spinner, clock and pause.
-    icon: "ArrowTurnForward",
+    label: RUN_STATE_PRESENTATION.skipped.label,
+    icon: RUN_STATE_PRESENTATION.skipped.icon as IconName,
     className: "text-subtle-foreground",
   },
   succeeded: {
-    label: "Succeeded",
-    icon: "CircleCheck",
+    label: RUN_STATE_PRESENTATION.succeeded.label,
+    icon: RUN_STATE_PRESENTATION.succeeded.icon as IconName,
     className: "text-success",
   },
 };
@@ -569,9 +416,6 @@ function RunRow({
   const visual = AUTOMATION_RUN_STATUS_VISUALS[run.status];
   const running = run.status === "running";
   const openable = run.runMode === "agent" && run.threadId !== null;
-  // The whole row is the affordance when there is a thread, so the destination
-  // stays keyboard-reachable without a separate visible button competing with
-  // the timestamp on every line.
   const RowTag = openable ? "button" : "div";
   const line = (
     <RowTag
@@ -625,7 +469,10 @@ function RunRow({
       {openable ? (
         <Icon
           name="ChevronRight"
-          className="size-3.5 shrink-0 text-subtle-foreground opacity-0 transition-opacity group-hover/run:opacity-100 group-focus-visible/run:opacity-100"
+          className={cn(
+            "size-3.5 shrink-0 text-subtle-foreground opacity-0 transition-opacity group-hover/run:opacity-100 group-focus-visible/run:opacity-100",
+            COARSE_POINTER_HOVER_REVEAL_VISIBLE_CLASS,
+          )}
           aria-hidden
         />
       ) : null}
@@ -654,62 +501,49 @@ function RunRow({
 
 function AgentAutomationDefinition({
   execution,
-  options,
-  optionsError,
   editing,
   personalProject,
   projectContextLabel,
   pending,
-  permissionModes,
   onCancel,
   onUpdate,
 }: {
   execution: Extract<AutomationExecution, { mode: "agent" }>;
-  options: AutomationExecutionOptionsResponse | null;
-  optionsError: string | null;
   editing: boolean;
   personalProject: boolean;
   projectContextLabel: string;
   pending: boolean;
-  permissionModes: readonly PermissionMode[];
   onCancel: () => void;
   onUpdate: (update: AgentExecutionUpdate) => Promise<void>;
 }) {
   const [prompt, setPrompt] = useState(execution.prompt);
-  const [model, setModel] = useState(execution.model);
+  const [providerModel, setProviderModel] = useState(() =>
+    providerModelValue(execution),
+  );
   const [permissionMode, setPermissionMode] = useState(
     execution.permissionMode,
   );
   useEffect(() => {
     setPrompt(execution.prompt);
-    setModel(execution.model);
+    setProviderModel(providerModelValue(execution));
     setPermissionMode(execution.permissionMode);
-  }, [execution.model, execution.permissionMode, execution.prompt]);
+  }, [
+    execution.model,
+    execution.permissionMode,
+    execution.prompt,
+    execution.providerId,
+    execution.reasoningLevel,
+    execution.serviceTier,
+  ]);
+  const pickerRouting = providerModelRouting(execution.environment);
   const trimmedPrompt = prompt.trim();
   const dirty =
     prompt !== execution.prompt ||
-    model !== execution.model ||
+    providerModel.providerId !== execution.providerId ||
+    providerModel.model !== execution.model ||
+    providerModel.reasoningLevel !== execution.reasoningLevel ||
+    providerModel.serviceTier !== execution.serviceTier ||
     permissionMode !== execution.permissionMode;
-  const modelOptions = options?.models.map((model) => ({
-    value: model.model,
-    label: formatAutomationModelLabel(model.model, execution.providerId),
-  })) ?? [
-    {
-      value: execution.model,
-      label: formatAutomationModelLabel(execution.model, execution.providerId),
-    },
-  ];
-  if (!modelOptions.some((option) => option.value === model)) {
-    modelOptions.unshift({
-      value: model,
-      label: formatAutomationModelLabel(model, execution.providerId),
-    });
-  }
-  const permissionOptions = permissionModes.map((mode) => ({
-    value: mode,
-    label: formatPermissionMode(mode),
-  }));
-
   const promptFooter = (
     <div
       data-automation-prompt-footer=""
@@ -747,22 +581,21 @@ function AgentAutomationDefinition({
         />
       </div>
       {editing ? (
-        <AutomationSelector
-          label="Permission mode"
+        <PermissionModePicker
+          providerId={providerModel.providerId}
           value={permissionMode}
-          options={permissionOptions}
+          onChange={setPermissionMode}
+          {...(pickerRouting === undefined ? {} : { routing: pickerRouting })}
           disabled={pending}
-          onValueChange={(value) => {
-            const next = permissionModes.find((mode) => mode === value);
-            if (next !== undefined) setPermissionMode(next);
-          }}
           className="h-6 shrink-0"
         />
       ) : (
-        <DisabledAutomationSelector
-          label="Permission mode"
-          value={formatPermissionMode(execution.permissionMode)}
-          compactValue={formatPermissionModeCompact(execution.permissionMode)}
+        <PermissionModePicker
+          providerId={execution.providerId}
+          value={execution.permissionMode}
+          onChange={ignorePermissionModeChange}
+          {...(pickerRouting === undefined ? {} : { routing: pickerRouting })}
+          disabled
           className="h-6 shrink-0"
         />
       )}
@@ -777,7 +610,10 @@ function AgentAutomationDefinition({
         if (!dirty || trimmedPrompt.length === 0) return;
         void onUpdate({
           prompt: trimmedPrompt,
-          model,
+          providerId: providerModel.providerId,
+          model: providerModel.model,
+          reasoningLevel: providerModel.reasoningLevel,
+          serviceTier: providerModel.serviceTier ?? null,
           permissionMode,
         });
       }}
@@ -785,7 +621,6 @@ function AgentAutomationDefinition({
       <Textarea
         value={prompt}
         onChange={(event) => setPrompt(event.target.value)}
-        maxLength={AUTOMATION_PROMPT_MAX_LENGTH}
         aria-label="Automation prompt"
         disabled={pending}
         className="min-h-28 resize-none border-0 bg-transparent px-4 pb-1 pr-14 pt-3 text-sm leading-relaxed shadow-none focus-visible:ring-0"
@@ -795,16 +630,13 @@ function AgentAutomationDefinition({
         className="flex min-w-0 shrink-0 items-center gap-3 pb-2 pl-3.5 pr-2 pt-1.5"
       >
         <div className="flex min-w-0 flex-1 items-center gap-1">
-          <AutomationSelector
-            label="Provider and model"
-            accessibleLabel={`Provider and model: ${formatAutomationProviderLabel(execution.providerId)}, ${modelOptions.find((option) => option.value === model)?.label ?? model}`}
-            value={model}
-            options={modelOptions}
-            disabled={pending || options === null}
-            onValueChange={setModel}
-            leading={
-              <AutomationProviderIcon providerId={execution.providerId} />
-            }
+          <ProviderModelPicker
+            value={providerModel}
+            onChange={setProviderModel}
+            {...(pickerRouting === undefined ? {} : { routing: pickerRouting })}
+            allowProviderChange={execution.targetThreadId === undefined}
+            disabled={pending}
+            className="h-6 max-w-full"
           />
         </div>
         <Button
@@ -836,17 +668,14 @@ function AgentAutomationDefinition({
       context={[
         {
           label: (
-            <DisabledAutomationSelector
-              label="Provider and model"
-              value={formatAutomationModelLabel(
-                execution.model,
-                execution.providerId,
-              )}
-              accessibleValue={`${formatAutomationProviderLabel(execution.providerId)}, ${formatAutomationModelLabel(execution.model, execution.providerId)}`}
-              leading={
-                <AutomationProviderIcon providerId={execution.providerId} />
-              }
-              title={`${formatAutomationProviderLabel(execution.providerId)}: ${formatAutomationModelLabel(execution.model, execution.providerId)}`}
+            <ProviderModelPicker
+              value={providerModelValue(execution)}
+              onChange={ignoreProviderModelChange}
+              {...(pickerRouting === undefined
+                ? {}
+                : { routing: pickerRouting })}
+              disabled
+              className="h-6 max-w-full"
             />
           ),
         },
@@ -869,11 +698,6 @@ function AgentAutomationDefinition({
           {promptFooter}
         </div>
       )}
-      {optionsError ? (
-        <p className="mt-1 px-3.5 text-xs text-destructive">
-          Couldn&apos;t load editing options. {optionsError}
-        </p>
-      ) : null}
     </div>
   );
 }
@@ -883,9 +707,6 @@ export function AutomationDetailView({
   projectLabel,
   runsState,
   actionPending,
-  executionOptions,
-  executionOptionsError,
-  permissionModes,
   editing,
   onToggle,
   onEdit,
@@ -903,12 +724,17 @@ export function AutomationDetailView({
     runCount: automation.runCount,
     lastRunStatus: automation.lastRunStatus,
   });
-  const lifecycleLocked = !oneShotLifecycleAllowsToggle(oneShotLifecycle);
-  const lifecycleDisabledReason = lifecycleLocked
-    ? oneShotLifecycle === "expired"
-      ? "Missed its run time. Edit to reschedule."
-      : "Already ran. Edit to reschedule."
-    : undefined;
+  const requiresPrompt =
+    automation.execution.mode === "agent" && automation.execution.prompt === "";
+  const lifecycleLocked =
+    requiresPrompt || !oneShotLifecycleAllowsToggle(oneShotLifecycle);
+  const lifecycleDisabledReason = requiresPrompt
+    ? "Add a prompt before changing this automation."
+    : lifecycleLocked
+      ? oneShotLifecycle === "expired"
+        ? "Missed its run time. Edit to reschedule."
+        : "Already ran. Edit to reschedule."
+      : undefined;
   const bodyLabel = automationBodyLabel(automation.execution);
   const execution = automation.execution;
   const projectContextLabel = projectLabel;
@@ -947,13 +773,15 @@ export function AutomationDetailView({
           disabled={actionPending || lifecycleLocked}
           disabledReason={lifecycleDisabledReason}
           label={
-            oneShotLifecycle === "expired"
-              ? "Expired automation; edit to reschedule"
-              : lifecycleLocked
-                ? `${automationScheduleLabel(automation)} automation`
-                : automation.enabled
-                  ? "Pause automation"
-                  : "Resume automation"
+            requiresPrompt
+              ? "Add a prompt before changing this automation"
+              : oneShotLifecycle === "expired"
+                ? "Expired automation; edit to reschedule"
+                : lifecycleLocked
+                  ? `${formatScheduleStatusLabel(automation)} automation`
+                  : automation.enabled
+                    ? "Pause automation"
+                    : "Resume automation"
           }
           onCheckedChange={onToggle}
         />
@@ -963,7 +791,15 @@ export function AutomationDetailView({
           label={`${automation.name} actions`}
           disabled={actionPending}
           items={[
-            { label: "Run now", icon: "Play", onSelect: onRunNow },
+            {
+              label: "Run now",
+              icon: "Play",
+              disabled: requiresPrompt,
+              disabledReason: requiresPrompt
+                ? "Add a prompt before running this automation."
+                : undefined,
+              onSelect: onRunNow,
+            },
             { kind: "separator" },
             {
               label: "Delete",
@@ -987,6 +823,7 @@ export function AutomationDetailView({
                 execution.mode === "agent" ? "Edit prompt" : "Edit with chat"
               }
               icon="Edit"
+              disabled={editing}
               onClick={onEdit}
             />
           }
@@ -994,11 +831,8 @@ export function AutomationDetailView({
           {execution.mode === "agent" ? (
             <AgentAutomationDefinition
               execution={execution}
-              options={executionOptions}
-              optionsError={executionOptionsError}
               editing={editing}
               pending={actionPending}
-              permissionModes={permissionModes}
               personalProject={personalProject}
               projectContextLabel={projectContextLabel}
               onCancel={onCancelEdit}
@@ -1058,18 +892,20 @@ export function AutomationDetailView({
               </div>
             </ResourceDetailCollection>
           ) : runsState.loading ? (
-            <ResourceDetailCollection>
-              <div
-                data-automation-runs-state="loading"
-                role="status"
-                aria-label="Loading runs"
-                className="flex min-w-0 items-center gap-2.5 px-2 py-2.5"
-              >
-                <Skeleton className="size-3.5 shrink-0 rounded-full" />
-                <Skeleton className="h-3 w-28 rounded-sm" />
-                <Skeleton className="h-3 w-10 rounded-sm" />
-              </div>
-            </ResourceDetailCollection>
+            <DelayedLoading>
+              <ResourceDetailCollection>
+                <div
+                  data-automation-runs-state="loading"
+                  role="status"
+                  aria-label="Loading runs"
+                  className="flex min-w-0 items-center gap-2.5 px-2 py-2.5"
+                >
+                  <Skeleton className="size-3.5 shrink-0 rounded-full" />
+                  <Skeleton className="h-3 w-28 rounded-sm" />
+                  <Skeleton className="h-3 w-10 rounded-sm" />
+                </div>
+              </ResourceDetailCollection>
+            </DelayedLoading>
           ) : runsState.runs.length === 0 ? (
             <ResourceDetailCollection>
               <div
@@ -1081,7 +917,7 @@ export function AutomationDetailView({
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled={actionPending}
+                  disabled={actionPending || requiresPrompt}
                   onClick={onRunNow}
                 >
                   <Icon name="Play" className="size-3.5" aria-hidden />

@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useState,
+  type CSSProperties,
   type FocusEvent,
   type KeyboardEvent,
   type MouseEvent,
@@ -16,6 +17,8 @@ import {
 } from "../../ui/disclosure.js";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
+import { useTimelineReasoningExpansion } from "./TimelineReasoningExpansion.js";
+import { PluginCompactIconMask } from "../../plugin/PluginIcon.js";
 import {
   TIMELINE_ROW_HEADER_CONTENT_CLASS_NAME,
   timelineRowHeaderClassName,
@@ -28,31 +31,25 @@ import {
   type TimelineTitleLinkResolver,
 } from "./TimelineTitleView.js";
 
-export interface ExpandableTimelineRowProps {
+interface ExpandableTimelineRowProps {
+  reasoningExpansionKey?: string;
   autoExpanded?: boolean;
   forceExpanded?: boolean;
-  /**
-   * Opens terminal frontier rows when they arrive, then latches that visible
-   * state until the user toggles the row or the row unmounts.
-   */
   terminalAutoExpanded?: boolean;
-  onBeforeExpand?: () => void;
   renderBody: () => ReactNode;
   title: TimelineTitle;
-  /** Replaces the generic timeline-title renderer for a specialized header. */
   titleContent?: ReactNode;
-  className?: string;
   collapsedPreview?: ReactNode;
   expandable?: boolean;
   horizontalPadding?: TimelineRowHorizontalPadding;
   leadingIcon?: IconName;
-  /** Extra classes on the header summary line only (not the expanded body). */
+  leadingIconUrl?: string;
+  leadingIconStyle?: CSSProperties;
   summaryClassName?: string;
   onTitleAction?: TimelineTitleActionResolver;
   resolveSegmentLinkHref?: TimelineTitleLinkResolver;
 }
 
-type ManualExpansionOverride = boolean | null;
 type CollapsedPreviewClickEvent = MouseEvent<HTMLDivElement>;
 type CollapsedPreviewFocusEvent = FocusEvent<HTMLDivElement>;
 type CollapsedPreviewKeyboardEvent = KeyboardEvent<HTMLDivElement>;
@@ -81,15 +78,16 @@ function isInteractivePreviewTarget({
 
 function ExpandableTimelineRowComponent({
   autoExpanded = false,
-  className,
   collapsedPreview,
   expandable = true,
   forceExpanded = false,
   horizontalPadding = "default",
   leadingIcon,
-  onBeforeExpand,
+  leadingIconUrl,
+  leadingIconStyle,
   onTitleAction,
   renderBody,
+  reasoningExpansionKey,
   resolveSegmentLinkHref,
   summaryClassName,
   terminalAutoExpanded = false,
@@ -97,7 +95,7 @@ function ExpandableTimelineRowComponent({
   titleContent,
 }: ExpandableTimelineRowProps) {
   const [manualExpansionOverride, setManualExpansionOverride] =
-    useState<ManualExpansionOverride>(null);
+    useTimelineReasoningExpansion(reasoningExpansionKey);
   const [terminalAutoExpandedLatch, setTerminalAutoExpandedLatch] =
     useState(terminalAutoExpanded);
   const [collapsedPreviewActive, setCollapsedPreviewActive] = useState(false);
@@ -119,11 +117,8 @@ function ExpandableTimelineRowComponent({
   const horizontalPaddingClass =
     timelineRowHorizontalPaddingClassName(horizontalPadding);
   const handleToggle = useCallback((): void => {
-    if (!isExpanded) {
-      onBeforeExpand?.();
-    }
     setManualExpansionOverride(!isExpanded);
-  }, [isExpanded, onBeforeExpand]);
+  }, [isExpanded, setManualExpansionOverride]);
   const handleCollapsedPreviewClick = useCallback(
     (event: CollapsedPreviewClickEvent): void => {
       if (
@@ -195,9 +190,7 @@ function ExpandableTimelineRowComponent({
               expandable ? () => setCollapsedPreviewActive(true) : undefined
             }
             onBlur={expandable ? handleCollapsedPreviewBlur : undefined}
-            onKeyDown={
-              expandable ? handleCollapsedPreviewKeyDown : undefined
-            }
+            onKeyDown={expandable ? handleCollapsedPreviewKeyDown : undefined}
           >
             {collapsedPreview}
           </div>
@@ -210,10 +203,17 @@ function ExpandableTimelineRowComponent({
             summaryClassName,
           )}
         >
-          {leadingIcon ? (
+          {leadingIconUrl !== undefined ? (
+            <PluginCompactIconMask
+              url={leadingIconUrl}
+              className="size-3.5 text-muted-foreground"
+              style={leadingIconStyle}
+            />
+          ) : leadingIcon ? (
             <Icon
               name={leadingIcon}
               className="size-3.5 shrink-0 text-muted-foreground"
+              style={leadingIconStyle}
               aria-hidden
             />
           ) : null}
@@ -230,7 +230,7 @@ function ExpandableTimelineRowComponent({
       forceHeaderChevronVisible={
         expandable && !isExpanded && collapsedPreviewActive
       }
-      className={cn("w-full", className)}
+      className="w-full"
       headerClassName={timelineRowHeaderClassName(horizontalPadding)}
       contentClassName={cn(horizontalPaddingClass, "pb-1 pt-0.5")}
       renderBody={renderBody}

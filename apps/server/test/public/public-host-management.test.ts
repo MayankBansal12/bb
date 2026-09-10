@@ -55,9 +55,6 @@ describe("public host management", () => {
       expect(issued.joinCode).toMatch(/^bbde_/u);
       expect(issued.expiresAt).toBeGreaterThan(Date.now());
       expect(issued.expiresAt).toBeLessThanOrEqual(Date.now() + 15 * 60 * 1000);
-      // Minting must not create a host row — an unredeemed code would leave a
-      // phantom offline machine in the Machines pane. The row is born at
-      // enroll with the daemon-reported name.
       expect(getHost(harness.db, issued.hostId)).toBeNull();
 
       const enrollResponse = await harness.app.request(
@@ -117,6 +114,7 @@ describe("public host management", () => {
             hostType: "persistent",
             instanceId: "instance-cloud-2",
             loadedEnvironments: [],
+            localApiPort: 38_888,
             platform: "linux",
             protocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
           }),
@@ -199,8 +197,6 @@ describe("public host management", () => {
           method: "POST",
           headers: { "x-bb-gate-auth": "machine" },
         }),
-        // The permission ceiling is the control that stops one machine from
-        // running privileged work on another, so a machine must never set it.
         harness.app.request(`${API}/hosts/${host.id}/permission-ceiling`, {
           method: "PATCH",
           headers: {
@@ -456,12 +452,14 @@ describe("public host management", () => {
         connectMachineId: "machine-cloud-remove",
         id: "host_cloud_remove",
       });
-      await harness.pluginService.start();
-      const connectPlugin = harness.pluginService
-        .list()
-        .find((plugin) => plugin.source === "builtin:connect");
-      expect(connectPlugin).toBeDefined();
-      if (!connectPlugin) throw new Error("connect plugin was not installed");
+      const connectPlugin = await harness.pluginService.install(
+        "builtin:connect",
+        { kind: "root" },
+      );
+      expect(connectPlugin).toMatchObject({
+        source: "builtin:connect",
+        status: "running",
+      });
       const revokeHandler = vi.fn(async () => ({ ok: true }));
       const revokeRecord = {
         inputSchema: z.object({ machineId: z.string() }),
@@ -476,23 +474,16 @@ describe("public host management", () => {
         .spyOn(harness.pluginService, "invokeRpcHandler")
         .mockResolvedValue({ ok: true, result: { ok: true } });
 
-      try {
-        const response = await harness.app.request(`${API}/hosts/${host.id}`, {
-          method: "DELETE",
-        });
-        expect(response.status).toBe(200);
-        expect(invoke).toHaveBeenCalledWith(
-          connectPlugin.id,
-          "revokeMachine",
-          revokeRecord,
-          { machineId: "machine-cloud-remove" },
-        );
-      } finally {
-        await harness.pluginService.stop();
-      }
+      const response = await harness.app.request(`${API}/hosts/${host.id}`, {
+        method: "DELETE",
+      });
+      expect(response.status).toBe(200);
+      expect(invoke).toHaveBeenCalledWith(
+        connectPlugin.id,
+        "revokeMachine",
+        revokeRecord,
+        { machineId: "machine-cloud-remove" },
+      );
     });
-    // Starting the plugin service builds and loads the builtin plugins, which
-    // is real work; the other plugin-service suites budget 30s+ for it. The
-    // 5s default is a coin flip on a loaded CI runner.
   }, 30_000);
 });

@@ -1,7 +1,10 @@
 import type { ReactNode } from "react";
+import { PERSONAL_PROJECT_ID } from "@bb/domain";
+import { pluginCliCall } from "@bb/domain/plugin-cli";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { Button } from "@bb/shared-ui/button";
-import type { PluginCapability } from "@bb/server-contract";
+import type { PluginCapability, SkillListResponse } from "@bb/server-contract";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import {
   ResourceDetailIncludesSection,
@@ -26,69 +29,51 @@ import {
   type PluginListItem,
 } from "@/hooks/queries/plugin-settings-queries";
 import { usePluginSlots, type PluginSlotSnapshot } from "@/lib/plugin-slots";
+import {
+  getPluginConfigurationRoutePath,
+  getPluginPanelRoutePath,
+  getRootComposeRoutePath,
+  getSettingsRoutePath,
+  getSkillDetailRoutePath,
+  getSkillsRoutePath,
+} from "@/lib/route-paths";
+import { getPluginHomepageSectionAnchor } from "@/lib/plugin-homepage-section";
+import { projectSkillsQueryKey } from "@/hooks/queries/query-keys";
 
-function pluginActivityIcon(
-  activity: "service" | "schedule",
-  state: "running" | "backoff" | "stopped" | "ok" | "error" | null,
-): { name: IconName; className: string; label: string } {
-  if (activity === "service" && state === "running") {
-    return {
-      name: "CircleCheck",
-      className: "text-success",
-      label: "Running",
-    };
-  }
-  if (activity === "service" && state === "backoff") {
-    return {
-      name: "RotateCcw",
-      className: "text-warning",
-      label: "Restarting",
-    };
-  }
-  if (activity === "service" && state === "stopped") {
-    return {
-      name: "Pause",
-      className: "text-muted-foreground",
-      label: "Stopped",
-    };
-  }
-  if (activity === "schedule" && state === null) {
+function pluginActivityIcon(state: "running" | "ok" | "error" | null): {
+  name: IconName;
+  className: string;
+  label: string;
+} {
+  if (state === null) {
     return {
       name: "Clock",
       className: "text-muted-foreground",
       label: "Scheduled",
     };
   }
-  if (activity === "schedule" && state === "running") {
-    // The app says "working" by shimmering a row's own icon, never by swapping
-    // it for a spinner (ThreadRow.tsx:144). A running job keeps its clock.
+  if (state === "running") {
     return {
       name: "Clock",
       className: "animate-shine-icon text-muted-foreground",
       label: "Running",
     };
   }
-  if (activity === "schedule" && state === "ok") {
+  if (state === "ok") {
     return {
       name: "CircleCheck",
       className: "text-success",
       label: "Succeeded",
     };
   }
-  if (activity === "schedule" && state === "error") {
+  if (state === "error") {
     return { name: "CircleX", className: "text-destructive", label: "Failed" };
   }
-  return activity === "service"
-    ? {
-        name: "Pause",
-        className: "text-muted-foreground",
-        label: "Stopped",
-      }
-    : {
-        name: "Clock",
-        className: "text-muted-foreground",
-        label: "Scheduled",
-      };
+  return {
+    name: "Clock",
+    className: "text-muted-foreground",
+    label: "Scheduled",
+  };
 }
 
 function pluginServiceStatus(state: "running" | "backoff" | "stopped"): {
@@ -119,13 +104,11 @@ function pluginServiceStatus(state: "running" | "backoff" | "stopped"): {
 }
 
 function PluginActivityState({
-  activity,
   state,
 }: {
-  activity: "service" | "schedule";
-  state: "running" | "backoff" | "stopped" | "ok" | "error" | null;
+  state: "running" | "ok" | "error" | null;
 }) {
-  const icon = pluginActivityIcon(activity, state);
+  const icon = pluginActivityIcon(state);
   return (
     <PluginDetailGlyph
       icon={icon.name}
@@ -140,6 +123,7 @@ interface PluginCapabilityItem {
   label: ReactNode;
   detail?: ReactNode;
   mono?: boolean;
+  destinationPath?: string;
 }
 
 function namedSurface(
@@ -147,6 +131,7 @@ function namedSurface(
   id: string,
   title: string | undefined,
   description: string,
+  destinationPath?: string,
 ): PluginCapabilityItem {
   const label = title?.trim() || id;
   return {
@@ -164,56 +149,144 @@ function namedSurface(
         </span>
       ),
     mono: label === id,
+    destinationPath,
   };
 }
 
-function namedSlotItems(
+function namedSlotItems<
+  Slot extends { pluginId: string; id: string; title?: string },
+>(
   pluginId: string,
-  slots: readonly { pluginId: string; id: string; title?: string }[],
+  slots: readonly Slot[],
   prefix: string,
   description: string,
+  destinationPath?: (slot: Slot) => string,
 ): PluginCapabilityItem[] {
   return slots
     .filter((slot) => slot.pluginId === pluginId)
-    .map((slot) => namedSurface(prefix, slot.id, slot.title, description));
+    .map((slot) =>
+      namedSurface(
+        prefix,
+        slot.id,
+        slot.title,
+        description,
+        destinationPath?.(slot),
+      ),
+    );
 }
 
 function pluginAppSurfaceItems(
-  pluginId: string,
+  plugin: PluginListItem,
   slots: PluginSlotSnapshot,
 ): PluginCapabilityItem[] {
-  const namedSlots = [
-    [slots.navPanels, "nav", "Adds a page to the app sidebar."],
-    [slots.homepageSections, "homepage", "Adds content to the Home page."],
-    [
+  const pluginId = plugin.id;
+  const settingsSections = slots.settingsSections.filter(
+    (section) => section.pluginId === pluginId,
+  );
+  return [
+    ...(plugin.hasSettings || settingsSections.length > 0
+      ? [
+          namedSurface(
+            "settings",
+            "settings",
+            "Settings",
+            "Opens this plugin's configuration.",
+            getPluginConfigurationRoutePath({ pluginId }),
+          ),
+        ]
+      : []),
+    ...namedSlotItems(
+      pluginId,
+      slots.navPanels,
+      "nav",
+      "Adds a page to the app sidebar.",
+      (panel) =>
+        getPluginPanelRoutePath({
+          pluginId,
+          path: panel.path,
+        }),
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.homepageSections,
+      "homepage",
+      "Adds content to the Home page.",
+      (section) =>
+        `${getRootComposeRoutePath()}#${getPluginHomepageSectionAnchor(pluginId, section.id)}`,
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.appOverlays,
+      "app-overlay",
+      "Renders app-wide floating interface content.",
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.threadLists,
+      "thread-list",
+      "Can replace the sidebar thread list; configured in Appearance.",
+      () => getSettingsRoutePath("appearance"),
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.experimentalSidebarNavigations,
+      "sidebar-navigation",
+      "Can replace the sidebar navigation controls; configured in Appearance.",
+      () => getSettingsRoutePath("appearance"),
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.sourceCodeRenderers,
+      "source-code-renderer",
+      "Replaces how source code is displayed everywhere in the app.",
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.diffRenderers,
+      "diff-renderer",
+      "Replaces how diffs are displayed everywhere in the app.",
+    ),
+    ...namedSlotItems(
+      pluginId,
       slots.threadPanelActions,
       "thread-panel",
       "Adds an action that opens a panel beside a thread.",
-    ],
-    [
+    ),
+    ...namedSlotItems(
+      pluginId,
       slots.newThreadPanelActions,
       "new-thread-panel",
       "Adds an action that opens a panel beside the New thread screen.",
-    ],
-    [
+    ),
+    ...namedSlotItems(
+      pluginId,
       slots.pendingInteractions,
       "input",
       "Renders a custom interaction inside a thread.",
-    ],
-    [
-      slots.sidebarFooterActions,
-      "sidebar",
-      "Adds an action to the app sidebar.",
-    ],
-    [
+    ),
+    ...slots.sidebarFooterItems
+      .filter((slot) => slot.pluginId === pluginId)
+      .map((slot) =>
+        namedSurface(
+          "sidebar-footer",
+          slot.id,
+          slot.label,
+          slot.kind === "action"
+            ? "Adds an action to the app sidebar footer."
+            : "Adds content revealed from the app sidebar footer.",
+        ),
+      ),
+    ...namedSlotItems(
+      pluginId,
       slots.messageActions,
       "message-action",
       "Adds an action to messages in threads.",
-    ],
-  ] as const;
-  return [
-    ...namedSlots.flatMap(([items, prefix, description]) =>
-      namedSlotItems(pluginId, items, prefix, description),
+    ),
+    ...namedSlotItems(
+      pluginId,
+      slots.threadHeaderActions,
+      "thread-header",
+      "Adds an action to thread headers.",
     ),
     ...slots.composerCustomizations
       .filter((slot) => slot.pluginId === pluginId)
@@ -259,6 +332,7 @@ function pluginAppSurfaceItems(
           slot.id,
           slot.title,
           "Opens supported files in a plugin-provided viewer.",
+          getSettingsRoutePath("files"),
         ),
         detail: (
           <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
@@ -282,7 +356,22 @@ function pluginAppSurfaceItems(
 
 export function PluginIncludes({ plugin }: { plugin: PluginListItem }) {
   const slots = usePluginSlots();
-  const appItems = pluginAppSurfaceItems(plugin.id, slots);
+  const queryClient = useQueryClient();
+  const cachedSkills = queryClient.getQueryData<SkillListResponse>(
+    projectSkillsQueryKey(PERSONAL_PROJECT_ID),
+  );
+  const appItems = pluginAppSurfaceItems(plugin, slots);
+
+  const skillDestination = (capabilityId: string): string => {
+    const installedSkill = cachedSkills?.skills.find((skill) => {
+      if (skill.pluginId !== plugin.id) return false;
+      const segments = skill.filePath.split(/[\\/]/u);
+      return segments.at(-2) === capabilityId || skill.name === capabilityId;
+    });
+    return installedSkill === undefined
+      ? `${getSkillsRoutePath()}?view=library`
+      : getSkillDetailRoutePath({ skillId: installedSkill.id });
+  };
 
   const declared = (kind: PluginCapability["kind"]): PluginCapabilityItem[] =>
     plugin.capabilities
@@ -292,11 +381,14 @@ export function PluginIncludes({ plugin }: { plugin: PluginListItem }) {
         label: capability.label,
         detail: capability.detail ?? undefined,
         mono: kind === "skill" || kind === "agent-tool",
+        destinationPath:
+          kind === "theme"
+            ? getSettingsRoutePath("appearance")
+            : kind === "skill"
+              ? skillDestination(capability.id)
+              : undefined,
       }));
 
-  // `kind` is the name behind the glyph, not a column. Most plugins contribute
-  // one or two items per kind, so a Kind column is near-unique per row and
-  // reads as filler; the glyph carries it and names itself on hover or focus.
   const categories: Array<{
     icon: IconName;
     kind: string;
@@ -314,7 +406,7 @@ export function PluginIncludes({ plugin }: { plugin: PluginListItem }) {
         ? [
             {
               key: plugin.cliCommand.name,
-              label: `bb ${plugin.cliCommand.name}`,
+              label: pluginCliCall(plugin.id, plugin.cliCommand.name),
               detail: plugin.cliCommand.summary || undefined,
               mono: true,
             },
@@ -348,15 +440,6 @@ export function PluginIncludes({ plugin }: { plugin: PluginListItem }) {
 
   if (!plugin.enabled || items.length === 0) return null;
 
-  // Commands, settings, agent tools, thread integrations and app surfaces are
-  // only observable on a *running* plugin — not merely an enabled one. A
-  // plugin that is enabled but failed to load, or is still loading, reports
-  // none of them, so keying this off `enabled` would tell the user it declares
-  // nothing when the truth is that we cannot see yet.
-  // "needs-configuration" is set on a *loaded* plugin, so its tools, slots and
-  // settings are registered and its capabilities do render — it just cannot do
-  // useful work yet. Treating it as not-running would caption a populated list
-  // with "this plugin isn't running".
   const live =
     plugin.status === "running" ||
     plugin.status === "degraded" ||
@@ -378,7 +461,18 @@ export function PluginIncludes({ plugin }: { plugin: PluginListItem }) {
                   className="text-muted-foreground"
                 />
               }
-              name={item.label}
+              name={
+                item.destinationPath === undefined ? (
+                  item.label
+                ) : (
+                  <Link
+                    to={item.destinationPath}
+                    className="rounded-sm text-xs underline decoration-border underline-offset-4 transition-colors hover:decoration-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    {item.label}
+                  </Link>
+                )
+              }
               nameClassName="text-xs"
               mono={item.mono}
               detail={item.detail}
@@ -400,19 +494,22 @@ function PluginRuntimeStatusAlert({
   runtimeStatus,
   onReload,
   reloadPending,
-  reloadable,
 }: {
   plugin: PluginListItem;
   runtimeStatus: PluginRuntimeStatusPresentation;
   onReload: () => void;
   reloadPending: boolean;
-  reloadable?: boolean;
 }) {
+  const { settingsSections } = usePluginSlots();
+  const hasSettingsPage =
+    plugin.hasSettings ||
+    settingsSections.some((section) => section.pluginId === plugin.id);
+  const canOpenSettings =
+    plugin.status === "needs-configuration" && hasSettingsPage;
   const canReload =
-    reloadable ??
-    (plugin.status === "error" ||
-      plugin.status === "degraded" ||
-      (plugin.status === "needs-configuration" && !plugin.hasSettings));
+    plugin.status === "error" ||
+    plugin.status === "degraded" ||
+    (plugin.status === "needs-configuration" && !plugin.hasSettings);
   const condition =
     plugin.status === "needs-configuration" && plugin.statusDetail?.trim()
       ? plugin.statusDetail
@@ -426,55 +523,61 @@ function PluginRuntimeStatusAlert({
     .join(" ");
   return (
     <PluginBannerBar
-      role="alert"
-      tone={runtimeStatus.tone === "error" ? "destructive" : "warning"}
+      role={plugin.status === "starting" ? "status" : "alert"}
+      tone={runtimeStatus.tone === "error" ? "destructive" : runtimeStatus.tone}
       icon={runtimeStatus.icon}
       title={runtimeStatus.label}
       detail={detail}
       separator={plugin.status !== "degraded"}
       action={
-        canReload ? (
-          <Button
-            type="button"
-            size="sm"
-            disabled={reloadPending}
-            className="h-7 px-2.5 text-xs"
-            onClick={onReload}
-          >
-            {reloadPending ? (
-              <Icon
-                name="Loading"
-                className="size-3.5 animate-spin"
-                aria-hidden
-              />
+        canOpenSettings || canReload ? (
+          <span className="flex items-center gap-2">
+            {canOpenSettings ? (
+              <Button asChild size="sm" className="h-7 gap-0.5 px-2.5 text-xs">
+                <Link
+                  to={getPluginConfigurationRoutePath({ pluginId: plugin.id })}
+                >
+                  Open settings
+                  <Icon name="ChevronRight" className="size-3.5" aria-hidden />
+                </Link>
+              </Button>
             ) : null}
-            {reloadPending ? "Reloading\u2026" : "Reload"}
-          </Button>
+            {canReload ? (
+              <Button
+                type="button"
+                size="sm"
+                variant={canOpenSettings ? "outline" : "default"}
+                disabled={reloadPending}
+                className="h-7 px-2.5 text-xs"
+                onClick={onReload}
+              >
+                {reloadPending ? (
+                  <Icon
+                    name="Loading"
+                    className="size-3.5 animate-spin"
+                    aria-hidden
+                  />
+                ) : null}
+                {reloadPending ? "Reloading\u2026" : "Reload"}
+              </Button>
+            ) : null}
+          </span>
         ) : undefined
       }
     />
   );
 }
 
-/**
- * The plugin's highest-priority health problem for the page banner.
- *
- * The banner owns the page-level consequence and recovery action. Runtime
- * diagnostics and cumulative handler counts stay out of user copy because
- * they do not identify one coherent, actionable incident. Scheduled-job
- * outcomes stay row-level and do not cause this runtime banner.
- */
 export function PluginHealthBanner({
   plugin,
   runtimeStatus,
-  reloadable,
 }: {
   plugin: PluginListItem;
   runtimeStatus: PluginRuntimeStatusPresentation | null;
-  reloadable?: boolean;
 }) {
   const queryClient = useQueryClient();
   const reload = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: () => reloadPlugin(fetch, plugin.id),
     onSuccess: () => invalidatePluginList({ queryClient }),
     onError: (error) => {
@@ -490,13 +593,11 @@ export function PluginHealthBanner({
       plugin={plugin}
       runtimeStatus={runtimeStatus}
       reloadPending={reload.isPending}
-      reloadable={reloadable}
       onReload={() => reload.mutate()}
     />
   );
 }
 
-/** Long-running processes the plugin keeps alive. */
 export function PluginServices({ plugin }: { plugin: PluginListItem }) {
   return (
     <div className="max-w-full overflow-hidden rounded-lg border border-border bg-card align-top">
@@ -562,19 +663,13 @@ export function PluginServices({ plugin }: { plugin: PluginListItem }) {
   );
 }
 
-/** Work the plugin has asked bb to run on a timer. */
 export function PluginSchedules({ plugin }: { plugin: PluginListItem }) {
   return (
     <PluginDetailTable>
       {plugin.schedules.map((schedule) => (
         <PluginDetailRow
           key={schedule.name}
-          glyph={
-            <PluginActivityState
-              activity="schedule"
-              state={schedule.lastStatus}
-            />
-          }
+          glyph={<PluginActivityState state={schedule.lastStatus} />}
           name={schedule.name}
           detail={
             schedule.lastError ??

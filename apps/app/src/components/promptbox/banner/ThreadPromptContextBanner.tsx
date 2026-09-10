@@ -20,7 +20,7 @@ import {
 import {
   activityIconClass,
   activityRowClass,
-} from "@/components/ui/activity-row-styles";
+} from "@bb/shared-ui/activity-row-styles";
 import { WorkspaceChangesList } from "@/components/thread/WorkspaceChangesList";
 import {
   formatChangeSummary,
@@ -33,9 +33,16 @@ import { cn } from "@bb/shared-ui/lib/utils";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import {
   getPullRequestAttentionDisplay,
+  getPullRequestGithubCheckStatus,
   PULL_REQUEST_STATE_DISPLAY,
 } from "@/lib/pull-request-display";
 import { PullRequestStatusPill } from "@/components/pull-request/PullRequestStatusPill";
+import { AnimatedBody } from "@/components/promptbox/banner/AnimatedBody";
+import {
+  PROMPT_BANNER_ACTION_FILL_CLASS,
+  PROMPT_BANNER_ACTION_SEGMENT_CLASS,
+  PromptBannerActionButton,
+} from "@/components/promptbox/banner/prompt-banner-actions";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -65,24 +72,13 @@ export interface ThreadPromptGitSection {
 export interface ThreadPromptParentThreadSection {
   parentThreadTitle: string;
   href: string;
-  /**
-   * How the current thread relates to the linked thread: a fork renders
-   * "Forked from …", a side chat renders "Side chat of …", any other child
-   * renders "Parent …".
-   */
   relationship: "parent" | "fork" | "side-chat";
 }
 
-/**
- * Single active child surfaced in the parent thread's context banner. The
- * caller is responsible for filtering down to active children — the banner
- * just renders what it's given.
- */
-export interface ThreadPromptChildThreadItem {
+interface ThreadPromptChildThreadItem {
   id: string;
   title: string;
   href: string;
-  /** True when this child is blocked on a permission or user question. */
   hasPendingInteraction: boolean;
 }
 
@@ -101,32 +97,16 @@ export interface ThreadPromptPullRequestSection {
   };
 }
 
-/**
- * Archived-state segment for the banner. When present, the banner renders
- * only this row — archived threads are read-only, so suppressing the other
- * sections keeps the surface focused on "you are looking at a frozen thread".
- */
 export interface ThreadPromptArchivedSection {
   archivedAt: number;
   onUnarchive?: () => void;
   unarchivePending?: boolean;
 }
 
-/**
- * Environment-gone segment for the banner. When present, the banner renders
- * only this row — a destroying/destroyed environment is not a recoverable
- * context for this thread, so live-work sections no longer apply.
- */
 export interface ThreadPromptEnvironmentGoneSection {
-  status: Extract<EnvironmentStatus, "destroying" | "destroyed">;
+  status: Extract<EnvironmentStatus, "destroyed">;
 }
 
-/**
- * Runtime statuses that count as active child work for the banner's
- * children section. These are the children the banner surfaces and (when the
- * bulk-stop slice lands) the children `Stop all` will target. Keep the set in
- * one place so future status additions don't drift across callers.
- */
 const THREAD_BANNER_ACTIVE_CHILD_RUNTIME_STATUSES: ReadonlySet<ThreadRuntimeDisplayStatus> =
   new Set([
     "active",
@@ -147,38 +127,13 @@ export type ThreadPromptContextBannerExpandedSection =
   | "parentThread"
   | "childThreads";
 
-/**
- * Pixel height of the banner's collapsed (single-row) state. Pinned via the
- * outer PromptStackCard's `min-height` so the height is a contract, not a
- * computed coincidence of text size + paddings + border. Imported by
- * FollowUpPromptBox to derive its elastic textarea target — keeping both
- * sides on the same constant means tweaking banner chrome only requires
- * updating this number in one place.
- */
 export const THREAD_PROMPT_CONTEXT_BANNER_ROW_HEIGHT =
   PROMPT_STACK_CARD_ROW_HEIGHT;
 
-export interface ThreadPromptContextBannerProps {
+interface ThreadPromptContextBannerProps {
   gitSection: ThreadPromptGitSection | null;
-  /**
-   * True while the workspace status query for this thread is in flight. Holds
-   * banner rendering until the result settles so first paint is the final
-   * form — without this, parentThread would render inline then collapse to its
-   * icon-only sibling form when git pills arrive.
-   */
   gitSectionPending: boolean;
-  /**
-   * When set, the banner renders the "Thread is archived" row and suppresses
-   * git and child-threads — those represent live work that no longer applies.
-   * parentThread still renders alongside if provided, since the parent
-   * relationship remains relevant context for a frozen thread.
-   */
   archivedSection: ThreadPromptArchivedSection | null;
-  /**
-   * When set, the banner renders the "environment is no longer available" row
-   * and suppresses git and child-threads. parentThread still renders alongside
-   * if provided, since the relationship remains useful context.
-   */
   environmentGoneSection: ThreadPromptEnvironmentGoneSection | null;
   parentThreadSection: ThreadPromptParentThreadSection | null;
   childThreadsSection: ThreadPromptChildThreadsSection | null;
@@ -198,31 +153,12 @@ const ENVIRONMENT_GONE_STATUS_COPY: Record<
   ThreadPromptEnvironmentGoneSection["status"],
   { ariaLabel: string; label: string }
 > = {
-  destroying: {
-    ariaLabel: "This environment is being archived.",
-    label: "Archiving environment...",
-  },
   destroyed: {
     ariaLabel: "This environment has been archived.",
     label: "Environment archived",
   },
 };
-const PROMPT_BANNER_ACTION_FILL_CLASS = "bg-background shadow-xs";
-const PROMPT_BANNER_ACTION_INTERACTIVE_CLASS =
-  "cursor-pointer text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60";
-const PROMPT_BANNER_ACTION_BUTTON_CLASS = cn(
-  "inline-flex items-center whitespace-nowrap rounded border border-border px-1.5 py-0.5 text-xs",
-  PROMPT_BANNER_ACTION_FILL_CLASS,
-  PROMPT_BANNER_ACTION_INTERACTIVE_CLASS,
-);
-const PROMPT_BANNER_ACTION_SEGMENT_CLASS = cn(
-  "text-xs",
-  PROMPT_BANNER_ACTION_INTERACTIVE_CLASS,
-  "focus-visible:z-10",
-);
 
-// Stable ids for aria-controls / aria-labelledby pairing between each
-// section's toggle button and its expanded body region.
 const SECTION_IDS = {
   parentThread: {
     toggle: "thread-prompt-banner-parent-thread-toggle",
@@ -286,10 +222,6 @@ function SectionToggleButton({
         PROMPT_STACK_INLAY_SEGMENT_CLASS,
         "hover:bg-state-hover",
         SEGMENT_SHRINK_CLASS,
-        // When a label sits between the icon and the chevron we space the row
-        // for legibility (6px). With no label the chevron sits right after the
-        // icon — the icons' own internal padding provides enough separation,
-        // and a gap here makes the pair look untethered.
         label !== null && label !== undefined ? "gap-1.5" : "gap-0",
         isExpanded ? "text-foreground" : "text-muted-foreground",
       )}
@@ -322,8 +254,6 @@ function SectionToggleButton({
   );
 }
 
-// Single source of truth for how the linked source thread is described across
-// the banner's three render surfaces (inline label, expanded body, aria).
 const PARENT_SECTION_COPY: Record<
   ThreadPromptParentThreadSection["relationship"],
   { verb: string; bodyLead: string; ariaPrefix: string }
@@ -448,23 +378,6 @@ function BannerActionSlot({
     </div>
   );
 }
-
-const PromptBannerActionButton = forwardRef<
-  HTMLButtonElement,
-  ButtonHTMLAttributes<HTMLButtonElement>
->(function PromptBannerActionButton(
-  { className, type = "button", ...props },
-  ref,
-) {
-  return (
-    <button
-      ref={ref}
-      type={type}
-      className={cn(PROMPT_BANNER_ACTION_BUTTON_CLASS, className)}
-      {...props}
-    />
-  );
-});
 
 const PromptBannerActionGroup = ({ children }: { children: ReactNode }) => (
   <div
@@ -633,7 +546,10 @@ function PullRequestBannerLink({
       className={cn(
         "flex items-center gap-1.5 text-xs text-muted-foreground no-underline transition-colors hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
         PROMPT_STACK_INLAY_SEGMENT_CLASS,
-        SEGMENT_SHRINK_CLASS,
+        getPullRequestGithubCheckStatus(pullRequest) !== null
+          ? "min-w-13"
+          : "min-w-8",
+        "overflow-hidden",
       )}
     >
       <PullRequestStatusPill pullRequest={pullRequest} className="h-4" />
@@ -654,35 +570,6 @@ function PullRequestBannerLink({
         </span>
       ) : null}
     </a>
-  );
-}
-
-function AnimatedBody({
-  id,
-  labelledBy,
-  isExpanded,
-  children,
-}: {
-  id: string;
-  labelledBy: string;
-  isExpanded: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <section
-      id={id}
-      role="region"
-      aria-labelledby={labelledBy}
-      aria-hidden={!isExpanded}
-      className={cn(
-        "grid overflow-hidden transition-[grid-template-rows,opacity,border-color] duration-200 ease-out",
-        isExpanded
-          ? "grid-rows-[1fr] border-t border-border opacity-100"
-          : "pointer-events-none grid-rows-[0fr] border-t border-transparent opacity-0",
-      )}
-    >
-      <div className="overflow-hidden bg-popover">{children}</div>
-    </section>
   );
 }
 
@@ -759,9 +646,7 @@ function ActiveChildThreadsCard({
           />
           <span className="min-w-0 flex-1 truncate text-left">
             <span className="text-muted-foreground">
-              {needsApproval
-                ? "Needs your input: "
-                : "Active child thread: "}
+              {needsApproval ? "Needs your input: " : "Active child thread: "}
             </span>
             <span className="font-medium text-foreground/80">
               {primary.title}
@@ -783,6 +668,7 @@ function ActiveChildThreadsCard({
         </button>
       </div>
       <AnimatedBody
+        collapsedBorder="reserve"
         id={SECTION_IDS.childThreads.body}
         labelledBy={SECTION_IDS.childThreads.toggle}
         isExpanded={isExpanded}
@@ -858,10 +744,7 @@ function ReadOnlyContextBanner({
             className="size-3.5 shrink-0"
             aria-hidden="true"
           />
-          <span
-            className="min-w-0 truncate"
-            aria-hidden="true"
-          >
+          <span className="min-w-0 truncate" aria-hidden="true">
             {statusLabel}
           </span>
         </div>
@@ -871,6 +754,7 @@ function ReadOnlyContextBanner({
       </div>
       {parentThreadSection ? (
         <AnimatedBody
+          collapsedBorder="reserve"
           id={SECTION_IDS.parentThread.body}
           labelledBy={SECTION_IDS.parentThread.toggle}
           isExpanded={isParentThreadExpanded}
@@ -886,14 +770,6 @@ function ReadOnlyContextBanner({
   );
 }
 
-/**
- * Single rounded strip rendered above the FollowUp prompt input. Hosts the
- * thread's high-signal context as inline section toggles.
- * Segment actions render in a far-right slot only when their segment is the
- * only visible segment. Only one section can be expanded at a time; the caller
- * owns expandedSection state. See
- * plans/thread-prompt-context-banner.md.
- */
 export function ThreadPromptContextBanner({
   gitSection,
   gitSectionPending,
@@ -916,9 +792,7 @@ export function ThreadPromptContextBanner({
         statusAriaLabel={
           environmentGoneCopy?.ariaLabel ?? ARCHIVED_THREAD_STATUS_LABEL
         }
-        statusLabel={
-          environmentGoneCopy?.label ?? ARCHIVED_THREAD_STATUS_LABEL
-        }
+        statusLabel={environmentGoneCopy?.label ?? ARCHIVED_THREAD_STATUS_LABEL}
         statusAction={
           archivedSection?.onUnarchive && !environmentGone ? (
             <ThreadUnarchiveTextAction
@@ -949,8 +823,6 @@ export function ThreadPromptContextBanner({
   const hasSingleVisibleSegment = visibleSegmentCount === 1;
   const isPullRequestAndGitOnly =
     showPullRequest && showGit && visibleSegmentCount === 2;
-  // selectWorkspaceChangedFilesSection only emits a section when files exist,
-  // so showGit implies a non-empty file list.
   const isGitExpanded = expandedSection === "git" && showGit;
   const isParentThreadExpanded =
     expandedSection === "parentThread" && showParentThread;
@@ -1013,12 +885,7 @@ export function ThreadPromptContextBanner({
       </BannerActionSlot>
     ) : null;
 
-  // When the parent segment is the only item in the banner, render it
-  // inline as "Parent <name>" with the name as a link. There's no other
-  // context to compete for the row, so the icon-only toggle would be a strict
-  // downgrade in legibility.
-  const isParentThreadOnly =
-    showParentThread && !showGit && !showPullRequest;
+  const isParentThreadOnly = showParentThread && !showGit && !showPullRequest;
 
   const pullRequest = pullRequestSection?.pullRequest ?? null;
   const showPullRequestLabel =
@@ -1060,7 +927,7 @@ export function ThreadPromptContextBanner({
             PROMPT_STACK_INLAY_INSET_CLASS,
           )}
         >
-          {/* Segment order: relationship metadata, GitHub PR, git status. */}
+          {}
           {showParentThread && parentThreadSection && isParentThreadOnly ? (
             <div
               className={cn(
@@ -1134,6 +1001,7 @@ export function ThreadPromptContextBanner({
         </div>
         {showParentThread && parentThreadSection && !isParentThreadOnly ? (
           <AnimatedBody
+            collapsedBorder="reserve"
             id={SECTION_IDS.parentThread.body}
             labelledBy={SECTION_IDS.parentThread.toggle}
             isExpanded={isParentThreadExpanded}
@@ -1147,6 +1015,7 @@ export function ThreadPromptContextBanner({
         ) : null}
         {showGit ? (
           <AnimatedBody
+            collapsedBorder="reserve"
             id={SECTION_IDS.git.body}
             labelledBy={SECTION_IDS.git.toggle}
             isExpanded={isGitExpanded}
@@ -1168,7 +1037,7 @@ export function ThreadPromptContextBanner({
 
   if (activeChildThreadsCard && compactContextBanner) {
     return (
-      <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
         {activeChildThreadsCard}
         {compactContextBanner}
       </div>

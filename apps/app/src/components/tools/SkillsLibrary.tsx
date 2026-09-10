@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import { buildSkillEditThreadPrompt } from "@bb/shared-ui/resource-edit-prompt";
 import type { EditableSkillScope, SkillSummary } from "@bb/server-contract";
@@ -16,12 +21,19 @@ import { getToolsOwnedCollectionRoutePath } from "@/components/tools/tools-navig
 import {
   SkillDetailDialogView,
   SkillsOverview,
+  type ProviderRoster,
 } from "@/components/tools/SkillsCollection";
+import { useSystemProviders } from "@/hooks/queries/system-queries";
 import { isSkillEditable } from "@/components/tools/skill-taxonomy";
-import { CREATE_SKILL_PROMPT } from "@/lib/create-resource-prompts";
+import { CREATE_SKILL_PROMPT } from "@bb/client-core";
+import { usePrimaryHost } from "@/hooks/queries/host-queries";
+import { useHostFilePreview } from "@/hooks/queries/host-file-preview-query";
+import { getAbsoluteDirname } from "@/lib/absolute-file-path";
+import { buildMarkdownLeaseImageRouting } from "@/components/ui/markdown-file-image-routing";
 import {
   buildRegistrySkillReferencePrompt,
   fetchRegistrySkillDetail,
+  fetchRegistrySkillEntries,
   fetchRegistrySkillEntry,
   fetchRegistryRepositoryStars,
   fetchRegistrySkills,
@@ -29,7 +41,7 @@ import {
   registryRepositoryKey,
   resolveInstalledRegistrySkill,
 } from "@/lib/skills-registry";
-import type { RegistryPagination, RegistrySkill } from "@/lib/skills-registry";
+import type { RegistryRanking, RegistrySkill } from "@/lib/skills-registry";
 import {
   getRegistrySkillDetailRoutePath,
   getRegistrySkillsRoutePath,
@@ -38,29 +50,26 @@ import {
   getSkillsRoutePath,
 } from "@/lib/route-paths";
 import {
+  prefetchSkillDetail,
   useDeleteSkill,
   useProjectSkills,
   useSkillContent,
   useSkillFiles,
 } from "@/hooks/queries/skills-queries";
+import { CreateWithTemplatesButton } from "@/components/create-via-prompt-examples";
 import { useLocalOpenTargets } from "@/hooks/useLocalOpenTargets";
 
 const EMPTY_SKILLS: readonly SkillSummary[] = [];
-const EMPTY_REGISTRY_PAGINATION: RegistryPagination = {
-  page: 0,
-  perPage: REGISTRY_PAGE_SIZE,
-  total: 0,
-  hasMore: false,
-};
+
+function useProviderRoster(): ProviderRoster {
+  const providers = useSystemProviders().data;
+  return useMemo(
+    () => new Map((providers ?? []).map((provider) => [provider.id, provider])),
+    [providers],
+  );
+}
 const REGISTRY_LIST_STALE_TIME_MS = 30 * 60_000;
 
-type SkillsCollectionMode = "library" | "browse";
-
-/**
- * View a skill's SKILL.md. Writable user-owned local skills can start an edit
- * thread or be deleted. Connected — owns the content/delete queries and renders
- * {@link SkillDetailDialogView}.
- */
 function SkillDetailPage({
   projectId,
   skill,
@@ -72,15 +81,22 @@ function SkillDetailPage({
   onClose: () => void;
   onEdit: (skill: SkillSummary) => void;
 }) {
+  const providerRoster = useProviderRoster();
   const [selectedPath, setSelectedPath] = useState("SKILL.md");
   useEffect(() => {
     setSelectedPath("SKILL.md");
   }, [skill?.id]);
   const filesQuery = useSkillFiles(projectId, skill);
   const contentQuery = useSkillContent(projectId, skill, selectedPath);
+  const primaryHost = usePrimaryHost({ enabled: skill !== null });
+  const previewHostId =
+    primaryHost?.status === "connected" ? primaryHost.id : null;
+  const skillFilePreview = useHostFilePreview(
+    previewHostId,
+    skill?.filePath ?? null,
+    { enabled: skill !== null && previewHostId !== null },
+  );
   const deleteSkill = useDeleteSkill(projectId);
-  // Skills live on the local host (personal project), so the SKILL.md is a real
-  // local file we can hand to the user's editor.
   const { canOpenPreferredFileTarget, openPathInPreferredFileTarget } =
     useLocalOpenTargets({ enabled: skill !== null });
 
@@ -88,10 +104,19 @@ function SkillDetailPage({
     skill && skill.manageable && isSkillEditable(skill) ? skill.scope : null;
   const editableScope: EditableSkillScope | null =
     skill && isSkillEditable(skill) ? skill.scope : null;
+  const markdownLinkRouting = useMemo(() => {
+    if (skill === null) return undefined;
+    return buildMarkdownLeaseImageRouting({
+      path: selectedPath,
+      rootPath: getAbsoluteDirname({ path: skill.filePath }),
+      previewUrl: skillFilePreview.data?.url,
+    });
+  }, [selectedPath, skill, skillFilePreview.data?.url]);
 
   return (
     <SkillDetailDialogView
       skill={skill}
+      providerRoster={providerRoster}
       files={filesQuery.data?.files ?? ["SKILL.md"]}
       selectedPath={selectedPath}
       onSelectPath={setSelectedPath}
@@ -102,6 +127,7 @@ function SkillDetailPage({
       canDelete={deletableScope !== null}
       canOpenInEditor={editableScope !== null && canOpenPreferredFileTarget}
       isDeleting={deleteSkill.isPending}
+      markdownLinkRouting={markdownLinkRouting}
       onEdit={() => {
         if (skill) onEdit(skill);
       }}
@@ -128,6 +154,8 @@ function SkillDetailPage({
 }
 
 export function SkillsLibrary() {
+  const providerRoster = useProviderRoster();
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
   const { skillId: routeSkillId, registrySkillId: routeRegistrySkillId } =
@@ -164,9 +192,46 @@ export function SkillsLibrary() {
     refetchOnWindowFocus: false,
     staleTime: REGISTRY_LIST_STALE_TIME_MS,
   });
+  const trimmedRegistrySearch = registrySearch.trim();
+  const [loadedRegistry, setLoadedRegistry] = useState<{
+    ranking: RegistryRanking;
+    search: string;
+    skills: RegistrySkill[];
+    hasMore: boolean;
+  }>({
+    ranking: "trending",
+    search: trimmedRegistrySearch,
+    skills: [],
+    hasMore: false,
+  });
+  useEffect(() => {
+    const data = registryQuery.data;
+    if (data === undefined) return;
+    setLoadedRegistry((current) => {
+      const matches =
+        current.ranking === data.ranking &&
+        current.search === trimmedRegistrySearch;
+      const base = matches ? current.skills : [];
+      const seen = new Set(base.map((skill) => skill.id));
+      const fresh = data.skills.filter((skill) => !seen.has(skill.id));
+      return {
+        ranking: data.ranking,
+        search: trimmedRegistrySearch,
+        skills: fresh.length === 0 && matches ? base : [...base, ...fresh],
+        hasMore: data.pagination.hasMore,
+      };
+    });
+  }, [registryQuery.data, trimmedRegistrySearch]);
+  const loadedRegistrySkills = useMemo(
+    () =>
+      loadedRegistry.search === trimmedRegistrySearch
+        ? loadedRegistry.skills
+        : [],
+    [loadedRegistry, trimmedRegistrySearch],
+  );
   const registryRepositorySources = useMemo(() => {
     const sources = new Map<string, string>();
-    for (const skill of registryQuery.data?.skills ?? []) {
+    for (const skill of loadedRegistrySkills) {
       if (skill.stars === null) {
         const repositoryKey = registryRepositoryKey(skill.source);
         if (!sources.has(repositoryKey)) {
@@ -178,7 +243,7 @@ export function SkillsLibrary() {
       repositoryKey,
       source,
     }));
-  }, [registryQuery.data?.skills]);
+  }, [loadedRegistrySkills]);
   const registryRepositoryStars = useQueries({
     queries: registryRepositorySources.map(({ repositoryKey, source }) => ({
       queryKey: ["skills-registry-repository-stars", repositoryKey],
@@ -187,17 +252,8 @@ export function SkillsLibrary() {
       enabled: isRegistryBrowseRoute,
       staleTime: 6 * 60 * 60_000,
       retry: false,
-      // staleTime only protects successes: an errored query has no
-      // dataUpdatedAt, so it is permanently stale and the app-wide
-      // refetch-on-focus default re-fires every failed lookup on every focus,
-      // against a 60-request/hour GitHub budget. This also stops successful
-      // results refreshing on focus, which is fine — star counts and
-      // descriptions move slowly and still refresh on remount.
       refetchOnWindowFocus: false,
     })),
-    // `combine` results are structurally shared, so this Map is referentially
-    // stable across renders. That lets the enrichment memo below list honest
-    // dependencies instead of hashing query data by hand.
     combine: (results) => ({
       values: new Map(
         registryRepositorySources.flatMap(({ repositoryKey }, index) => {
@@ -212,45 +268,61 @@ export function SkillsLibrary() {
       ),
     }),
   });
-  const registryDescriptionSkills = useMemo(
+  const registryRanking = loadedRegistry.ranking;
+  const registryDescriptionSkillIds = useMemo(
     () =>
-      (registryQuery.data?.skills ?? []).filter(
-        (skill) => skill.summary === null,
-      ),
-    [registryQuery.data?.skills],
+      loadedRegistrySkills
+        .filter(
+          (skill) => skill.summary === null || registryRanking === "trending",
+        )
+        .map((skill) => skill.id)
+        .sort(),
+    [loadedRegistrySkills, registryRanking],
   );
-  const registryDescriptions = useQueries({
-    queries: registryDescriptionSkills.map((skill) => ({
-      queryKey: ["skills-registry-entry", skill.id],
-      queryFn: ({ signal }: { signal: AbortSignal }) =>
-        fetchRegistrySkillEntry(skill.id, signal),
-      enabled: isRegistryBrowseRoute,
-      staleTime: 30 * 60_000,
-      retry: false,
-      refetchOnWindowFocus: false,
-    })),
-    combine: (results) => ({
-      values: new Map(
-        registryDescriptionSkills.flatMap((skill, index) => {
-          const entry = results[index]?.data;
-          return entry === undefined ? [] : ([[skill.id, entry]] as const);
-        }),
-      ),
-      pendingSkillIds: new Set(
-        registryDescriptionSkills.flatMap((skill, index) =>
-          results[index]?.isPending ? [skill.id] : [],
-        ),
-      ),
-    }),
+  const registryEntriesQuery = useQuery({
+    queryKey: ["skills-registry-entries", registryDescriptionSkillIds],
+    queryFn: ({ signal }) =>
+      fetchRegistrySkillEntries(registryDescriptionSkillIds, signal),
+    enabled: isRegistryBrowseRoute && registryDescriptionSkillIds.length > 0,
+    staleTime: 30 * 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+    placeholderData: keepPreviousData,
   });
+  const registryDescriptions = useMemo(() => {
+    const values = new Map(
+      (registryEntriesQuery.data ?? []).map(
+        (entry) => [entry.id, entry] as const,
+      ),
+    );
+    return {
+      values,
+      pendingSkillIds: new Set(
+        registryEntriesQuery.isFetching
+          ? registryDescriptionSkillIds.filter((id) => !values.has(id))
+          : [],
+      ),
+    };
+  }, [
+    registryEntriesQuery.data,
+    registryEntriesQuery.isFetching,
+    registryDescriptionSkillIds,
+  ]);
   const registrySkills = useMemo(
     () =>
-      (registryQuery.data?.skills ?? []).map((skill) => {
+      loadedRegistrySkills.map((skill) => {
         const entry = registryDescriptions.values.get(skill.id);
         const describedSkill =
           entry === undefined
             ? skill
-            : { ...skill, topic: entry.topic, summary: entry.summary };
+            : {
+                ...skill,
+                ...(registryRanking === "trending"
+                  ? { installs: entry.installs }
+                  : {}),
+                topic: entry.topic,
+                summary: entry.summary,
+              };
         if (describedSkill.stars !== null) return describedSkill;
         const stars = registryRepositoryStars.values.get(
           registryRepositoryKey(describedSkill.source),
@@ -260,15 +332,27 @@ export function SkillsLibrary() {
           : { ...describedSkill, stars };
       }),
     [
-      registryQuery.data?.skills,
+      loadedRegistrySkills,
       registryDescriptions.values,
       registryRepositoryStars.values,
+      registryRanking,
     ],
+  );
+  const unknownInstallSkillIds = useMemo(
+    () =>
+      new Set(
+        registryRanking === "trending"
+          ? loadedRegistrySkills.flatMap((skill) =>
+              registryDescriptions.values.has(skill.id) ? [] : [skill.id],
+            )
+          : [],
+      ),
+    [registryRanking, loadedRegistrySkills, registryDescriptions.values],
   );
   const pendingRegistrySkillIds = useMemo(
     () =>
       new Set(
-        (registryQuery.data?.skills ?? []).flatMap((skill) =>
+        loadedRegistrySkills.flatMap((skill) =>
           registryDescriptions.pendingSkillIds.has(skill.id) ||
           registryRepositoryStars.pendingRepositoryKeys.has(
             registryRepositoryKey(skill.source),
@@ -279,7 +363,7 @@ export function SkillsLibrary() {
       ),
     [
       registryDescriptions.pendingSkillIds,
-      registryQuery.data?.skills,
+      loadedRegistrySkills,
       registryRepositoryStars.pendingRepositoryKeys,
     ],
   );
@@ -373,22 +457,9 @@ export function SkillsLibrary() {
     setRegistrySearch(nextQuery);
     setRegistryPage(0);
   }, []);
-  const changeCollectionMode = useCallback(
-    (mode: SkillsCollectionMode) => {
-      if (mode === "browse") {
-        setRegistryPage(0);
-        navigate(getSkillsRoutePath());
-        return;
-      }
-      navigate(getToolsOwnedCollectionRoutePath("skills"));
-    },
-    [navigate],
-  );
   const closeSkillDetail = useCallback(() => {
     navigate(getToolsOwnedCollectionRoutePath("skills"));
   }, [navigate]);
-  // Create via prompt: open the composer seeded with the bb-skill prompt; the
-  // spawned thread authors the SKILL.md.
   const handleCreateSkill = useCallback(
     (prompt?: string) => {
       navigate(getRootComposeRoutePath(), {
@@ -486,35 +557,51 @@ export function SkillsLibrary() {
       ) : (
         <SkillsOverview
           skills={skills}
+          providerRoster={providerRoster}
           isLoading={isLoading}
           hasError={hasError}
           query={libraryQuery}
           activeMode={isRegistryBrowseRoute ? "browse" : "library"}
-          onModeChange={changeCollectionMode}
           browseContent={
             <RegistrySkillsBrowsePage
               skills={registrySkills}
-              pendingSkillIds={pendingRegistrySkillIds}
-              pagination={
-                registryQuery.data?.pagination ?? {
-                  ...EMPTY_REGISTRY_PAGINATION,
-                  page: registryRequestPage,
-                }
+              action={
+                <CreateWithTemplatesButton
+                  kind="skill"
+                  label="New bb skill"
+                  onCreate={handleCreateSkill}
+                />
               }
+              pendingSkillIds={pendingRegistrySkillIds}
+              unknownInstallSkillIds={unknownInstallSkillIds}
               isLoading={
-                registryQuery.isFetching && registryQuery.data === undefined
+                registryQuery.isFetching && loadedRegistrySkills.length === 0
+              }
+              loadingMore={
+                registryQuery.isFetching && loadedRegistrySkills.length > 0
+              }
+              hasMore={
+                loadedRegistry.search === trimmedRegistrySearch &&
+                loadedRegistry.hasMore
               }
               hasError={registryQuery.isError}
               query={registrySearch}
               onRetry={() => void registryQuery.refetch()}
               onQueryChange={handleRegistryQueryChange}
-              onPageChange={setRegistryPage}
+              onLoadMore={() => {
+                if (!registryQuery.isFetching) {
+                  setRegistryPage((current) => current + 1);
+                }
+              }}
               onFork={forkRegistrySkill}
               onSelect={openRegistrySkill}
             />
           }
           onCreateSkill={handleCreateSkill}
           onSelectSkill={openSkill}
+          onPrefetchSkill={(skill) =>
+            prefetchSkillDetail(queryClient, PERSONAL_PROJECT_ID, skill)
+          }
           onQueryChange={setLibraryQuery}
           onRetry={() => void skillsQuery.refetch()}
         />

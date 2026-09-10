@@ -1,29 +1,26 @@
 import { fuzzyMatchText } from "@bb/fuzzy-match";
-import type { PromptMentionSuggestion } from "@/components/promptbox/mentions/types";
-import { compareCodepoint } from "@/lib/codepoint-compare";
+import type { PromptMentionSuggestion } from "@bb/client-core";
+import { compareCodepoint } from "@bb/client-core";
 
-export type SectionMentionSuggestion = Extract<
+type SectionMentionSuggestion = Extract<
   PromptMentionSuggestion,
   { kind: "section" }
 >;
 
-/** A thread section the mention menu can offer. */
 export interface SectionMentionCandidate {
   id: string;
   name: string;
 }
 
-export interface BuildSectionMentionSuggestionsArgs {
+interface BuildSectionMentionSuggestionsArgs {
   sections: readonly SectionMentionCandidate[];
   query: string;
   limit: number;
 }
 
-function getSectionSearchTexts(
-  section: SectionMentionCandidate,
-): readonly string[] {
+function getSectionSearchText(section: SectionMentionCandidate): string {
   const name = section.name.trim();
-  return name ? [name, section.id] : [section.id];
+  return name || section.id;
 }
 
 function toSectionMentionSuggestion(
@@ -49,7 +46,8 @@ export function buildSectionMentionSuggestions(
   const matches = fuzzyMatchText({
     items: args.sections,
     query: trimmedQuery,
-    getText: getSectionSearchTexts,
+    getText: getSectionSearchText,
+    getAliases: (section) => [section.id],
     limit: args.sections.length,
   });
 

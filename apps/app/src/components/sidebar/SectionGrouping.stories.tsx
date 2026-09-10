@@ -13,10 +13,10 @@ import {
   type ProjectThreadListState,
 } from "./ProjectRow";
 import {
+  buildSidebarEntitySectionId,
   compareStandardThreads,
   type SidebarSectionDefinition,
-} from "./projectThreadGroups";
-import { buildSidebarEntitySectionId } from "./sidebarSectionOrder";
+} from "@bb/client-core";
 
 export default {
   title: "sidebar/Section grouping",
@@ -90,7 +90,8 @@ const sectionThreads: ThreadListEntry[] = [
     environmentId: "env_story_section",
     environmentName: "Section build",
     environmentBranchName: "bb/sidebar-sections",
-    environmentWorkspaceDisplayKind: "managed-worktree",
+    environmentProviderId: "git-worktree",
+    queuedWork: "none",
     latestAttentionAt: 40,
     createdAt: 40,
   }),
@@ -101,7 +102,8 @@ const sectionThreads: ThreadListEntry[] = [
     environmentId: "env_story_section",
     environmentName: "Section build",
     environmentBranchName: "bb/sidebar-sections",
-    environmentWorkspaceDisplayKind: "managed-worktree",
+    environmentProviderId: "git-worktree",
+    queuedWork: "none",
     hasPendingInteraction: true,
     latestAttentionAt: 30,
     createdAt: 30,

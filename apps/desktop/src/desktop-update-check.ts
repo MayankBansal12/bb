@@ -14,11 +14,11 @@ export const DESKTOP_UPDATE_ACTIVE_MIN_INTERVAL_MS = 15 * 60 * 1000;
 
 type DesktopUpdateIntervalHandle = ReturnType<typeof setInterval>;
 
-export interface DesktopUpdateLogger {
+interface DesktopUpdateLogger {
   warn(message: string): void;
 }
 
-export interface ParseDesktopVersionFeedArgs {
+interface ParseDesktopVersionFeedArgs {
   channel: BbDesktopVersionFeed["channel"];
   checkedAt: string;
   currentVersion: string;
@@ -37,11 +37,11 @@ interface MalformedDesktopVersionFeedParseResult {
   reason: string;
 }
 
-export type DesktopVersionFeedParseResult =
+type DesktopVersionFeedParseResult =
   | MalformedDesktopVersionFeedParseResult
   | ValidDesktopVersionFeedParseResult;
 
-export interface CreateDesktopUpdateServiceArgs {
+interface CreateDesktopUpdateServiceArgs {
   channel: BbDesktopVersionFeed["channel"];
   currentVersion: string;
   enabled: boolean;
@@ -105,16 +105,12 @@ function areDesktopInfoValuesEqual(
   );
 }
 
-function parseJsonPayload(payloadText: string): unknown {
-  return JSON.parse(payloadText);
-}
-
 export function parseDesktopVersionFeed(
   args: ParseDesktopVersionFeedArgs,
 ): DesktopVersionFeedParseResult {
   let payload: unknown;
   try {
-    payload = parseJsonPayload(args.payloadText);
+    payload = JSON.parse(args.payloadText);
   } catch (error) {
     return {
       kind: "malformed",
@@ -132,9 +128,6 @@ export function parseDesktopVersionFeed(
     };
   }
 
-  // Both platforms publish a feed into the same release tag, so a swapped or
-  // mis-uploaded asset is now possible where it was not before. A feed that
-  // does not describe this build must never raise an update prompt.
   if (parsedFeed.data.platform !== args.platform) {
     return {
       kind: "malformed",

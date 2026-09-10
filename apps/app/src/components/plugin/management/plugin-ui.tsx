@@ -1,46 +1,106 @@
-import { useState, type ReactNode } from "react";
-import { Icon, type IconName } from "@bb/shared-ui/icon";
+import { useState, type CSSProperties, type ReactNode } from "react";
+import { Icon } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
-import { PluginIcon } from "@/components/plugin/PluginIcon";
+import { ResourceIconFrame } from "@bb/shared-ui/resource-list";
+import {
+  PluginCompactIconMask,
+  PluginIcon,
+  pluginIconName,
+} from "@/components/plugin/PluginIcon";
 import { usePreferredTheme } from "@/hooks/useTheme";
 import type { PluginListItem } from "@/hooks/queries/plugin-settings-queries";
 
-/**
- * Shared pieces of the Plugins collection and detail surfaces. Tinted styles derive
- * from the theme anchors per the repo palette rules. These mix a *chromatic*
- * token (--success/--warning-text/--destructive-text) against the near-zero
- * chroma --canvas/--ink anchors, so they mix `in oklab`, not `in oklch`:
- * oklch would interpolate the hue from the anchor's 0° through to the token's
- * hue, dragging a low-percentage green mix through orange/pink. oklab
- * interpolates on the a/b axes, so the hue survives at every step. (The
- * general "opaque steps mix in oklch" rule is for neutral --ink/--canvas
- * derivations, where both poles are achromatic and there is no hue to lose.)
- */
-
-/** Green "Update X.Y.Z" tint (sketch v2 `.pill.update`). */
-export const UPDATE_TINT_STYLE = {
-  background: "color-mix(in oklab, var(--success) 14%, var(--canvas))",
-  borderColor: "color-mix(in oklab, var(--success) 35%, var(--canvas))",
-  color: "color-mix(in oklab, var(--success) 80%, var(--ink))",
+export const UPDATE_ICON_STYLE = {
+  color: "color-mix(in oklab, var(--success) 72%, var(--ink))",
 } as const;
 
-/** Success verdict banner tint (sketch v2 `.banner`). */
-export const SUCCESS_BANNER_STYLE = {
-  background: "color-mix(in oklab, var(--success) 9%, var(--canvas))",
-  borderColor: "color-mix(in oklab, var(--success) 35%, var(--canvas))",
-} as const;
+export function isReadablePluginVersion(version: string): boolean {
+  return /^v?\d+\.\d+/u.test(version);
+}
 
-/** Warning note tint (sketch `.notebox.warn`, full-trust warning). */
-export const WARNING_NOTE_STYLE = {
-  background: "color-mix(in oklab, var(--warning-text) 6%, var(--canvas))",
-  borderColor: "color-mix(in oklab, var(--warning-text) 35%, var(--canvas))",
-} as const;
+export function displayPluginVersion(version: string): string {
+  return /^[0-9a-f]{12,}$/iu.test(version) ? version.slice(0, 7) : version;
+}
 
 export const SUCCESS_TEXT_STYLE = {
   color: "color-mix(in oklab, var(--success) 80%, var(--ink))",
 } as const;
 
-/** Plugin identity for roomy surfaces, with rich artwork as an optional override. */
+const PLUGIN_INSTALL_COUNT_FORMATTER = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+export function formatPluginInstallCount(installs: number): string {
+  return PLUGIN_INSTALL_COUNT_FORMATTER.format(installs);
+}
+
+const PLUGIN_CATEGORY_ACCENT_TOKENS: Record<string, string> = {
+  "themes-and-appearance": "--file-accent",
+  "thread-management": "--file-accent",
+  "thread-content": "--file-accent",
+  "memory-and-context": "--success",
+  security: "--warning",
+  "agents-and-providers": "--success",
+  environments: "--attention",
+  "token-usage-and-limits": "--warning",
+  notifications: "--warning",
+  "code-and-reviews": "--pr-merged",
+  "file-viewers-and-editors": "--pr-merged",
+  "cloud-and-remote": "--attention",
+  "command-line": "--attention",
+  utilities: "--attention",
+  "plugin-development": "--pr-merged",
+  "tasks-and-workflows": "--success",
+};
+
+function neutral(percent: number): string {
+  return `color-mix(in oklch, var(--ink) ${percent}%, var(--canvas))`;
+}
+
+function accentTint(token: string, percent: number): string {
+  return `color-mix(in oklch, var(${token}) ${percent}%, var(--canvas))`;
+}
+
+function accentInk(token: string, percent: number): string {
+  return `color-mix(in oklch, var(${token}) ${percent}%, var(--ink))`;
+}
+
+function pluginCatalogCategoryAccentToken(
+  categoryId: string | undefined,
+): string | undefined {
+  return categoryId === undefined
+    ? undefined
+    : PLUGIN_CATEGORY_ACCENT_TOKENS[categoryId];
+}
+
+export function pluginCatalogCategoryPillStyle(
+  categoryId: string | undefined,
+): CSSProperties {
+  const accentToken = pluginCatalogCategoryAccentToken(categoryId);
+  return accentToken === undefined
+    ? {
+        background: neutral(8),
+        borderColor: neutral(16),
+        color: neutral(55),
+      }
+    : {
+        background: accentTint(accentToken, 16),
+        borderColor: accentTint(accentToken, 24),
+        color: accentInk(accentToken, 52),
+      };
+}
+
+export function pluginCatalogCategoryMutedAccentStyle(
+  categoryId: string | undefined,
+): CSSProperties {
+  const accentToken = pluginCatalogCategoryAccentToken(categoryId);
+  return {
+    background:
+      accentToken === undefined ? neutral(36) : accentTint(accentToken, 55),
+  };
+}
+
 export function PluginLogo({
   plugin,
   className,
@@ -55,8 +115,6 @@ export function PluginLogo({
       : plugin.logoUrl;
   const [failedLogoUrl, setFailedLogoUrl] = useState<string | null>(null);
   if (logoUrl === null || logoUrl === failedLogoUrl) {
-    // No rich image: use the plugin's compact asset or named icon, falling
-    // back to the generic plugin glyph (never a letter avatar).
     return (
       <span
         aria-hidden="true"
@@ -86,29 +144,81 @@ export function PluginLogo({
   );
 }
 
-/**
- * Neutral avatar for entries without a shipped logo (installed rows, browse
- * cards and catalog status). Renders a bare generic glyph — a placeholder, not
- * the entry's initial and not a tile. The `className` sizes the footprint so
- * it aligns with sibling logo images.
- */
-export function PlaceholderBadge({
+export function CatalogEntryIcon({
+  entry,
   className,
-  iconName = "Zap",
 }: {
-  className?: string;
-  iconName?: IconName;
+  entry: {
+    displayName: string;
+    icon: string | null;
+    iconUrl: string | null;
+    iconTinted: boolean;
+  };
+  className: string;
 }) {
+  const [failedIconUrl, setFailedIconUrl] = useState<string | null>(null);
   return (
     <span
       aria-hidden="true"
-      className={cn(
-        "grid shrink-0 place-items-center text-muted-foreground",
-        className,
-      )}
+      data-catalog-entry-icon-glyph=""
+      className={cn("grid shrink-0 place-items-center", className)}
     >
-      <Icon name={iconName} className="size-5" />
+      {entry.iconUrl !== null && entry.iconTinted ? (
+        <PluginCompactIconMask url={entry.iconUrl} className="size-full" />
+      ) : entry.iconUrl === null || entry.iconUrl === failedIconUrl ? (
+        <Icon name={pluginIconName(entry.icon)} className="size-full" />
+      ) : (
+        <img
+          src={entry.iconUrl}
+          alt=""
+          className="size-full rounded-sm object-contain"
+          onError={() => setFailedIconUrl(entry.iconUrl)}
+        />
+      )}
     </span>
+  );
+}
+
+export function PluginCategoryLabel({
+  categoryId,
+  label,
+}: {
+  categoryId: string | undefined;
+  label: string;
+}) {
+  return (
+    <span
+      className="shrink-0 truncate rounded border px-2 py-1 text-2xs leading-none"
+      style={pluginCatalogCategoryPillStyle(categoryId)}
+    >
+      {label}
+    </span>
+  );
+}
+
+export function CatalogEntryIconChip({
+  entry,
+  className,
+}: {
+  entry: {
+    displayName: string;
+    icon: string | null;
+    iconUrl: string | null;
+    iconTinted: boolean;
+  };
+  className?: string;
+}) {
+  return (
+    <ResourceIconFrame
+      className={cn("size-10 rounded-md border", className)}
+      style={{
+        background: neutral(5),
+        borderColor: neutral(14),
+        color: neutral(55),
+      }}
+    >
+      {() => <CatalogEntryIcon entry={entry} className="size-6" />}
+    </ResourceIconFrame>
   );
 }
 
@@ -120,19 +230,13 @@ export function formatAbsoluteDate(epochMs: number): string {
   });
 }
 
-export interface DetailsDisclosureProps {
+interface DetailsDisclosureProps {
   summary: string;
   children: ReactNode;
-  /** Pre-expand when the details are the story (failure, skipped release). */
   defaultExpanded?: boolean;
   className?: string;
 }
 
-/**
- * The Layer 3 evidence disclosure: collapsed when the verdict line is the
- * whole story, pre-expanded when a check failed or something surprising
- * happened.
- */
 export function DetailsDisclosure({
   summary,
   children,
@@ -168,23 +272,17 @@ export function DetailsDisclosure({
   );
 }
 
-/** Key/value grid used in dialogs and the source-details disclosure. */
 export function KeyValueGrid({
   entries,
 }: {
-  entries: { key: string; value: ReactNode; mono?: boolean }[];
+  entries: { key: string; value: ReactNode }[];
 }) {
   return (
     <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1.5 text-xs">
       {entries.map((entry) => (
         <div key={entry.key} className="contents">
           <dt className="text-muted-foreground">{entry.key}</dt>
-          <dd
-            className={cn(
-              "min-w-0 break-words text-foreground",
-              entry.mono !== false && "font-mono",
-            )}
-          >
+          <dd className="min-w-0 break-words text-foreground font-mono">
             {entry.value}
           </dd>
         </div>
@@ -193,7 +291,6 @@ export function KeyValueGrid({
   );
 }
 
-/** The full-trust reminder — a quiet inline note, not a loud callout. */
 export function FullTrustWarning() {
   return (
     <p
@@ -202,14 +299,13 @@ export function FullTrustWarning() {
     >
       <Icon name="Lock" className="mt-0.5 size-3 shrink-0" />
       <span>
-        Plugins run as full-trust code with access to all local bb data. Only
-        install sources you trust.
+        Plugins run as full-trust code with access to your computer. Only
+        install from sources you trust.
       </span>
     </p>
   );
 }
 
-/** The rollback promise — always visible in update dialogs (locked rule). */
 export function RollbackNote({
   fromVersion,
   toVersion,

@@ -18,10 +18,8 @@ import {
   AutomationRunStatusIndicator,
 } from "bb-plugin-automations/detail-view";
 import { AUTOMATION_CREATE_TEMPLATES } from "bb-plugin-automations/overview-view";
-import {
-  pluginSourceQueryKey,
-  type PluginCatalogSearchEntry,
-} from "@/hooks/queries/plugin-catalog-queries";
+import type { PluginCatalogSearchEntry } from "@/hooks/queries/plugin-catalog-queries";
+import { pluginSourceQueryKey } from "@/hooks/queries/query-keys";
 import {
   EMPTY_PLUGIN_UPDATE_STATE,
   type PluginListItem,
@@ -38,27 +36,17 @@ import {
   PluginProvenancePill,
 } from "@/components/tools/PluginDetail";
 import {
-  BbLogo,
   ProviderLogo,
   SkillProvenanceTooltip,
 } from "@/components/tools/SkillsCollection";
+import { BbLogo } from "@/components/ui/bb-logo";
+import { ProvenancePill } from "@/components/tools/ProvenancePill";
+import { SkillDetailView } from "@/components/tools/SkillDetailView";
 import {
-  SkillDetailView,
-  SkillOwnershipBadge,
-} from "@/components/tools/SkillDetailView";
+  makePluginListItem,
+  makePluginRegistrationSet,
+} from "@/test/fixtures/plugins";
 
-/**
- * Every state each tool type's detail page can be in, rendered as the real
- * page. One story per tool type: scroll it and you have reviewed that type.
- *
- * These are the whole Extensions detail story surface, deliberately. Anything a running
- * server would show you is better seen in the running app, and anything that
- * must not regress belongs in a test — `detail-page-recipes.test.tsx` pins
- * section order and labels, `SkillsView.test.tsx` and `ToolsSidebar.test.tsx`
- * pin routing. What is left, and what these cover, is the states a healthy
- * local server will not produce on demand: loading, missing, failed, empty,
- * and disabled — plus content ugly enough to break a layout.
- */
 export default {
   title: "Extensions",
 };
@@ -152,11 +140,6 @@ function Story({
   );
 }
 
-/**
- * One state: what it is on the left, the real page on the right. The caption
- * sticks while a tall page scrolls past it, so you never lose track of which
- * state you are looking at.
- */
 function State({
   name,
   note,
@@ -181,16 +164,8 @@ function State({
   );
 }
 
-// --- Skills -----------------------------------------------------------------
-
 const SKILL_PATH = "/Users/you/.bb/skills/writing-voice/SKILL.md";
 
-/**
- * The leading slot carries the skill's provider, exactly as the real library
- * rows and detail route do — a provider logo when the skill is discovered
- * under one, the bb mark when it is not. Omitting it here would make every
- * state below misrepresent the page.
- */
 function SkillLeading({ provider }: { provider: SkillProvider | null }) {
   if (provider === null) {
     return <BbLogo />;
@@ -378,35 +353,16 @@ export function SkillDetailStates() {
   );
 }
 
-// --- Plugins ----------------------------------------------------------------
-
-const PLUGIN: PluginListItem = {
+const PLUGIN: PluginListItem = makePluginListItem({
   id: "github",
   source: "npm:@bb-plugins/github",
   rootDir: "/Users/you/.bb/plugins/github",
   version: "1.4.0",
-  enabled: true,
-  status: "running",
-  statusDetail: null,
   description: "Browse GitHub issues and pull requests without leaving bb.",
   name: "GitHub",
   icon: "Github",
-  compactIconUrl: null,
-  logoUrl: null,
-  logoDarkUrl: null,
-  hasSettings: false,
-  handlerStats: { count: 0, totalMs: 0, maxMs: 0, errorCount: 0 },
-  services: [],
-  schedules: [],
-  cliCommand: null,
-  capabilities: [],
-  app: { hasApp: false, bundle: null },
-  provenance: "direct",
-  isOrphanedBuiltin: false,
-  catalogEntryId: null,
   sourceDisplay: "npm · @bb-plugins/github",
-  updateState: EMPTY_PLUGIN_UPDATE_STATE,
-};
+});
 
 const NEXT_RUN_AT = new Date(2027, 0, 15, 9).getTime();
 
@@ -428,8 +384,6 @@ const STATIC_CAPABILITIES: PluginListItem["capabilities"] = [
 const FULL_PLUGIN: PluginListItem = {
   ...PLUGIN,
   cliCommand: { name: "gh", summary: "Work with GitHub from the terminal" },
-  // One fixture covers every service and schedule state the Activity section
-  // can render, so they are reviewed in context instead of as loose icons.
   services: [
     { name: "issue-sync", state: "running" },
     { name: "webhook-listener", state: "backoff" },
@@ -476,11 +430,6 @@ const APP_SURFACE_PLUGIN = {
   app: { hasApp: true, bundle: null },
 } satisfies PluginListItem;
 
-/**
- * The shapes fixtures usually flatter away: an id long enough to have no break
- * opportunity, prose that outgrows one line, and every capability group
- * populated at once.
- */
 const AWKWARD_PLUGIN: PluginListItem = {
   ...FULL_PLUGIN,
   id: "enterprise-issue-tracker-synchronization",
@@ -512,13 +461,6 @@ const AWKWARD_PLUGIN: PluginListItem = {
   ],
 };
 
-/**
- * Release is not always two passive values. An offered update, a rolled-back
- * update, and an update held back by compatibility each add a Release-section
- * state. They are built on the minimal plugin so the state under review
- * is Release itself, and each carries its own id so the seeded source query
- * covers it without a backend request.
- */
 const UPDATE_AVAILABLE_PLUGIN: PluginListItem = {
   ...PLUGIN,
   id: "github-update-available",
@@ -543,11 +485,6 @@ const UPDATE_FAILED_PLUGIN: PluginListItem = {
   },
 };
 
-/**
- * A bundled plugin has no update channel of its own, so Release states the
- * policy instead of an install date. That is the longest release value the
- * section carries, and it needs no source request at all.
- */
 const BUNDLED_PLUGIN: PluginListItem = {
   ...PLUGIN,
   id: "github-bundled",
@@ -560,13 +497,25 @@ const BUNDLED_PLUGIN: PluginListItem = {
 
 const UNINSTALLED_CATALOG_PLUGIN = {
   entryId: "github",
+  marketplace: "bb-official",
   pluginId: "github",
   displayName: "GitHub",
   description: "Browse GitHub issues and pull requests without leaving bb.",
   icon: "Github",
+  iconUrl: null,
+  iconTinted: false,
   category: "Developer tools",
+  screenshots: [],
+  collections: [],
   source: "builtin:github",
+  repositoryUrl: null,
+  marketplaceDisplayName: "BB Official",
+  publisherKey: "bb-official",
+  publisherLabel: "BB Official",
+  official: true,
+  author: null,
   installed: false,
+  installs: null,
   compatible: true,
   incompatibleReason: null,
 } satisfies PluginCatalogSearchEntry;
@@ -581,12 +530,6 @@ const COMPATIBILITY_BLOCKED_PLUGIN: PluginListItem = {
   },
 };
 
-/**
- * Runs the real persisted-failure Retry path long enough to inspect its pending
- * state. Success clears the failure and advances the rendered version before
- * the production success toast appears, matching the list refresh that follows
- * a real update.
- */
 function FailedReleaseLifecycle() {
   const [plugin, setPlugin] = useState(UPDATE_FAILED_PLUGIN);
 
@@ -643,9 +586,6 @@ function Plugin({
   isLoading?: boolean;
 }) {
   return (
-    // Banners are siblings of the page, not children, and they span the pane
-    // (ToolsView.tsx:236). The negative inset undoes the story card's padding
-    // so the full-bleed bars read the way they do in the app.
     <div className="flex min-w-0 flex-col">
       {plugin === null ? null : (
         <div className="-mx-4 md:-mx-5">
@@ -662,6 +602,8 @@ function Plugin({
           onEdit={noop}
           onOpenSource={noop}
           onDelete={noop}
+          catalogEntries={[]}
+          onOpenPlugin={noop}
         />
       </div>
     </div>
@@ -683,14 +625,22 @@ function CatalogPlugin({
         <CatalogPluginDetail
           entry={entry}
           onInstall={() => setInstallOpen(true)}
+          catalogEntries={[entry]}
+          onOpenPlugin={noop}
         />
       </div>
       <AddPluginDialog
         open={installOpen}
         initial={{
           entryId: entry.entryId,
+          pluginId: entry.pluginId,
+          marketplace: "bb-official",
+          publisherLabel: "BB Official",
           displayName: entry.displayName,
           icon: entry.icon,
+          iconUrl: entry.iconUrl,
+          iconTinted: entry.iconTinted,
+          source: entry.source,
         }}
         onOpenChange={setInstallOpen}
       />
@@ -698,37 +648,32 @@ function CatalogPlugin({
   );
 }
 
-/**
- * App surfaces reach Includes through the browser slot registry rather than the
- * server payload, because a React component cannot cross that boundary. The
- * story registers them the same way a loaded plugin frontend would.
- */
 function PluginWithAppSurfaces() {
   useEffect(() => {
-    setPluginSlotRegistrations(APP_SURFACE_PLUGIN.id, {
-      homepageSections: [],
-      settingsSections: [],
-      navPanels: [
-        {
-          id: "issues",
-          title: "Issues",
-          icon: "Github",
-          path: "issues",
-          component: () => null,
-        },
-      ],
-      threadPanelActions: [
-        {
-          id: "open-pr",
-          title: "Open pull request",
-          icon: "GitPullRequest",
-          component: () => null,
-        },
-      ],
-      sidebarFooterActions: [],
-      fileOpeners: [],
-      messageDirectives: [],
-    });
+    setPluginSlotRegistrations(
+      APP_SURFACE_PLUGIN.id,
+      makePluginRegistrationSet({
+        navPanels: [
+          {
+            id: "issues",
+            title: "Issues",
+            icon: "Github",
+            path: "issues",
+            component: () => null,
+          },
+        ],
+        threadPanelActions: [
+          {
+            id: "open-pr",
+            title: "Open pull request",
+            icon: "GitPullRequest",
+            component: () => null,
+          },
+        ],
+        sidebarFooterActions: [],
+        fileOpeners: [],
+      }),
+    );
     return () => removePluginSlotRegistrations(APP_SURFACE_PLUGIN.id);
   }, []);
   return <Plugin plugin={APP_SURFACE_PLUGIN} />;
@@ -1028,8 +973,6 @@ export function PluginReleaseStates() {
   );
 }
 
-// --- Cross-resource controls -----------------------------------------------
-
 function NoControl({ children }: { children: ReactNode }) {
   return (
     <span className="text-xs italic text-subtle-foreground">{children}</span>
@@ -1098,6 +1041,7 @@ const CATALOG_PLUGIN = {
   id: "github-official",
   provenance: "catalog",
   catalogEntryId: "github",
+  publisherLabel: "BB Community",
 } satisfies PluginListItem;
 
 const pluginUninstallItems = [
@@ -1109,10 +1053,18 @@ const pluginUninstallItems = [
   },
 ];
 
+const pluginCatalogItems = [
+  {
+    label: "Uninstall",
+    icon: "Trash2" as const,
+    tone: "destructive" as const,
+    onSelect: noop,
+  },
+];
+
 const pluginLocalItems = [
   { label: "Edit", icon: "Edit" as const, onSelect: noop },
   { label: "Open source", icon: "ExternalLink" as const, onSelect: noop },
-  { kind: "separator" as const },
   {
     label: "Remove from bb",
     icon: "Trash2" as const,
@@ -1144,12 +1096,6 @@ const automationMenuItems = [
   },
 ];
 
-/**
- * Every provenance, lifecycle, acquisition, and contextual control currently
- * emitted by the Automations, Plugins, and Skills resource surfaces. Generic
- * route recovery actions remain in the detail-state stories where their failed
- * context is visible; this inventory is for comparing the resource vocabulary.
- */
 export function ResourceControlStates() {
   return (
     <PluginStoryQueryBoundary>
@@ -1235,17 +1181,14 @@ export function ResourceControlStates() {
           <ControlRow
             state="Skill · BB Official"
             control={
-              <SkillOwnershipBadge
-                label="BB Official"
-                tooltip="Ships with bb"
-              />
+              <ProvenancePill label="BB Official" tooltip="Ships with bb" />
             }
             meaning="A skill that ships with bb."
           />
           <ControlRow
             state="Skill · Included"
             control={
-              <SkillOwnershipBadge
+              <ProvenancePill
                 label="Included"
                 tooltip={
                   <SkillProvenanceTooltip
@@ -1261,7 +1204,7 @@ export function ResourceControlStates() {
           <ControlRow
             state="Skill · Imported"
             control={
-              <SkillOwnershipBadge
+              <ProvenancePill
                 label="Imported"
                 tooltip={
                   <SkillProvenanceTooltip
@@ -1315,14 +1258,24 @@ export function ResourceControlStates() {
             meaning="A plugin mutation is in flight, so the lifecycle switch cannot race it."
           />
           <ControlRow
-            state="Installed actions"
+            state="Direct installed actions"
             control={
               <ResourceOverflowMenu
                 label="Direct plugin actions"
                 items={pluginUninstallItems}
               />
             }
-            meaning="Direct and catalog installs can be uninstalled from the ownership menu."
+            meaning="Direct installs can be submitted to the marketplace or uninstalled."
+          />
+          <ControlRow
+            state="Catalog installed actions"
+            control={
+              <ResourceOverflowMenu
+                label="Catalog plugin actions"
+                items={pluginCatalogItems}
+              />
+            }
+            meaning="Official catalog installs are already published, so their ownership menu only offers uninstall."
           />
           <ControlRow
             state="Local actions"
@@ -1332,7 +1285,7 @@ export function ResourceControlStates() {
                 items={pluginLocalItems}
               />
             }
-            meaning="Local sources can be edited, opened, or removed from bb without deleting the source directory."
+            meaning="Local sources can be edited, opened, submitted to the marketplace, or removed from bb without deleting the source directory."
           />
           <ControlRow
             state="BB Official built-in actions"

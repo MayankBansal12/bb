@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import { PERSONAL_PROJECT_ID } from "@bb/domain";
-import type { RegistrySkill } from "@bb/server-contract";
+import type { RegistryRanking, RegistrySkill } from "@bb/server-contract";
 import type { SkillsRegistryArea } from "@bb/sdk";
 import { action } from "../action.js";
 import { createCliBbSdk } from "../client.js";
@@ -71,12 +71,6 @@ function addWorkspaceOptions(command: Command): Command {
     .option("--json", "Print machine-readable JSON output");
 }
 
-/**
- * Enrichment fans out one request per item, and each one proxies to GitHub or
- * skills.sh. `--per-page` goes up to 100, so both the concurrency and the
- * number of items enriched are capped: unauthenticated GitHub allows 60
- * requests/hour/IP, and an uncapped burst exhausts that in a single search.
- */
 const REGISTRY_ENRICH_CONCURRENCY = 6;
 const REGISTRY_ENRICH_LIMIT = 48;
 
@@ -131,21 +125,20 @@ async function enrichRegistryStars(
   });
 }
 
-/**
- * The registry list deliberately no longer resolves summaries server-side —
- * that preflight was removed because it made browsing O(N) slow. The CLI has
- * no per-card lazy loading to compensate with, so it resolves the missing
- * summaries here instead, under the same caps as stars.
- */
-async function enrichRegistrySummaries(
+interface EnrichedRegistrySkill extends RegistrySkill {
+  lifetimeInstalls: number | null;
+}
+
+async function enrichRegistryEntries(
   registry: SkillsRegistryArea,
   skills: readonly RegistrySkill[],
-): Promise<RegistrySkill[]> {
+  ranking: RegistryRanking,
+): Promise<EnrichedRegistrySkill[]> {
+  const needsLifetimeInstalls = ranking === "trending";
   const missing = skills
-    .filter((skill) => skill.summary === null)
+    .filter((skill) => skill.summary === null || needsLifetimeInstalls)
     .slice(0, REGISTRY_ENRICH_LIMIT);
-  if (missing.length === 0) return [...skills];
-  const summaryById = new Map(
+  const entryById = new Map(
     await mapWithConcurrency(
       missing,
       REGISTRY_ENRICH_CONCURRENCY,
@@ -153,13 +146,19 @@ async function enrichRegistrySummaries(
         const entry = await registry
           .get({ registrySkillId: skill.id })
           .catch(() => null);
-        return [skill.id, entry?.summary ?? null] as const;
+        return [skill.id, entry] as const;
       },
     ),
   );
   return skills.map((skill) => {
-    const summary = summaryById.get(skill.id);
-    return summary == null ? skill : { ...skill, summary };
+    const entry = entryById.get(skill.id) ?? null;
+    return {
+      ...skill,
+      summary: entry?.summary ?? skill.summary,
+      lifetimeInstalls: needsLifetimeInstalls
+        ? (entry?.installs ?? null)
+        : skill.installs,
+    };
   });
 }
 
@@ -285,9 +284,15 @@ export function registerSkillCommands(
 
   skill
     .command("search [query]")
-    .description("Search the skills.sh registry")
+    .description(
+      "Search the skills.sh registry, or list what is trending with no query",
+    )
     .option("--page <number>", "Zero-based result page", "0")
-    .option("--per-page <number>", "Results per page", "24")
+    .option(
+      "--per-page <number>",
+      `Results per page; above ${REGISTRY_ENRICH_LIMIT} leaves lifetime install counts unresolved`,
+      "24",
+    )
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (query: string | undefined, options: SkillSearchOptions) => {
@@ -297,13 +302,24 @@ export function registerSkillCommands(
           page: parseNonnegativeInteger(options.page, 0),
           perPage: parseNonnegativeInteger(options.perPage, 24),
         });
-        const enrichedResult = {
-          ...result,
-          skills: await enrichRegistrySummaries(
-            registry,
-            await enrichRegistryStars(registry, result.skills),
-          ),
-        };
+        const enrichedSkills = await enrichRegistryEntries(
+          registry,
+          await enrichRegistryStars(registry, result.skills),
+          result.ranking,
+        );
+        const enrichedResult = { ...result, skills: enrichedSkills };
+        const unresolvedCount = enrichedSkills.filter(
+          (entry) => entry.lifetimeInstalls === null,
+        ).length;
+        if (unresolvedCount > 0) {
+          console.error(
+            `Lifetime install counts unresolved for ${unresolvedCount} of ` +
+              `${enrichedSkills.length} skills — a detail page could not be ` +
+              `fetched, or the page exceeds the ${REGISTRY_ENRICH_LIMIT}-row ` +
+              `enrichment cap. Those rows carry lifetimeInstalls: null and ` +
+              `print as "—"; installs still counts the ranking's window.`,
+          );
+        }
         if (outputJson(options, enrichedResult)) return;
         console.log(
           renderBorderlessTable(
@@ -314,7 +330,9 @@ export function registerSkillCommands(
             },
             enrichedResult.skills.map((entry) => [
               entry.id,
-              String(entry.installs),
+              entry.lifetimeInstalls === null
+                ? "—"
+                : String(entry.lifetimeInstalls),
               entry.stars === null ? "—" : String(entry.stars),
               entry.summary ?? "",
             ]),

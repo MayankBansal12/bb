@@ -6,7 +6,6 @@ import {
   getLastStoredProviderThreadId,
   getLastStoredTurnRequestEvent,
   getStoredTurnRequestEventForTurn,
-  getStoredProviderThreadIdAtOrBeforeSequence,
   getThread,
   listStoredTurnStartedKeys,
   noopNotifier,
@@ -23,6 +22,7 @@ import {
   systemErrorEventDataSchema,
   threadScope,
   turnRequestEventDataSchema,
+  WORKSPACE_PROVISIONING_STEP_KEYS,
 } from "@bb/domain";
 import { randomBytes } from "node:crypto";
 import type {
@@ -60,8 +60,24 @@ interface ThreadEventTransactionDeps {
   hub: DbNotifier;
 }
 
-export interface ClientTurnRequestedEventArgs {
-  continuationOfRequestId?: ClientTurnRequestId;
+/**
+ * What makes a dispatched turn a retry of an earlier one. Both halves travel
+ * together because either alone is useless: the id without the count cannot
+ * tell a second attempt from a fifth, and the count without the id cannot say
+ * what is being retried.
+ */
+export interface TurnRequestRetryMarker {
+  requestId: ClientTurnRequestId;
+  attempt: number;
+}
+
+interface ClientTurnRequestedEventArgs {
+  /**
+   * Set only when a `turn.failed` retry row is dispatching, marking this turn
+   * as attempt N of an earlier request rather than something the user just
+   * asked for.
+   */
+  retryOf?: TurnRequestRetryMarker;
   environmentId: string | null;
   execution: ResolvedThreadExecutionOptions;
   initiator: ThreadTurnInitiator;
@@ -70,10 +86,6 @@ export interface ClientTurnRequestedEventArgs {
   requestMethod: "thread/start" | "turn/start";
   senderThreadId: string | null;
   source: "spawn" | "tell";
-  // Family-B taxonomy stamping for `initiator: "system"` messages. Omitted for
-  // user/agent turns (legacy/non-system messages project as unlabeled/null).
-  // `senderThreadId` is null for system messages, so the subject is stamped
-  // here at emit time or it is unrecoverable downstream.
   systemMessageKind?: SystemMessageKind;
   systemMessageSubject?: SystemMessageSubject | null;
   target: TurnRequestTarget;
@@ -81,11 +93,11 @@ export interface ClientTurnRequestedEventArgs {
   type: "client/turn/requested";
 }
 
-export interface PreparedClientTurnRequestedEventArgs extends ClientTurnRequestedEventArgs {
+interface PreparedClientTurnRequestedEventArgs extends ClientTurnRequestedEventArgs {
   requestId: ClientTurnRequestId;
 }
 
-export interface ClientTurnLifecycleEventArgs {
+interface ClientTurnLifecycleEventArgs {
   environmentId: string | null;
   initiator: ThreadTurnInitiator;
   requestMethod: "thread/start" | "turn/start";
@@ -94,11 +106,11 @@ export interface ClientTurnLifecycleEventArgs {
   type: "client/thread/start" | "client/turn/start";
 }
 
-export type ClientTurnEventArgs =
+type ClientTurnEventArgs =
   | ClientTurnLifecycleEventArgs
   | ClientTurnRequestedEventArgs;
 
-export interface AppendedClientTurnRequest {
+interface AppendedClientTurnRequest {
   requestId: ClientTurnRequestId;
   sequence: number;
 }
@@ -108,16 +120,16 @@ export interface AppendedClientTurnRequestWithNotification extends AppendedClien
   notificationMetadata: ThreadChangeMetadata;
 }
 
-export type ThreadOwnershipChangeAction = "assign" | "release" | "transfer";
+type ThreadOwnershipChangeAction = "assign" | "release" | "transfer";
 
-export interface AppendThreadOwnershipChangeEventArgs {
+interface AppendThreadOwnershipChangeEventArgs {
   environmentId?: string | null;
   nextParentThreadId: string | null;
   previousParentThreadId: string | null;
   threadId: string;
 }
 
-export interface AppendSystemErrorEventArgs {
+interface AppendSystemErrorEventArgs {
   code: string;
   detail?: string;
   environmentId?: string | null;
@@ -128,20 +140,21 @@ export interface AppendSystemErrorEventArgs {
   threadId: string;
 }
 
-export interface AppendThreadProvisioningEventArgs {
+interface AppendThreadProvisioningEventArgs {
   entries: ProvisioningTranscriptEntry[];
-  environmentId: string;
+  environmentId: string | null;
   provisioningId: string;
   status: SystemThreadProvisioningStatus;
   threadId: string;
 }
 
-export interface BuildCwdBranchEntriesArgs {
+interface BuildCwdBranchEntriesArgs {
   branchName: string | null;
+  headSha: string | null;
   path: string;
 }
 
-export interface AppendThreadInterruptedEventArgs {
+interface AppendThreadInterruptedEventArgs {
   reason: SystemThreadInterruptedReason;
   threadId: string;
 }
@@ -232,12 +245,6 @@ function buildClientTurnBaseEventData(
   };
 }
 
-function buildClientTurnLifecycleEventData(
-  args: ClientTurnLifecycleEventArgs,
-): ClientTurnLifecycleEventData {
-  return buildClientTurnBaseEventData(args);
-}
-
 function buildClientTurnRequestedEventData(
   args: ClientTurnRequestedEventArgs,
   requestId: ClientTurnRequestId,
@@ -245,13 +252,13 @@ function buildClientTurnRequestedEventData(
   return {
     ...buildClientTurnBaseEventData(args),
     requestId,
-    ...(args.continuationOfRequestId !== undefined
-      ? { continuationOfRequestId: args.continuationOfRequestId }
+    ...(args.retryOf !== undefined
+      ? {
+          retryOfRequestId: args.retryOf.requestId,
+          retryAttempt: args.retryOf.attempt,
+        }
       : {}),
     senderThreadId: args.senderThreadId,
-    // Stamp the Family-B taxonomy fields when present. Omitted entirely for
-    // non-system turns so legacy events keep parsing via the schema's optional
-    // defaults (unlabeled / null) rather than carrying redundant payload.
     ...(args.systemMessageKind !== undefined
       ? { systemMessageKind: args.systemMessageKind }
       : {}),
@@ -325,7 +332,7 @@ function appendBuiltClientTurnEvent(
         environmentId: args.environmentId,
         type: args.type,
         scope: threadScope(),
-        data: buildClientTurnLifecycleEventData(args),
+        data: buildClientTurnBaseEventData(args),
       });
     case "client/turn/requested": {
       return appendBuiltClientTurnRequestedEvent(append, {
@@ -342,11 +349,6 @@ function isThreadReadStateUpdate(
   return result !== null;
 }
 
-// A user-initiated turn request implies the user has eyes on the thread, so
-// `lastReadAt` advances alongside the event. Without this, the unread divider
-// would later be placed against a stale read floor: the user's own message
-// would land past the cutoff when the thread eventually
-// replies and re-arms the snapshot.
 function applyUserTurnReadForEvent(
   db: DbTransaction,
   args: AppendThreadEventArgs,
@@ -373,13 +375,6 @@ function applyUserTurnReadForEvent(
   };
 }
 
-function applyReadStateUpdateForEvent(
-  db: DbTransaction,
-  args: AppendThreadEventArgs,
-): ThreadReadStateUpdate | null {
-  return applyUserTurnReadForEvent(db, args);
-}
-
 function appendThreadEventsInTransactionWithAttention(
   db: DbTransaction,
   args: readonly AppendThreadEventArgs[],
@@ -387,7 +382,7 @@ function appendThreadEventsInTransactionWithAttention(
   assertStoredTurnStartedForEvents(db, args);
   const sequences = appendStoredThreadEventsInTransaction(db, args);
   const readStateUpdates = args
-    .map((eventArgs) => applyReadStateUpdateForEvent(db, eventArgs))
+    .map((eventArgs) => applyUserTurnReadForEvent(db, eventArgs))
     .filter(isThreadReadStateUpdate);
 
   return { readStateUpdates, sequences };
@@ -473,8 +468,6 @@ function assertStoredTurnStartedForEvents(
   db: DbQueryConnection,
   eventArgs: readonly AppendThreadEventArgs[],
 ): void {
-  // Same-batch satisfaction is ordered: turn/started only unlocks later events
-  // in this append list. Daemon batches enforce the same invariant separately.
   const existingTurnKeys = listExistingTurnStartKeys(
     db,
     collectTurnStartRequirements(eventArgs),
@@ -588,21 +581,6 @@ export function appendClientTurnEventInTransaction(
   );
 }
 
-export function appendPreparedClientTurnRequestedEventInTransaction(
-  db: DbTransaction,
-  args: PreparedClientTurnRequestedEventArgs,
-): AppendedClientTurnRequest {
-  const result =
-    appendPreparedClientTurnRequestedEventWithNotificationInTransaction(
-      db,
-      args,
-    );
-  return {
-    requestId: result.requestId,
-    sequence: result.sequence,
-  };
-}
-
 export function appendPreparedClientTurnRequestedEventWithNotificationInTransaction(
   db: DbTransaction,
   args: PreparedClientTurnRequestedEventArgs,
@@ -668,25 +646,12 @@ export function parseStoredTurnRequestEvent(
   }
 
   if (event.type === "client/turn/requested") {
-    return {
-      direction: event.direction,
-      requestId: event.requestId,
-      ...(event.continuationOfRequestId !== undefined
-        ? { continuationOfRequestId: event.continuationOfRequestId }
-        : {}),
-      source: event.source,
-      initiator: event.initiator,
-      senderThreadId: event.senderThreadId,
-      systemMessageKind: event.systemMessageKind,
-      systemMessageSubject: event.systemMessageSubject,
-      input: event.input,
-      ...(event.inputGroups !== undefined
-        ? { inputGroups: event.inputGroups }
-        : {}),
-      target: event.target,
-      request: event.request,
-      execution: event.execution,
-    };
+    // Strip only the envelope. A field-by-field copy used to live here and
+    // silently dropped every field added after it was written (the gate
+    // provenance pair, then the retry marker), which is exactly the kind of
+    // loss a reader cannot detect: the event parses, it is just missing things.
+    const { type: _type, threadId: _threadId, scope: _scope, ...data } = event;
+    return data;
   }
 
   if (row.type === "client/thread/start" || row.type === "client/turn/start") {
@@ -749,19 +714,27 @@ export function buildCwdBranchEntries(
   const entries: ProvisioningTranscriptEntry[] = [
     {
       type: "step",
-      key: "workspace-path",
+      key: WORKSPACE_PROVISIONING_STEP_KEYS.workspacePath,
       text: `Using workspace: ${args.path}`,
       status: "completed",
       startedAt: now,
     },
   ];
   if (args.branchName) {
+    const sha = args.headSha;
     entries.push({
       type: "step",
-      key: "workspace-branch",
-      text: `Using branch: ${args.branchName}`,
+      key: WORKSPACE_PROVISIONING_STEP_KEYS.workspaceBranch,
+      text:
+        sha === null
+          ? `Using branch: ${args.branchName}`
+          : `Using branch: ${args.branchName} (${sha.slice(0, 7)})`,
       status: "completed",
       startedAt: now,
+      metadata:
+        sha === null
+          ? { branchName: args.branchName }
+          : { branchName: args.branchName, sha },
     });
   }
   return entries;
@@ -993,16 +966,6 @@ export function getLastProviderThreadId(
   threadId: string,
 ): string | null {
   return getLastStoredProviderThreadId(deps.db, threadId);
-}
-
-export function getProviderThreadIdAtOrBeforeSequence(
-  deps: ThreadEventReadDeps,
-  args: {
-    sequence: number;
-    threadId: string;
-  },
-): string | null {
-  return getStoredProviderThreadIdAtOrBeforeSequence(deps.db, args);
 }
 
 export function getLastExecutionOptions(

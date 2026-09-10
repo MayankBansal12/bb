@@ -12,10 +12,11 @@ describe("experiments settings", () => {
       expect(response.status).toBe(200);
       const body = systemConfigResponseSchema.parse(await readJson(response));
       expect(body.experiments).toEqual({
-        claudeCodeMockCliTraffic: false,
+        changelogPreview: false,
         editMessages: true,
-        newOnboarding: false,
-        toolsHub: false,
+        mobileApp: false,
+        sidebarProgressiveDisclosure: false,
+        timelineWindowing: false,
       });
     });
   });
@@ -26,34 +27,38 @@ describe("experiments settings", () => {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          claudeCodeMockCliTraffic: true,
+          changelogPreview: true,
           editMessages: true,
-          newOnboarding: true,
-          toolsHub: true,
+          mobileApp: true,
+          sidebarProgressiveDisclosure: true,
+          timelineWindowing: true,
         }),
       });
       expect(put.status).toBe(200);
       expect(experimentsSchema.parse(await readJson(put))).toEqual({
-        claudeCodeMockCliTraffic: true,
+        changelogPreview: true,
         editMessages: true,
-        newOnboarding: true,
-        toolsHub: true,
+        mobileApp: true,
+        sidebarProgressiveDisclosure: true,
+        timelineWindowing: true,
       });
       expect(getExperiments(harness.db)).toEqual({
-        claudeCodeMockCliTraffic: true,
+        changelogPreview: true,
         editMessages: true,
-        newOnboarding: true,
-        toolsHub: true,
+        mobileApp: true,
+        sidebarProgressiveDisclosure: true,
+        timelineWindowing: true,
       });
 
       const config = await harness.app.request("/api/v1/system/config");
       expect(
         systemConfigResponseSchema.parse(await readJson(config)).experiments,
       ).toEqual({
-        claudeCodeMockCliTraffic: true,
+        changelogPreview: true,
         editMessages: true,
-        newOnboarding: true,
-        toolsHub: true,
+        mobileApp: true,
+        sidebarProgressiveDisclosure: true,
+        timelineWindowing: true,
       });
     });
   });
@@ -67,10 +72,11 @@ describe("experiments settings", () => {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          claudeCodeMockCliTraffic: false,
+          changelogPreview: false,
           editMessages: false,
-          newOnboarding: false,
-          toolsHub: false,
+          mobileApp: false,
+          sidebarProgressiveDisclosure: false,
+          timelineWindowing: false,
         }),
       });
       expect(put.status).toBe(200);

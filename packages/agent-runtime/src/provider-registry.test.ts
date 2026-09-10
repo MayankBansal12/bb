@@ -1,13 +1,9 @@
 import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import {
-  DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG,
-  turnScope,
-} from "@bb/domain";
 import { createProviderForId } from "./provider-registry.js";
-import type { HostDaemonAcpLaunchSpec } from "@bb/host-daemon-contract";
+import type { AgentRuntimeBridgeLaunch } from "./types.js";
 
-const dynamicAcpLaunchSpec: HostDaemonAcpLaunchSpec = {
+const dynamicAcpLaunchSpec = {
   displayName: "Custom ACP",
   command: "custom-agent",
   args: ["serve"],
@@ -20,130 +16,159 @@ const dynamicAcpLaunchSpec: HostDaemonAcpLaunchSpec = {
   },
 };
 
-describe("provider registry", () => {
-  it("creates codex provider with expected process config", () => {
-    const provider = createProviderForId("codex");
-    expect(provider.id).toBe("codex");
-    expect(provider.process.command).toBe("codex");
-    expect(provider.process.args).toMatchObject(["app-server"]);
-  });
+const ACP_BRIDGE_LAUNCH: AgentRuntimeBridgeLaunch = {
+  pluginId: "provider-fixture",
+  dataDir: "/data/plugins/provider-fixture/bridge-data",
+  source: {
+    kind: "artifact",
+    digest: "e".repeat(64),
+    artifactPath: "/data/provider-bridges/acp.mjs",
+  },
+  providerOptions: {
+    acpLaunchSpec: {
+      displayName: "Cursor",
+      command: "cursor-agent",
+      args: ["acp"],
+      env: {},
+    },
+  },
+  envPassthrough: [],
+  capabilities: {
+    providerInstallation: false,
+    supportsServiceTier: true,
+    permissionModes: ["accept-edits", "full"],
+    supportsThreadArchive: false,
+    supportsThreadRename: false,
+    fork: "tip",
+  },
+};
 
-  it("creates claude-code provider with expected process config", () => {
-    const provider = createProviderForId("claude-code");
-    expect(provider.id).toBe("claude-code");
-    expect(provider.process.command).toBe("node");
-    expect(provider.process.args.slice(0, 3)).toEqual([
+const PI_BRIDGE_LAUNCH: AgentRuntimeBridgeLaunch = {
+  pluginId: "provider-fixture",
+  dataDir: "/data/plugins/provider-fixture/bridge-data",
+  source: {
+    kind: "artifact",
+    digest: "b".repeat(64),
+    artifactPath: "/data/provider-bridges/pi.mjs",
+  },
+  providerOptions: {},
+  envPassthrough: [],
+  capabilities: {
+    providerInstallation: false,
+    supportsServiceTier: false,
+    permissionModes: ["full"],
+    supportsThreadArchive: false,
+    supportsThreadRename: false,
+    fork: "checkpoint",
+  },
+};
+
+function expectBridgeSpawn(
+  provider: { process: { args: string[] } },
+  expected: { module: string | RegExp; bundleDir?: string },
+): void {
+  const args = provider.process.args;
+  expect(args.slice(-2)).toEqual([
+    "provider-fixture",
+    "/data/plugins/provider-fixture/bridge-data",
+  ]);
+  const moduleArg = args.at(-3) ?? "";
+  if (typeof expected.module === "string") {
+    expect(moduleArg).toBe(expected.module);
+  } else {
+    expect(moduleArg).toMatch(expected.module);
+  }
+  const workerArgs = args.slice(0, -3);
+  if (expected.bundleDir === undefined) {
+    expect(workerArgs.slice(0, 3)).toEqual([
       "--conditions=source",
       "--import",
       import.meta.resolve("tsx"),
     ]);
-    expect(provider.process.args.at(-1)).toMatch(
-      /agent-runtime\/src\/claude-code\/bridge\/bridge\.ts$/,
-    );
-    expect(existsSync(provider.process.args.at(-1) ?? "")).toBe(true);
+    expect(workerArgs.at(-1)).toMatch(/bridge-worker-entry\.ts$/u);
+  } else {
+    expect(workerArgs).toEqual([
+      `${expected.bundleDir}/bb-provider-bridge-worker.mjs`,
+    ]);
+  }
+}
+
+describe("provider registry", () => {
+  it("carries environment write roots to the acp bridge via provider options", () => {
+    const provider = createProviderForId("acp-cursor", {
+      additionalWorkspaceWriteRoots: ["/extra-root"],
+      bridgeLaunch: ACP_BRIDGE_LAUNCH,
+    });
+    const plan = provider.buildCommandPlan({
+      type: "thread/start",
+      threadId: "thread-1",
+      cwd: "/workspace",
+      options: {
+        providerOptions: {},
+        permissionMode: "full",
+        permissionScope: "full",
+        approvalReviewer: null,
+        permissionEscalation: null,
+      },
+      instructionMode: "append",
+    });
+    expect(plan).toMatchObject({
+      kind: "request",
+      method: "thread/start",
+      params: {
+        options: {
+          providerOptions: {
+            additionalWorkspaceWriteRoots: ["/extra-root"],
+          },
+        },
+      },
+    });
   });
 
-  it("passes the configured bridge bundle directory to bundled providers", () => {
-    const claudeProvider = createProviderForId("claude-code", {
-      additionalWorkspaceWriteRoots: [],
-      bridgeBundleDir: "/tmp",
-    });
+  it("runs the packaged bootstrap from the configured bridge bundle directory", () => {
     const piProvider = createProviderForId("pi", {
       additionalWorkspaceWriteRoots: [],
       bridgeBundleDir: "/tmp",
+      bridgeLaunch: PI_BRIDGE_LAUNCH,
     });
 
-    expect(claudeProvider.process.args[0]).toBe(
-      "/tmp/bb-claude-code-bridge.mjs",
-    );
-    expect(piProvider.process.args[0]).toBe("/tmp/bb-pi-bridge.mjs");
+    expectBridgeSpawn(piProvider, {
+      module: "/data/provider-bridges/pi.mjs",
+      bundleDir: "/tmp",
+    });
   });
 
-  it("passes the configured bridge node runtime to bundled providers", () => {
+  it("runs the bridge under the configured bridge node runtime", () => {
     const bridgeNodeEnv = { ELECTRON_RUN_AS_NODE: "1" };
-    const claudeProvider = createProviderForId("claude-code", {
+    const provider = createProviderForId("pi", {
       additionalWorkspaceWriteRoots: [],
-      bridgeNodeEnv,
-      bridgeNodeExecutablePath: "/Applications/bb.app/Contents/MacOS/bb",
-    });
-    const piProvider = createProviderForId("pi", {
-      additionalWorkspaceWriteRoots: [],
-      bridgeNodeEnv,
-      bridgeNodeExecutablePath: "/Applications/bb.app/Contents/MacOS/bb",
-    });
-    const acpProvider = createProviderForId("acp-cursor", {
-      additionalWorkspaceWriteRoots: [],
+      bridgeLaunch: PI_BRIDGE_LAUNCH,
       bridgeNodeEnv,
       bridgeNodeExecutablePath: "/Applications/bb.app/Contents/MacOS/bb",
     });
 
-    expect(claudeProvider.process.command).toBe(
+    expect(provider.process.command).toBe(
       "/Applications/bb.app/Contents/MacOS/bb",
     );
-    expect(claudeProvider.process.env).toEqual(bridgeNodeEnv);
-    expect(piProvider.process.command).toBe(
-      "/Applications/bb.app/Contents/MacOS/bb",
-    );
-    expect(piProvider.process.env).toEqual(bridgeNodeEnv);
-    expect(acpProvider.process.command).toBe(
-      "/Applications/bb.app/Contents/MacOS/bb",
-    );
-    expect(acpProvider.process.env).toEqual(bridgeNodeEnv);
-  });
-
-  it("passes the configured turn id prefix to bundled providers", () => {
-    const claudeProvider = createProviderForId("claude-code", {
-      additionalWorkspaceWriteRoots: [],
-      turnIdPrefix: "turn_runtime_",
-    });
-    const piProvider = createProviderForId("pi", {
-      additionalWorkspaceWriteRoots: [],
-      turnIdPrefix: "turn_runtime_",
-    });
-
-    const claudeEvents = claudeProvider.translateEvent({
-      type: "assistant",
-      message: {},
-    });
-    const piEvents = piProvider.translateEvent({
-      type: "agent_start",
-    });
-
-    expect(claudeEvents).toContainEqual(
-      expect.objectContaining({
-        type: "turn/started",
-        threadId: "",
-        providerThreadId: "",
-        scope: turnScope("turn_runtime_1"),
-      }),
-    );
-    expect(piEvents).toContainEqual(
-      expect.objectContaining({
-        type: "turn/started",
-        threadId: "",
-        providerThreadId: "",
-        scope: turnScope("turn_runtime_1"),
-      }),
-    );
+    expect(provider.process.env).toEqual(bridgeNodeEnv);
   });
 
   it("creates pi provider with expected process config", () => {
-    const provider = createProviderForId("pi");
+    const provider = createProviderForId("pi", {
+      additionalWorkspaceWriteRoots: [],
+      bridgeLaunch: PI_BRIDGE_LAUNCH,
+    });
     expect(provider.id).toBe("pi");
     expect(provider.process.command).toBe("node");
-    expect(provider.process.args.slice(0, 3)).toEqual([
-      "--conditions=source",
-      "--import",
-      import.meta.resolve("tsx"),
-    ]);
-    expect(provider.process.args.at(-1)).toMatch(
-      /agent-runtime\/src\/pi\/bridge\/bridge\.ts$/,
-    );
-    expect(existsSync(provider.process.args.at(-1) ?? "")).toBe(true);
+    expectBridgeSpawn(provider, { module: "/data/provider-bridges/pi.mjs" });
+    expect(existsSync(provider.process.args.at(-4) ?? "")).toBe(true);
   });
 
   it("passes the requested workspace to Pi model listing", () => {
-    const provider = createProviderForId("pi");
+    const provider = createProviderForId("pi", {
+      additionalWorkspaceWriteRoots: [],
+      bridgeLaunch: PI_BRIDGE_LAUNCH,
+    });
 
     expect(
       provider.buildCommandPlan({
@@ -157,33 +182,39 @@ describe("provider registry", () => {
     });
   });
 
-  it("creates the acp cursor provider with the bridge process config", () => {
-    const provider = createProviderForId("acp-cursor");
-    expect(provider.id).toBe("acp-cursor");
-    expect(provider.process.command).toBe("node");
-    expect(provider.process.args.at(-1)).toMatch(
-      /agent-runtime\/src\/acp\/bridge\/bridge\.ts$/,
-    );
-    expect(existsSync(provider.process.args.at(-1) ?? "")).toBe(true);
+  it("runs every acp id on the acp plugin's verified artifact", () => {
+    for (const providerId of ["acp-cursor", "acp-opencode", "acp-custom"]) {
+      const provider = createProviderForId(providerId, {
+        additionalWorkspaceWriteRoots: [],
+        bridgeLaunch: {
+          ...ACP_BRIDGE_LAUNCH,
+          providerOptions: { acpLaunchSpec: dynamicAcpLaunchSpec },
+        },
+      });
+      expect(provider.id).toBe(providerId);
+      expectBridgeSpawn(provider, {
+        module: "/data/provider-bridges/acp.mjs",
+      });
+      expect(provider.capabilities).toMatchObject({
+        supportsServiceTier: true,
+        supportsFork: true,
+        supportsSessionRewind: false,
+        permissionModes: ["accept-edits", "full"],
+      });
+    }
   });
 
-  it("passes the configured bridge bundle directory to the acp provider", () => {
+  it("carries the plugin-declared cursor launch spec to the acp bridge", () => {
     const provider = createProviderForId("acp-cursor", {
       additionalWorkspaceWriteRoots: [],
-      bridgeBundleDir: "/tmp",
+      bridgeLaunch: ACP_BRIDGE_LAUNCH,
     });
-    expect(provider.process.args[0]).toBe("/tmp/bb-acp-bridge.mjs");
-  });
-
-  it("binds the acp cursor provider to its agent launch command", () => {
-    const provider = createProviderForId("acp-cursor");
     const plan = provider.buildCommandPlan({
       type: "thread/start",
       threadId: "thread-1",
       cwd: "/workspace",
       options: {
-        claudeCodeMockCliTraffic: DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG,
-        workflowsEnabled: false,
+        providerOptions: {},
         permissionMode: "full",
         permissionScope: "full",
         approvalReviewer: null,
@@ -195,31 +226,34 @@ describe("provider registry", () => {
       kind: "request",
       method: "thread/start",
       params: {
-        agent: { command: "cursor-agent", args: ["acp"] },
+        options: {
+          providerOptions: {
+            acpLaunchSpec: {
+              displayName: "Cursor",
+              command: "cursor-agent",
+              args: ["acp"],
+            },
+          },
+        },
       },
     });
   });
 
-  it("creates a dynamic acp provider from a launch spec", () => {
+  it("carries a configured acp agent's declared launch spec", () => {
     const provider = createProviderForId("acp-custom", {
       additionalWorkspaceWriteRoots: ["/extra-root"],
-      acpLaunchSpec: dynamicAcpLaunchSpec,
+      bridgeLaunch: {
+        ...ACP_BRIDGE_LAUNCH,
+        providerOptions: { acpLaunchSpec: dynamicAcpLaunchSpec },
+      },
     });
 
     expect(provider.id).toBe("acp-custom");
-    expect(provider.displayName).toBe("Custom ACP");
-    const modelListPlan = provider.buildCommandPlan({ type: "model/list" });
-    expect(modelListPlan).toMatchObject({
+    expect(provider.buildCommandPlan({ type: "model/list" })).toMatchObject({
       kind: "request",
       method: "model/list",
       params: {
-        listCommand: {
-          command: "custom-agent",
-          args: ["models", "list"],
-          cwd: "/agent-home",
-          envVars: { CUSTOM_AGENT_TOKEN: "token" },
-        },
-        primaryModels: ["model-a"],
+        providerOptions: { acpLaunchSpec: dynamicAcpLaunchSpec },
       },
     });
 
@@ -228,8 +262,7 @@ describe("provider registry", () => {
       threadId: "thread-1",
       cwd: "/workspace",
       options: {
-        claudeCodeMockCliTraffic: DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG,
-        workflowsEnabled: false,
+        providerOptions: {},
         permissionMode: "full",
         permissionScope: "full",
         approvalReviewer: null,
@@ -242,135 +275,104 @@ describe("provider registry", () => {
       kind: "request",
       method: "thread/start",
       params: {
-        cwd: "/agent-home",
-        agent: { command: "custom-agent", args: ["serve"] },
-        envVars: {
-          CUSTOM_AGENT_TOKEN: "token",
-          BB_THREAD_ID: "thread-1",
+        options: {
+          providerOptions: {
+            acpLaunchSpec: dynamicAcpLaunchSpec,
+            additionalWorkspaceWriteRoots: ["/extra-root"],
+          },
         },
-        workspaceWriteRoots: ["/agent-home", "/extra-root"],
       },
     });
   });
 
-  it("passes dynamic ACP reasoning CLI config to model listing and thread start", () => {
-    const reasoningCli: NonNullable<HostDaemonAcpLaunchSpec["reasoningCli"]> = {
-      flag: "--reasoning-effort",
-      supportedLevels: ["low", "medium", "high"],
-      levelValues: { max: "high" },
-      defaultLevel: "high",
-    };
-    const provider = createProviderForId("acp-custom", {
-      additionalWorkspaceWriteRoots: [],
-      acpLaunchSpec: {
-        displayName: "Custom ACP",
-        command: "custom-agent",
-        args: ["serve"],
-        env: {},
-        reasoningCli,
-      },
-    });
-
-    expect(provider.buildCommandPlan({ type: "model/list" })).toEqual({
-      kind: "request",
-      method: "model/list",
-      params: {
-        agent: { command: "custom-agent", args: ["serve"] },
-        primaryModels: [],
-        reasoningCli,
-      },
-    });
-
-    expect(
-      provider.buildCommandPlan({
-        type: "thread/start",
-        threadId: "thread-1",
-        cwd: "/workspace",
-        options: {
-          claudeCodeMockCliTraffic: DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG,
-          workflowsEnabled: false,
-          permissionMode: "full",
-          permissionScope: "full",
-          approvalReviewer: null,
-          permissionEscalation: null,
-          reasoningLevel: "max",
+  it("carries environment write roots and declared capabilities onto an artifact bridge", () => {
+    const provider = createProviderForId("codex", {
+      additionalWorkspaceWriteRoots: ["/extra-root"],
+      bridgeLaunch: {
+        pluginId: "provider-fixture",
+        dataDir: "/data/plugins/provider-fixture/bridge-data",
+        providerOptions: {},
+        envPassthrough: [],
+        source: {
+          kind: "artifact",
+          digest: "b".repeat(64),
+          artifactPath: "/data/provider-bridges/codex.mjs",
         },
-        instructionMode: "append",
-      }),
-    ).toMatchObject({
+        capabilities: {
+          providerInstallation: false,
+          supportsServiceTier: true,
+          permissionModes: ["accept-edits", "auto", "full"],
+          supportsThreadArchive: true,
+          supportsThreadRename: true,
+          fork: "checkpoint",
+        },
+      },
+    });
+
+    expect(provider.capabilities).toMatchObject({
+      supportsThreadArchive: true,
+      supportsThreadRename: true,
+      supportsFork: true,
+      supportsSessionRewind: true,
+      supportsServiceTier: true,
+      permissionModes: ["accept-edits", "auto", "full"],
+    });
+    const plan = provider.buildCommandPlan({
+      type: "thread/start",
+      threadId: "thread-1",
+      cwd: "/workspace",
+      options: {
+        providerOptions: {},
+        permissionMode: "full",
+        permissionScope: "full",
+        approvalReviewer: null,
+        permissionEscalation: null,
+      },
+      instructionMode: "append",
+    });
+    expect(plan).toMatchObject({
       kind: "request",
       method: "thread/start",
       params: {
-        agent: { command: "custom-agent", args: ["serve"] },
-        launchReasoningLevel: "max",
-        reasoningCli,
+        options: {
+          providerOptions: {
+            additionalWorkspaceWriteRoots: ["/extra-root"],
+          },
+        },
       },
     });
   });
 
-  it.each<[string, HostDaemonAcpLaunchSpec["modelCli"]]>([
-    ["no model cli", undefined],
-    [
-      "empty model cli",
-      { listArgs: [], selectFlag: "--model", primaryModels: ["model-a"] },
-    ],
-  ])(
-    "uses ACP-native discovery and selection when a launch spec has %s",
-    (_name, modelCli) => {
-      const provider = createProviderForId("acp-custom", {
-        additionalWorkspaceWriteRoots: [],
-        acpLaunchSpec: {
-          displayName: "Custom ACP",
-          command: "custom-agent",
-          args: ["serve"],
-          env: {},
-          ...(modelCli !== undefined ? { modelCli } : {}),
+  it("honors a verified bridge launch for an id the registry does not know", () => {
+    const provider = createProviderForId("echo-agent", {
+      additionalWorkspaceWriteRoots: [],
+      bridgeLaunch: {
+        pluginId: "provider-fixture",
+        dataDir: "/data/plugins/provider-fixture/bridge-data",
+        source: {
+          kind: "artifact",
+          digest: "d".repeat(64),
+          artifactPath: "/data/provider-bridges/artifact.mjs",
         },
-      });
-
-      const modelListPlan = provider.buildCommandPlan({ type: "model/list" });
-      expect(modelListPlan).toEqual({
-        kind: "request",
-        method: "model/list",
-        params: {
-          agent: { command: "custom-agent", args: ["serve"] },
-          primaryModels: [],
+        providerOptions: {},
+        envPassthrough: [],
+        capabilities: {
+          providerInstallation: false,
+          supportsServiceTier: true,
+          permissionModes: ["accept-edits", "full"],
+          supportsThreadArchive: false,
+          supportsThreadRename: false,
+          fork: "none",
         },
-      });
-
-      const params =
-        modelListPlan.kind === "request" ? modelListPlan.params : {};
-      expect(params).not.toHaveProperty("listCommand");
-
-      const startPlan = provider.buildCommandPlan({
-        type: "thread/start",
-        threadId: "thread-1",
-        cwd: "/workspace",
-        options: {
-          claudeCodeMockCliTraffic: DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG,
-          workflowsEnabled: false,
-          permissionMode: "full",
-          permissionScope: "full",
-          approvalReviewer: null,
-          permissionEscalation: null,
-          model: "requested-model",
-        },
-        instructionMode: "append",
-      });
-      expect(startPlan).toMatchObject({
-        kind: "request",
-        method: "thread/start",
-        params: {
-          agent: { command: "custom-agent", args: ["serve"] },
-          modelSelection: { modelId: "requested-model" },
-        },
-      });
-    },
-  );
-
-  it("rejects unsupported adapters", () => {
-    expect(() => createProviderForId("pi-mono")).toThrow(
-      'Unsupported provider "pi-mono"',
-    );
+      },
+    });
+    expectBridgeSpawn(provider, {
+      module: "/data/provider-bridges/artifact.mjs",
+    });
+    expect(provider.capabilities.supportsServiceTier).toBe(true);
+    expect(provider.capabilities.permissionModes).toEqual([
+      "accept-edits",
+      "full",
+    ]);
   });
 });

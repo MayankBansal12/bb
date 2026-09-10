@@ -7,17 +7,26 @@ export function isIgnoredPluginDevPath(relativePath: string): boolean {
     .some((segment) => IGNORED_SEGMENTS.has(segment));
 }
 
-export interface PluginDevLoopDeps {
-  pluginId: string;
+export interface PluginDevLoopTargets {
   hasApp: boolean;
+  hasHost: boolean;
+}
+
+interface PluginDevLoopDeps {
+  pluginId: string;
+  // Re-resolved every cycle: a plugin can add or drop its app/host entry
+  // while the dev loop is watching, and a stale snapshot would demand a
+  // build that can never succeed again (or skip one that now must run).
+  targets: () => Promise<PluginDevLoopTargets>;
   buildApp: () => Promise<void>;
+  buildHost: () => Promise<void>;
   reloadPlugin: () => Promise<void>;
   log: (line: string) => void;
   debounceMs?: number;
   now?: () => number;
 }
 
-export interface PluginDevLoop {
+interface PluginDevLoop {
   handleChange: (relativePath: string) => void;
   settled: () => Promise<void>;
   dispose: () => void;
@@ -39,7 +48,15 @@ export function createPluginDevLoop(deps: PluginDevLoopDeps): PluginDevLoop {
     const parts = [
       `${files.length} file${files.length === 1 ? "" : "s"} changed`,
     ];
-    if (deps.hasApp) {
+    let targets: PluginDevLoopTargets;
+    try {
+      targets = await deps.targets();
+    } catch (error) {
+      parts.push(`manifest read failed: ${errorMessage(error)}`);
+      deps.log(`${parts.join(" · ")} — fix and save to retry`);
+      return;
+    }
+    if (targets.hasApp) {
       const startedAt = now();
       try {
         await deps.buildApp();
@@ -48,6 +65,19 @@ export function createPluginDevLoop(deps: PluginDevLoopDeps): PluginDevLoop {
         );
       } catch (error) {
         parts.push(`build failed: ${errorMessage(error)}`);
+        deps.log(`${parts.join(" · ")} — fix and save to retry`);
+        return;
+      }
+    }
+    if (targets.hasHost) {
+      const startedAt = now();
+      try {
+        await deps.buildHost();
+        parts.push(
+          `rebuilt host in ${Math.max(0, Math.round(now() - startedAt))}ms`,
+        );
+      } catch (error) {
+        parts.push(`host build failed: ${errorMessage(error)}`);
         deps.log(`${parts.join(" · ")} — fix and save to retry`);
         return;
       }

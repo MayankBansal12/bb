@@ -4,56 +4,61 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { InstalledPlugin } from "@bb/server-contract";
 import { resetPluginSlotStoreForTest } from "@/lib/plugin-slots";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
-import { ToolsHubExperimentProvider } from "@/components/tools/tools-experiment-context";
+import { pluginListQueryKey } from "@/hooks/queries/query-keys";
 import { useSettingsNavState } from "./settings-nav";
+import { makeInstalledPlugin } from "@/test/fixtures/plugins";
 
 const mocks = vi.hoisted(() => ({
-  plugins: [] as Array<Record<string, unknown>>,
-}));
-
-vi.mock("@/hooks/queries/plugin-settings-queries", () => ({
-  usePluginList: () => ({ data: { plugins: mocks.plugins } }),
+  accessState: "unavailable",
 }));
 
 vi.mock("@/hooks/useHostDaemon", () => ({
   useHostDaemon: () => ({ hasDaemon: false }),
+  useLocalHostDaemonAccess: () => ({ accessState: mocks.accessState }),
 }));
 
-function wrapperFor(path: string, toolsHubEnabled = false) {
-  const { wrapper: QueryWrapper } = createQueryClientTestHarness();
+function wrapperFor(path: string, plugins: readonly InstalledPlugin[] = []) {
+  const { queryClient, wrapper: QueryWrapper } = createQueryClientTestHarness();
+  queryClient.setQueryData(pluginListQueryKey(true), plugins);
   return function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryWrapper>
-        <MemoryRouter initialEntries={[path]}>
-          <ToolsHubExperimentProvider enabled={toolsHubEnabled}>
-            {children}
-          </ToolsHubExperimentProvider>
-        </MemoryRouter>
+        <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
       </QueryWrapper>
     );
   };
 }
 
+function disabledPlugin(): InstalledPlugin {
+  return makeInstalledPlugin({
+    id: "linear",
+    source: "path:/plugins/linear",
+    rootDir: "/plugins/linear",
+    enabled: false,
+    status: "disabled",
+    description: "Linear integration",
+    name: "Linear",
+    sourceDisplay: "path · /plugins/linear",
+  });
+}
+
 afterEach(() => {
   cleanup();
   resetPluginSlotStoreForTest();
-  vi.clearAllMocks();
-  mocks.plugins = [];
+  mocks.accessState = "unavailable";
 });
 
 describe("useSettingsNavState", () => {
-  it("resolves Codex and Claude Code as separate provider pages", () => {
+  it("resolves the Providers bucket from its section route", () => {
     const { result } = renderHook(() => useSettingsNavState(), {
-      wrapper: wrapperFor("/settings/providers/claude-code"),
+      wrapper: wrapperFor("/settings/providers"),
     });
 
-    expect(result.current.activeProviderId).toBe("claude-code");
-    expect(result.current.activeSection).toBeNull();
-    expect(
-      result.current.providerEntries.map((provider) => provider.id),
-    ).toEqual(["codex", "claude-code"]);
+    expect(result.current.activeSection).toBe("providers");
+    expect(result.current.hasUnknownSection).toBe(false);
   });
 
   it("shows the Machines section", () => {
@@ -63,6 +68,17 @@ describe("useSettingsNavState", () => {
 
     expect(result.current.sections.map((section) => section.id)).toContain(
       "machines",
+    );
+  });
+
+  it("shows Files when local helper access can be enabled", () => {
+    mocks.accessState = "permission-required";
+    const { result } = renderHook(() => useSettingsNavState(), {
+      wrapper: wrapperFor("/settings/files"),
+    });
+
+    expect(result.current.sections).toContainEqual(
+      expect.objectContaining({ icon: "File", id: "files" }),
     );
   });
 
@@ -77,33 +93,23 @@ describe("useSettingsNavState", () => {
     );
   });
 
-  it("keeps legacy plugin management in Settings while Extensions is disabled", () => {
+  it("resolves installed plugin management in Settings", () => {
     const { result } = renderHook(() => useSettingsNavState(), {
-      wrapper: wrapperFor("/settings"),
+      wrapper: wrapperFor("/settings/plugins"),
     });
 
+    expect(result.current.activeSection).toBe("plugins");
+    expect(result.current.hasUnknownSection).toBe(false);
     expect(result.current.sections.map((section) => section.id)).toContain(
       "plugins",
     );
   });
 
-  it("hides legacy plugin management but preserves registered plugin settings while Extensions is enabled", () => {
-    mocks.plugins = [
-      {
-        id: "workflows",
-        enabled: true,
-        hasSettings: true,
-      },
-    ];
+  it("omits disabled plugins from individual settings entries", () => {
     const { result } = renderHook(() => useSettingsNavState(), {
-      wrapper: wrapperFor("/settings", true),
+      wrapper: wrapperFor("/settings", [disabledPlugin()]),
     });
 
-    expect(result.current.sections.map((section) => section.id)).not.toContain(
-      "plugins",
-    );
-    expect(result.current.pluginEntries.map((plugin) => plugin.id)).toEqual([
-      "workflows",
-    ]);
+    expect(result.current.pluginEntries).toEqual([]);
   });
 });

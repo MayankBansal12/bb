@@ -14,7 +14,7 @@ describe("bb thread tell command output", () => {
     registerThreadCommands(program, () => "http://server");
 
   it("bb thread tell --json prints the raw response plus thread id", async () => {
-    const post = vi.fn(async () => ({ ok: true }));
+    const post = vi.fn(async () => ({ ok: true, delivery: "sent" }));
     stubServerApi({ "v1.threads.:id.send.$post": post });
 
     await runCommand(
@@ -27,8 +27,64 @@ describe("bb thread tell command output", () => {
     ).toEqual({
       threadId: "thread-json-tell",
       ok: true,
+      delivery: "sent",
       mode: "steer",
     });
+  });
+
+  it("bb thread tell names the typed reason a message queued for", async () => {
+    // The server says WHY, so the CLI stops inferring it from the flags it
+    // sent — which is what let the old four-way delivery enum collapse.
+    const post = vi.fn(async () => ({
+      ok: true,
+      delivery: "queued",
+      queuedMessage: {
+        id: "qm_1",
+        waitingOn: { kind: "interaction" },
+        sendAt: null,
+      },
+    }));
+    stubServerApi({ "v1.threads.:id.send.$post": post });
+
+    await runCommand(["thread", "tell", "thread-blocked", "hello"], register);
+
+    expect(vi.mocked(console.log).mock.calls[0]?.[0]).toBe(
+      "Thread thread-blocked message queued (waiting for a pending interaction); it dispatches when that clears",
+    );
+  });
+
+  it("bb thread tell names the plugin a message is waiting on", async () => {
+    const post = vi.fn(async () => ({
+      ok: true,
+      delivery: "queued",
+      queuedMessage: {
+        id: "qm_2",
+        waitingOn: {
+          kind: "plugin",
+          pluginId: "concurrency-limit",
+          reason: "4 of 4 running",
+        },
+        sendAt: null,
+      },
+    }));
+    stubServerApi({ "v1.threads.:id.send.$post": post });
+
+    await runCommand(["thread", "tell", "thread-limited", "hello"], register);
+
+    expect(vi.mocked(console.log).mock.calls[0]?.[0]).toBe(
+      "Thread thread-limited message queued (concurrency-limit: 4 of 4 running); it dispatches when that clears",
+    );
+  });
+
+  it("bb thread tell keeps the steered wording for servers that only report ok", async () => {
+    const post = vi.fn(async () => ({ ok: true }));
+    stubServerApi({ "v1.threads.:id.send.$post": post });
+
+    await runCommand(["thread", "tell", "thread-legacy", "hello"], register);
+
+    expect(vi.mocked(console.log).mock.calls[0]?.[0]).toBe(
+      "Thread thread-legacy steered",
+    );
   });
 
   it("bb thread tell --mode queue preserves non-urgent queued delivery", async () => {
@@ -124,6 +180,53 @@ describe("bb thread tell command output", () => {
         input: [{ type: "text", text: "hello", mentions: [] }],
         mode: "steer-if-active",
         permissionMode: "auto",
+      },
+    });
+  });
+
+  it("bb thread tell --plan sends the composer's /plan command mention", async () => {
+    const post = vi.fn(async () => ({ ok: true }));
+    stubServerApi({ "v1.threads.:id.send.$post": post });
+
+    await runCommand(
+      [
+        "thread",
+        "tell",
+        "thread-plan",
+        "add a README",
+        "--plan",
+        "--file",
+        "/tmp/report.pdf",
+      ],
+      register,
+    );
+
+    expect(post).toHaveBeenCalledWith({
+      param: { id: "thread-plan" },
+      json: {
+        input: [
+          {
+            type: "text",
+            text: "/plan add a README",
+            mentions: [
+              {
+                start: 0,
+                end: 5,
+                resource: {
+                  kind: "command",
+                  trigger: "/",
+                  name: "plan",
+                  source: "command",
+                  origin: "builtin",
+                  label: "plan",
+                  argumentHint: null,
+                },
+              },
+            ],
+          },
+          { type: "localFile", path: "/tmp/report.pdf" },
+        ],
+        mode: "steer-if-active",
       },
     });
   });

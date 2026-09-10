@@ -18,7 +18,7 @@ import {
   type ProjectListRowModel,
 } from "./ProjectListProjects";
 import type { ProjectThreadListState } from "./ProjectRow";
-import { compareStandardThreads } from "./projectThreadGroups";
+import { compareStandardThreads } from "@bb/client-core";
 import { ThreadRow, type ThreadRowOptions } from "./ThreadRow";
 
 export default {
@@ -167,6 +167,7 @@ function StoryThreadRow({
     <ThreadRow
       projectId={PROJECT_IDS.bb}
       thread={thread}
+      crossProjectId={null}
       isActive={isActive}
       hasComposerDraft={hasComposerDraft}
       options={defaultThreadOption}
@@ -241,6 +242,7 @@ function ProjectListStage({
         <ProjectListProjects
           status="ready"
           rows={rowModels}
+          progressiveDisclosureEnabled
           collapsedProjectIds={collapsedProjectIds}
           collapsedThreadIds={collapsedThreadIds}
           collapsedEnvironmentIds={collapsedEnvironmentIds}
@@ -284,7 +286,8 @@ function makeWorktreeComboThreads(combo: readonly RollupSignal[]) {
     environmentId,
     environmentHostId: HOST_IDS.local,
     environmentBranchName: `bb/status-${key}`,
-    environmentWorkspaceDisplayKind: "managed-worktree",
+    environmentProviderId: "git-worktree",
+    queuedWork: "none",
   } satisfies Partial<ThreadListEntry>;
 
   return {
@@ -323,7 +326,8 @@ function makeParentRollupThreads(combo: readonly RollupSignal[]) {
   const parent = makeThread(`thr_parent_${key}`, "Collapsed parent", {
     environmentHostId: HOST_IDS.local,
     environmentBranchName: BRANCH_NAMES.default,
-    environmentWorkspaceDisplayKind: "managed-worktree",
+    environmentProviderId: "git-worktree",
+    queuedWork: "none",
   });
 
   return {

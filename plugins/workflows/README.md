@@ -37,9 +37,12 @@ Both surfaces are implemented by the plugin app with `@bb/shared-ui` controls
 and BB theme tokens. Directive attributes and restored panel parameters are
 treated as untrusted input. The backend additionally binds every requested run
 to the directive message or panel thread, so a run ID from another thread
-cannot be inspected or stopped through these UI RPCs. The composer status
-surface checks once per second while mounted so newly started runs appear;
-active message cards and panels poll once per second, then stop when terminal.
+cannot be inspected or stopped through these UI RPCs. The service publishes a
+`workflow-runs` realtime signal for the origin thread when a run starts, is
+claimed, settles, or is cancelled, so the composer status surface learns about
+new runs without a standing poll; it and the active message cards poll once
+per second only while a run is active and the page is visible, refresh once
+when the page or the realtime connection comes back, and stop when terminal.
 
 The security boundary is the QuickJS context: workflow code has JSON data and
 explicit orchestration capabilities, but no Node, filesystem, shell, network,
@@ -103,7 +106,9 @@ corrective retries after their initial invalid attempt.
 
 Workflow workers use BB's generic hidden-thread visibility. They remain
 out of sidebar organization without contributing unread/pending favicon
-attention. Ordinary search, prompt history,
+attention. Retention archives them when it deletes their run, because a
+stopped worker keeps its thread row and no server cascade reaches a root
+hidden thread. Ordinary search, prompt history,
 lifecycle, and direct operations remain available. Workers are root threads,
 so no parent notification applies; a hidden thread that does have a parent
 still reports its turns and blockers to it. Workflows does not create a
@@ -127,7 +132,9 @@ Workflows declares six plugin settings:
 - `maxAgentCalls` bounds the shared parent/child call count.
 - `totalRunTimeoutMs` fails a run independently of explicit cancellation.
 - `retentionDays` controls terminal-run cleanup while preserving active runs
-  and retained resume ancestors.
+  and retained resume ancestors. The sweep archives each expired run's worker
+  threads before it deletes the run, and keeps the run for a later sweep when a
+  worker does not archive.
 - `maxNotificationBytes` bounds completion messages by UTF-8 byte length.
 
 `maxActiveRuns` is live plugin-global dispatch policy: changing it immediately

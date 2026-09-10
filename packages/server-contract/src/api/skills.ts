@@ -22,9 +22,13 @@ export const registryPaginationSchema = z.object({
 });
 export type RegistryPagination = z.infer<typeof registryPaginationSchema>;
 
+export const registryRankingSchema = z.enum(["trending", "all-time"]);
+export type RegistryRanking = z.infer<typeof registryRankingSchema>;
+
 export const registrySkillsPageSchema = z.object({
   skills: z.array(registrySkillSchema),
   pagination: registryPaginationSchema,
+  ranking: registryRankingSchema,
 });
 export type RegistrySkillsPage = z.infer<typeof registrySkillsPageSchema>;
 
@@ -50,14 +54,26 @@ export const registrySkillDetailSchema = z.object({
 });
 export type RegistrySkillDetail = z.infer<typeof registrySkillDetailSchema>;
 
+export const REGISTRY_ENTRY_BATCH_LIMIT = 200;
+
+export const registrySkillEntriesRequestSchema = z
+  .object({
+    ids: z.array(z.string().min(1)).min(1).max(REGISTRY_ENTRY_BATCH_LIMIT),
+  })
+  .strict();
+
+export const registrySkillEntriesResponseSchema = z.object({
+  entries: z.array(registrySkillSchema),
+});
+export type RegistrySkillEntriesResponse = z.infer<
+  typeof registrySkillEntriesResponseSchema
+>;
+
 export const registrySkillInstallRequestSchema = z
   .object({
     registrySkillId: z.string().min(1),
   })
   .strict();
-export type RegistrySkillInstallRequest = z.infer<
-  typeof registrySkillInstallRequestSchema
->;
 
 export const registrySkillInstallResponseSchema = z.object({
   ok: z.literal(true),

@@ -7,7 +7,7 @@ import {
   type SidebarOrganizationMode,
   type SidebarSectionId,
 } from "./sidebarCollapsedAtoms";
-import type { LegacySidebarEntityAnchor } from "./sidebarSectionOrder";
+import type { LegacySidebarEntityAnchor } from "@bb/client-core";
 import { usePersistedSidebarSectionOrder } from "./usePersistedSidebarSectionOrder";
 
 const MODE_SECTION_ORDER_CONFIG: Record<
@@ -34,7 +34,6 @@ const MODE_SECTION_ORDER_CONFIG: Record<
 interface UseSidebarModeSectionOrderArgs {
   entitySectionIds: readonly SidebarSectionId[];
   hasThreadsSection?: boolean;
-  isReady: boolean;
   mode: SidebarOrganizationMode;
   showPinnedSection: boolean;
 }
@@ -48,7 +47,6 @@ interface UseSidebarModeSectionOrderResult {
 export function useSidebarModeSectionOrder({
   entitySectionIds,
   hasThreadsSection,
-  isReady,
   mode,
   showPinnedSection,
 }: UseSidebarModeSectionOrderArgs): UseSidebarModeSectionOrderResult {
@@ -56,14 +54,10 @@ export function useSidebarModeSectionOrder({
   const [storedOrder, setStoredOrder] = useAtom(config.atom);
   const persistedOrder = usePersistedSidebarSectionOrder({
     storedOrder,
-    setStoredOrder,
     entitySectionIds,
     legacyEntityAnchor: config.legacyEntityAnchor,
-    // Keep hidden Pinned sections in persisted order so their placement
-    // survives while the user has no pinned threads.
     hasPinnedSection: true,
     ...(hasThreadsSection === undefined ? {} : { hasThreadsSection }),
-    isReady,
   });
   const order = useMemo(
     () =>

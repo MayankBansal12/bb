@@ -80,7 +80,6 @@ describe("GET /threads/:id/timeline?afterSequence (row-patch delta)", () => {
 
       const before = await getTimeline(harness, thread.id);
 
-      // Append another item to the active turn.
       seedEvent(harness.deps, {
         threadId: thread.id,
         environmentId: environment.id,
@@ -143,10 +142,8 @@ describe("GET /threads/:id/timeline?afterSequence (row-patch delta)", () => {
         },
       });
 
-      // Active turn: rows are expanded.
       const before = await getTimeline(harness, thread.id);
 
-      // Complete the turn -> the projection collapses the turn's rows.
       seedEvent(harness.deps, {
         ...turn,
         sequence: 4,
@@ -161,13 +158,73 @@ describe("GET /threads/:id/timeline?afterSequence (row-patch delta)", () => {
       const fresh = await getTimeline(harness, thread.id);
       expect(merged).not.toBeNull();
       expect(merged).toEqual(fresh.rows);
-      // The collapse genuinely changed the window (different row ids/content),
-      // and a row the client held was dropped — i.e. the delta exercised removal,
-      // not just upsert. Otherwise the test proves nothing.
       expect(fresh.rows).not.toEqual(before.rows);
       const beforeIds = new Set(before.rows.map((row) => row.id));
       const freshIds = new Set(fresh.rows.map((row) => row.id));
       expect([...beforeIds].some((id) => !freshIds.has(id))).toBe(true);
+    });
+  });
+
+  it("two interleaved clients both receive deltas (snapshot ring per params key)", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedThreadFixture(harness);
+      const turn = {
+        threadId: thread.id,
+        environmentId: environment.id,
+        providerThreadId: "p1",
+        scope: turnScope("turn-1"),
+      } as const;
+      let sequence = 0;
+      const appendMessage = (text: string): void => {
+        sequence += 1;
+        seedEvent(harness.deps, {
+          ...turn,
+          sequence,
+          type: "item/completed",
+          data: {
+            item: { type: "agentMessage", id: `assistant-${sequence}`, text },
+          },
+        });
+      };
+      sequence += 1;
+      seedEvent(harness.deps, {
+        ...turn,
+        sequence,
+        type: "turn/started",
+        data: {},
+      });
+      appendMessage("one");
+
+      const desktop = await getTimeline(harness, thread.id);
+      const phone = desktop;
+
+      appendMessage("two");
+      const desktopAt3 = await getTimeline(harness, thread.id, desktop.maxSeq);
+      expect(desktopAt3.delta).toBeDefined();
+      appendMessage("three");
+      const desktopAt4 = await getTimeline(
+        harness,
+        thread.id,
+        desktopAt3.maxSeq,
+      );
+      expect(desktopAt4.delta).toBeDefined();
+
+      const phoneAt4 = await getTimeline(harness, thread.id, phone.maxSeq);
+      expect(phoneAt4.maxSeq).toBe(4);
+      expect(phoneAt4.rows).toHaveLength(0);
+      expect(phoneAt4.delta).toBeDefined();
+      const merged = applyTimelineDelta(phone.rows, phoneAt4.delta!);
+      const fresh = await getTimeline(harness, thread.id);
+      expect(merged).toEqual(fresh.rows);
+
+      for (const text of ["four", "five", "six", "seven"]) {
+        appendMessage(text);
+        const polled = await getTimeline(harness, thread.id, sequence - 1);
+        expect(polled.delta).toBeDefined();
+      }
+      const evicted = await getTimeline(harness, thread.id, 2);
+      expect(evicted.delta).toBeUndefined();
+      expect(evicted.rows.length).toBeGreaterThan(0);
     });
   });
 

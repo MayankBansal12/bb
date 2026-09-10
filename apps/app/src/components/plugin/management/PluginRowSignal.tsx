@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { UPDATE_ACTION_ICON } from "@bb/domain/update-state";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
@@ -9,7 +10,7 @@ import {
   TooltipTrigger,
 } from "@bb/shared-ui/tooltip";
 import type { PluginRowSignal } from "./plugin-status";
-import { UPDATE_TINT_STYLE } from "./plugin-ui";
+import { isReadablePluginVersion, UPDATE_ICON_STYLE } from "./plugin-ui";
 
 export function PluginSignalLogo({
   children,
@@ -37,7 +38,6 @@ export function PluginSignalLogo({
   );
 }
 
-/** The single status/action slot shared by installed plugin rows and galleries. */
 export function PluginRowSignalView({
   signal,
   onUpdateClick,
@@ -50,15 +50,32 @@ export function PluginRowSignalView({
   statusPresentation?: "standalone" | "badge";
 }) {
   if (signal.kind === "update") {
+    const readableVersion = isReadablePluginVersion(signal.version)
+      ? signal.version
+      : null;
+    const updateDescription =
+      readableVersion === null
+        ? "Update available"
+        : `Update to ${readableVersion}`;
     return (
-      <button
-        type="button"
-        className="shrink-0 rounded-full border px-2.5 py-1 text-2xs font-medium"
-        style={UPDATE_TINT_STYLE}
-        onClick={onUpdateClick}
-      >
-        Update {signal.version}
-      </button>
+      <TooltipProvider delayDuration={250}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-7 shrink-0 rounded-full"
+              style={UPDATE_ICON_STYLE}
+              aria-label={updateDescription}
+              onClick={onUpdateClick}
+            >
+              <Icon name={UPDATE_ACTION_ICON} className="size-4" aria-hidden />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{updateDescription}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     );
   }
 
@@ -80,7 +97,9 @@ export function PluginRowSignalView({
                 : "size-7",
               signal.tone === "error"
                 ? "text-destructive hover:text-destructive"
-                : "text-warning-text hover:text-warning-text",
+                : signal.tone === "warning"
+                  ? "text-warning-text hover:text-warning-text"
+                  : "text-muted-foreground hover:text-muted-foreground",
             )}
             aria-label={statusDescription}
             onClick={onStatusClick}

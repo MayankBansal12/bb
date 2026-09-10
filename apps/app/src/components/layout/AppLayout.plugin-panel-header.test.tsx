@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppLayout } from "./AppLayout";
+import { APP_OVERLAY_LAYER } from "@/components/ui/app-overlay-layers";
+import { setCompactSecondaryPanelPresentation } from "@/components/ui/secondary-panel-shelf-visibility";
 
 const viewportState = vi.hoisted(() => ({ compact: false }));
 
@@ -19,25 +21,30 @@ vi.mock("@/components/sidebar/AppSidebar", () => ({
   AppSidebar: () => <aside data-testid="app-sidebar" />,
 }));
 
-vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
-  useThreadSplitsEnabled: () => true,
-}));
-
 vi.mock("@/hooks/queries/system-queries", () => ({
   useSystemConfig: () => ({
     data: {
       experiments: {
-        claudeCodeMockCliTraffic: false,
+        changelogPreview: false,
         editMessages: false,
-        newOnboarding: false,
-        toolsHub: true,
+        mobileApp: false,
+        sidebarProgressiveDisclosure: false,
+        timelineWindowing: false,
       },
     },
   }),
 }));
 
+vi.mock("@/hooks/useHostDaemon", () => ({
+  useHostDaemon: () => ({ hasDaemon: false }),
+  useLocalHostDaemonAccess: () => ({ accessState: "unavailable" }),
+}));
+
 vi.mock("@/lib/plugin-slots", () => ({
   usePluginSlots: () => ({
+    appOverlays: [],
+    commandPaletteActions: [],
+    fileOpeners: [],
     navPanels: [
       {
         pluginId: "helm-wiki",
@@ -46,12 +53,13 @@ vi.mock("@/lib/plugin-slots", () => ({
         icon: "Book",
       },
     ],
+    settingsSections: [],
   }),
 }));
 
 vi.mock("@/components/plugin/PluginPanelHeader", () => ({
-  PluginPanelHeaderCenter: ({ panel }: { panel: { title: string } }) => (
-    <span data-testid="plugin-panel-header-center">{panel.title}</span>
+  PluginPanelHeaderCenter: ({ chrome }: { chrome: { title: string } }) => (
+    <span data-testid="plugin-panel-header-center">{chrome.title}</span>
   ),
   PluginPanelHeaderActions: () => null,
 }));
@@ -64,8 +72,12 @@ vi.mock("@/components/project/ProjectActionsProvider", () => ({
 
 vi.mock("@/components/thread/ThreadActionsProvider", () => ({
   ThreadActionsProvider: ({ children }: { children: ReactNode }) => (
-    <>{children}</>
+    <div data-testid="thread-actions-provider">{children}</div>
   ),
+}));
+
+vi.mock("@/components/plugin/PluginAppOverlays", () => ({
+  PluginAppOverlays: () => <div data-testid="plugin-app-overlays" />,
 }));
 
 vi.mock("@/components/dialogs/ProjectPathDialog", () => ({
@@ -167,26 +179,51 @@ function renderPluginPanelRoute(): void {
 describe("AppLayout plugin panel header", () => {
   beforeEach(() => {
     viewportState.compact = false;
+    setCompactSecondaryPanelPresentation("closed");
   });
 
   afterEach(() => {
     cleanup();
+    setCompactSecondaryPanelPresentation("closed");
     vi.clearAllMocks();
   });
 
-  it("renders the shared header on compact viewports so the body clears the sidebar trigger", () => {
+  it("leaves the compact header to the plugin page panel host", () => {
     viewportState.compact = true;
     renderPluginPanelRoute();
 
-    expect(screen.getByTestId("app-page-header")).toBeTruthy();
-    expect(screen.getByTestId("plugin-panel-header-center").textContent).toBe(
-      "Helm Wiki",
-    );
+    expect(screen.queryByTestId("app-page-header")).toBeNull();
   });
 
-  it("leaves the header to the split workspace on regular viewports", () => {
+  it("leaves the regular header to the plugin page panel host", () => {
     renderPluginPanelRoute();
 
     expect(screen.queryByTestId("app-page-header")).toBeNull();
+  });
+
+  it("mounts app overlays inside the app-level thread actions provider", () => {
+    renderPluginPanelRoute();
+
+    expect(
+      screen
+        .getByTestId("thread-actions-provider")
+        .contains(screen.getByTestId("plugin-app-overlays")),
+    ).toBe(true);
+  });
+
+  it("shows the fixed left trigger only while the compact right panel is closed", () => {
+    viewportState.compact = true;
+    renderPluginPanelRoute();
+
+    const trigger = screen.getByTestId("app-sidebar-trigger-overlay");
+    expect(trigger.style.zIndex).toBe(String(APP_OVERLAY_LAYER.sidebarTrigger));
+    act(() => setCompactSecondaryPanelPresentation("shelf"));
+    expect(screen.queryByTestId("app-sidebar-trigger-overlay")).toBeNull();
+
+    act(() => setCompactSecondaryPanelPresentation("full"));
+    expect(screen.queryByTestId("app-sidebar-trigger-overlay")).toBeNull();
+
+    act(() => setCompactSecondaryPanelPresentation("closed"));
+    expect(screen.getByTestId("app-sidebar-trigger-overlay")).not.toBeNull();
   });
 });

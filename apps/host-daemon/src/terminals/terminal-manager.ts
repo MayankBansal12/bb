@@ -6,7 +6,10 @@ import path from "node:path";
 import { spawn as spawnPty } from "node-pty";
 import type { TerminalSessionCloseReason } from "@bb/domain";
 import type { HostDaemonDaemonWsMessage } from "@bb/host-daemon-contract";
-import { sanitizeInheritedChildProcessEnv } from "@bb/process-utils";
+import {
+  killProcessGroup,
+  sanitizeInheritedChildProcessEnv,
+} from "@bb/process-utils";
 import type { HostDaemonServerTerminalMessage } from "../server-connection-support.js";
 import type { HostDaemonLogger } from "../logger.js";
 import { RuntimeManager } from "../runtime-manager.js";
@@ -19,6 +22,9 @@ const DEFAULT_SCROLLBACK_MAX_CHUNKS = 10_000;
 const MAX_OUTPUT_CHUNK_BYTES = 64 * 1024;
 const DEFAULT_OUTPUT_BATCH_DELAY_MS = 4;
 const DEFAULT_TERMINAL_CLOSE_GRACE_PERIOD_MS = 2_000;
+const PRIMARY_DEVICE_ATTRIBUTES_QUERY_PATTERN = /\u001b\[(?:0)?c/g;
+const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE = "\u001b[?1;2c";
+const MAX_PRIMARY_DEVICE_ATTRIBUTES_REPLIES_PER_CHUNK = 8;
 const NODE_PTY_NATIVE_DIRS: readonly string[] = [
   path.join("build", "Release"),
   path.join("build", "Debug"),
@@ -39,7 +45,8 @@ export interface TerminalPtyExit {
 }
 
 export interface TerminalPtyProcess {
-  kill(signal?: string): void;
+  dispose(): void;
+  kill(signal?: NodeJS.Signals): void;
   onData(listener: (data: string) => void): TerminalPtyDisposable;
   onExit(listener: (event: TerminalPtyExit) => void): TerminalPtyDisposable;
   resize(cols: number, rows: number): void;
@@ -76,11 +83,8 @@ export interface TerminalManagerOptions {
   logger: HostDaemonLogger;
   platform?: NodeJS.Platform;
   ptyAdapter?: TerminalPtyAdapter;
-  outputBatchDelayMs?: number;
   resolveShell?: ResolveTerminalShell;
   runtimeManager: RuntimeManager;
-  scrollbackMaxBytes?: number;
-  scrollbackMaxChunks?: number;
   sendMessage: (message: HostDaemonDaemonWsMessage) => boolean;
 }
 
@@ -102,11 +106,24 @@ interface TerminalSession {
   outputBuffers: Buffer[];
   outputBytes: number;
   outputFlushTimeout: ReturnType<typeof setTimeout> | null;
+  pendingPrimaryDeviceAttributesQuery: PendingPrimaryDeviceAttributesQuery;
   pty: TerminalPtyProcess;
   rows: number;
   scrollback: ScrollbackEntry[];
   scrollbackBytes: number;
   terminalId: string;
+}
+
+type PendingPrimaryDeviceAttributesQuery =
+  | ""
+  | "\u001b"
+  | "\u001b["
+  | "\u001b[0";
+
+interface PrimaryDeviceAttributesQueryResult {
+  output: string;
+  pendingQuery: PendingPrimaryDeviceAttributesQuery;
+  queryCount: number;
 }
 
 interface SendTerminalErrorArgs {
@@ -170,7 +187,15 @@ interface TerminalOperationCompletion {
   resolve: () => void;
 }
 
-export const nodePtyAdapter: TerminalPtyAdapter = {
+function disposeNodePty(pty: ReturnType<typeof spawnPty>): void {
+  const destroy = "destroy" in pty ? pty.destroy : undefined;
+  if (typeof destroy !== "function") {
+    throw new Error("node-pty terminal does not expose resource disposal");
+  }
+  Reflect.apply(destroy, pty, []);
+}
+
+const nodePtyAdapter: TerminalPtyAdapter = {
   spawn(args) {
     ensureNodePtySpawnHelperExecutable(args.logger);
     const pty = spawnPty(args.file, args.args, {
@@ -181,7 +206,12 @@ export const nodePtyAdapter: TerminalPtyAdapter = {
       rows: args.rows,
     });
     return {
-      kill: (signal) => pty.kill(signal),
+      dispose: () => disposeNodePty(pty),
+      kill: (signal) =>
+        killProcessGroup({
+          child: { pid: pty.pid, kill: (groupSignal) => pty.kill(groupSignal) },
+          signal: signal ?? "SIGHUP",
+        }),
       onData: (listener) => pty.onData(listener),
       onExit: (listener) =>
         pty.onExit((event) =>
@@ -206,7 +236,7 @@ interface EnsureNodePtySpawnHelperExecutableInPackageArgs {
 
 type NodePtySpawnHelperPathList = string[];
 
-export function resolveNodePtySpawnHelperCandidatePaths(
+function resolveNodePtySpawnHelperCandidatePaths(
   args: ResolveNodePtySpawnHelperPathArgs,
 ): NodePtySpawnHelperPathList {
   const helperPaths: string[] = [];
@@ -297,7 +327,7 @@ function isNonEmptyString(value: string | undefined): value is string {
   return value !== undefined && value.length > 0;
 }
 
-export async function resolveDefaultTerminalShell(): Promise<string> {
+async function resolveDefaultTerminalShell(): Promise<string> {
   const candidates = [
     process.env.SHELL,
     "/bin/zsh",
@@ -321,8 +351,7 @@ function buildTerminalEnv(args: BuildTerminalEnvArgs): NodeJS.ProcessEnv {
     BB_TERMINAL_SESSION_ID: args.terminalId,
     COLORTERM: "truecolor",
     DISABLE_AUTO_TITLE: "true",
-    // zsh emits a highlighted "%" by default when a prompt follows output
-    // without a newline. It becomes noisy when scrollback is replayed.
+    FORCE_HYPERLINK: "1",
     PROMPT_EOL_MARK: "",
     TERM: "xterm-256color",
   };
@@ -391,14 +420,41 @@ function createTerminalOperationCompletion(): TerminalOperationCompletion {
   return { promise, resolve: resolveCompletion };
 }
 
+function consumePrimaryDeviceAttributesQueries(
+  pendingQuery: PendingPrimaryDeviceAttributesQuery,
+  data: string,
+): PrimaryDeviceAttributesQueryResult {
+  const input = pendingQuery + data;
+  const nextPendingQuery: PendingPrimaryDeviceAttributesQuery = input.endsWith(
+    "\u001b[0",
+  )
+    ? "\u001b[0"
+    : input.endsWith("\u001b[")
+      ? "\u001b["
+      : input.endsWith("\u001b")
+        ? "\u001b"
+        : "";
+  const completeInput = input.slice(0, input.length - nextPendingQuery.length);
+  let queryCount = 0;
+  const output = completeInput.replace(
+    PRIMARY_DEVICE_ATTRIBUTES_QUERY_PATTERN,
+    () => {
+      queryCount += 1;
+      return "";
+    },
+  );
+  return {
+    output,
+    pendingQuery: nextPendingQuery,
+    queryCount,
+  };
+}
+
 export class TerminalManager {
   private readonly closeGracePeriodMs: number;
-  private readonly outputBatchDelayMs: number;
   private readonly platform: NodeJS.Platform;
   private readonly ptyAdapter: TerminalPtyAdapter;
   private readonly resolveShell: ResolveTerminalShell;
-  private readonly scrollbackMaxBytes: number;
-  private readonly scrollbackMaxChunks: number;
   private readonly terminalOperations = new Map<string, Promise<void>>();
   private readonly openingTerminalEnvironmentIds = new Map<
     string,
@@ -409,15 +465,9 @@ export class TerminalManager {
   constructor(private readonly options: TerminalManagerOptions) {
     this.closeGracePeriodMs =
       options.closeGracePeriodMs ?? DEFAULT_TERMINAL_CLOSE_GRACE_PERIOD_MS;
-    this.outputBatchDelayMs =
-      options.outputBatchDelayMs ?? DEFAULT_OUTPUT_BATCH_DELAY_MS;
     this.platform = options.platform ?? process.platform;
     this.ptyAdapter = options.ptyAdapter ?? nodePtyAdapter;
     this.resolveShell = options.resolveShell ?? resolveDefaultTerminalShell;
-    this.scrollbackMaxBytes =
-      options.scrollbackMaxBytes ?? DEFAULT_SCROLLBACK_MAX_BYTES;
-    this.scrollbackMaxChunks =
-      options.scrollbackMaxChunks ?? DEFAULT_SCROLLBACK_MAX_CHUNKS;
   }
 
   async handleMessage(message: HostDaemonServerTerminalMessage): Promise<void> {
@@ -553,6 +603,7 @@ export class TerminalManager {
         outputBuffers: [],
         outputBytes: 0,
         outputFlushTimeout: null,
+        pendingPrimaryDeviceAttributesQuery: "",
         pty,
         rows: message.rows,
         scrollback: [],
@@ -705,11 +756,6 @@ export class TerminalManager {
   private closeTerminal(args: CloseTerminalArgs): void {
     const session = this.sessions.get(args.terminalId);
     if (!session) {
-      // Close is idempotent across the server/daemon boundary. The server can
-      // still have a running row after the daemon has already forgotten the
-      // PTY (for example, when an earlier exit message was lost). A silent
-      // return leaves that row running forever because the server is waiting
-      // for this acknowledgement before it completes the close request.
       this.options.sendMessage({
         type: "terminal.exited",
         terminalId: args.terminalId,
@@ -801,6 +847,22 @@ export class TerminalManager {
       return;
     }
 
+    const result = consumePrimaryDeviceAttributesQueries(
+      session.pendingPrimaryDeviceAttributesQuery,
+      data,
+    );
+    session.pendingPrimaryDeviceAttributesQuery = result.pendingQuery;
+    if (result.queryCount > 0) {
+      const replyCount = Math.min(
+        result.queryCount,
+        MAX_PRIMARY_DEVICE_ATTRIBUTES_REPLIES_PER_CHUNK,
+      );
+      session.pty.write(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.repeat(replyCount));
+    }
+    this.bufferTerminalOutput(session, result.output);
+  }
+
+  private bufferTerminalOutput(session: TerminalSession, data: string): void {
     const buffer = Buffer.from(data, "utf8");
     if (buffer.byteLength === 0) {
       return;
@@ -818,7 +880,7 @@ export class TerminalManager {
     session.outputFlushTimeout = setTimeout(() => {
       session.outputFlushTimeout = null;
       this.flushTerminalOutput(session);
-    }, this.outputBatchDelayMs);
+    }, DEFAULT_OUTPUT_BATCH_DELAY_MS);
   }
 
   private flushTerminalOutput(session: TerminalSession): void {
@@ -869,8 +931,8 @@ export class TerminalManager {
 
   private pruneScrollback(session: TerminalSession): void {
     while (
-      session.scrollbackBytes > this.scrollbackMaxBytes ||
-      session.scrollback.length > this.scrollbackMaxChunks
+      session.scrollbackBytes > DEFAULT_SCROLLBACK_MAX_BYTES ||
+      session.scrollback.length > DEFAULT_SCROLLBACK_MAX_CHUNKS
     ) {
       const removed = session.scrollback.shift();
       if (!removed) {
@@ -883,6 +945,13 @@ export class TerminalManager {
   private finishTerminalSession(args: FinishTerminalSessionArgs): void {
     if (this.sessions.get(args.session.terminalId) !== args.session) {
       return;
+    }
+    if (args.session.pendingPrimaryDeviceAttributesQuery.length > 0) {
+      this.bufferTerminalOutput(
+        args.session,
+        args.session.pendingPrimaryDeviceAttributesQuery,
+      );
+      args.session.pendingPrimaryDeviceAttributesQuery = "";
     }
     this.flushTerminalOutput(args.session);
     if (args.session.closeTimeout !== null) {
@@ -898,6 +967,17 @@ export class TerminalManager {
     }
     for (const disposable of args.session.disposables) {
       disposable.dispose();
+    }
+    try {
+      args.session.pty.dispose();
+    } catch (error) {
+      this.options.logger.warn(
+        {
+          terminalId: args.session.terminalId,
+          ...runtimeErrorLogFields(error),
+        },
+        "Failed to dispose terminal PTY",
+      );
     }
     this.options.sendMessage({
       type: "terminal.exited",

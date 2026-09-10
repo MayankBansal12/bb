@@ -14,13 +14,13 @@ const NETWORK_TRANSPORT_ERROR_MESSAGE =
 const GENERIC_REQUEST_FAILED_MESSAGE = "Request failed";
 const TRAILING_PERIOD_PATTERN = /\.$/u;
 
-export interface MutationErrorMessageOptions {
+interface MutationErrorMessageOptions {
   error: unknown;
   fallbackMessage: string;
   lifecycleOperation?: LifecycleErrorOperation | undefined;
 }
 
-export interface MutationErrorMeta {
+interface MutationErrorMeta {
   errorMessage?: string;
   lifecycleOperation?: LifecycleErrorOperation;
   showErrorToast?: boolean;
@@ -36,17 +36,8 @@ function stripHttpStatusPrefix(message: string): string {
   return message.replace(HTTP_STATUS_PREFIX_PATTERN, "");
 }
 
-function stripTrailingPeriod(message: string): string {
-  return message.replace(TRAILING_PERIOD_PATTERN, "");
-}
-
 function isAbortLikeError(error: unknown): boolean {
-  if (error instanceof DOMException && error.name === "AbortError") {
-    return true;
-  }
-
-  const record = toRecord(error);
-  return record?.name === "AbortError";
+  return toRecord(error)?.name === "AbortError";
 }
 
 function isNetworkTransportError(error: unknown): boolean {
@@ -93,7 +84,6 @@ function toLifecycleErrorOperation(
     case "send_message":
     case "send_queued_message":
     case "set_queued_message_group_boundary":
-    case "squash_merge":
     case "stop_thread":
     case "update_queued_message":
     case "update_merge_base":
@@ -186,13 +176,22 @@ export function showMutationErrorToast({
     return;
   }
 
-  const message = stripTrailingPeriod(
-    getMutationErrorMessage({
-      error,
-      fallbackMessage,
-      lifecycleOperation,
-    }),
-  );
+  const lifecycleDescription = describeLifecycleError({
+    error,
+    operation: lifecycleOperation,
+  });
+  if (lifecycleDescription) {
+    appToast.error(lifecycleDescription.title, {
+      description: lifecycleDescription.body,
+    });
+    return;
+  }
+
+  const message = getMutationErrorMessage({
+    error,
+    fallbackMessage,
+    lifecycleOperation,
+  }).replace(TRAILING_PERIOD_PATTERN, "");
   if (message === GENERIC_REQUEST_FAILED_MESSAGE) {
     appToast.error("Request failed", {
       description: "Please try again",
@@ -200,5 +199,12 @@ export function showMutationErrorToast({
     return;
   }
 
-  appToast.error(message);
+  const title = normalizeMessage(fallbackMessage).replace(
+    TRAILING_PERIOD_PATTERN,
+    "",
+  );
+  appToast.error(
+    title,
+    message === title ? undefined : { description: message },
+  );
 }

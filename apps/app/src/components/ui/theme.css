@@ -9,6 +9,17 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * Blink cannot anchor a `:has()` that Tailwind nests inside `:is()`/`:where()`
+ * with a universal subject (the shape it emits for `group-has-*` variants).
+ * With that shape present, every DOM insertion or removal under the page
+ * restyles the whole subtree (~1 s on a large thread). Keep `:has()` on the
+ * group element itself instead.
+ */
+@custom-variant queue-boundary-row-hover (:where(.group\/queue):has([data-queued-message-group-boundary-row]:hover) &);
+@custom-variant queue-boundary-row-focus-within (:where(.group\/queue):has([data-queued-message-group-boundary-row]:focus-within) &);
+@custom-variant tab-pill-close-focus-visible (:where(.group\/tab-pill):has([data-tab-pill-close]:focus-visible) &);
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -27,6 +38,7 @@
    * settled/closed-turn machinery, and a text-only destructive that clears AA in
    * dark mode (the --destructive fill is below the 4.5:1 text floor there). */
   --color-readback-foreground: var(--readback-foreground);
+  --color-version-upgrade: var(--version-upgrade);
   --color-timeline-accent: var(--timeline-accent);
   --color-file-accent: var(--file-accent);
   --color-accent: var(--accent);
@@ -45,6 +57,7 @@
   /* GitHub's merged-PR purple — the one chromatic exception in the PR state
    * dots, matching the universal merged-PR color language. */
   --color-pr-merged: var(--pr-merged);
+  --color-brand-discord: var(--brand-discord);
   --color-diff-removed: var(--diff-removed);
   --color-border: var(--border);
   --color-border-hairline: var(--border-hairline);
@@ -259,6 +272,52 @@
     opacity: 1;
   }
 
+  /* Sidebar row glyph that swaps on hover (the Extensions row's toolbox ->
+   * tool case). Both glyphs share one grid cell and only opacity changes, so
+   * the row can never reflow mid-swap. Driven by the same
+   * :is(:hover, :has(:focus-visible)) row selector as the hover actions above,
+   * so a keyboard focus swaps the glyph exactly like a pointer hover. */
+  .bb-sidebar-row-icon-swap {
+    display: grid;
+    grid-template-areas: "glyph";
+  }
+
+  .bb-sidebar-row-icon-swap > * {
+    grid-area: glyph;
+  }
+
+  .bb-sidebar-row-icon-hover {
+    opacity: 0;
+  }
+
+  .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
+    .bb-sidebar-row-icon-rest {
+    opacity: 0;
+  }
+
+  .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
+    .bb-sidebar-row-icon-hover {
+    opacity: 1;
+  }
+
+  /* Row content beside a hover-actions overlay that grows past its rest slot
+   * (the thread row's archive button sits left of the menu trigger). Reserve
+   * one action width under the same row states that reveal the overlay, so the
+   * title truncates instead of running under the button. */
+  .bb-sidebar-hover-actions-inset {
+    transition-property: padding;
+    transition-duration: 0ms;
+  }
+
+  .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
+    .bb-sidebar-hover-actions-inset,
+  .bb-sidebar-hover-actions-row:has(
+      .bb-sidebar-hover-actions[data-sidebar-hover-actions-open="true"]
+    )
+    .bb-sidebar-hover-actions-inset {
+    padding-right: 1.5rem;
+  }
+
   .bb-sidebar-hover-actions-fade {
     opacity: 1;
     transition-property: opacity;
@@ -272,6 +331,11 @@
   }
 
   @media (max-width: 767px) and (pointer: coarse) {
+    /* The overlay is hidden on coarse phones, so no room is reserved. */
+    .bb-sidebar-hover-actions-row .bb-sidebar-hover-actions-inset {
+      padding-right: 0;
+    }
+
     .bb-sidebar-hover-actions-row:hover:not(:has(:focus-visible))
       .bb-sidebar-hover-actions:not(
         [data-sidebar-hover-actions-open="true"]
@@ -395,6 +459,11 @@
   --subtle-foreground: oklch(0.5 0 0);
   /* Recede tier between muted (7.77:1) and subtle (6.00:1); ~6.83:1 on white. */
   --readback-foreground: oklch(0.47 0 0);
+  /* The version an update would move you to. Its own role rather than plain
+   * body text so the "this is the one you'd get" emphasis can be tuned without
+   * touching every other foreground, and derived from the anchors so custom
+   * palettes tint it instead of stranding it neutral beside their own text. */
+  --version-upgrade: color-mix(in oklch, var(--ink) 96%, var(--canvas));
   /* Soft "paper blue" timeline accent — the one tint in the otherwise
    * achromatic timeline. ~5.0:1 on white. */
   --timeline-accent: oklch(0.55 0.1 250);
@@ -426,6 +495,7 @@
   --success-foreground: color-mix(in oklch, var(--success) 45%, var(--ink));
   --diff-added: oklch(0.4 0.13 163);
   --pr-merged: oklch(0.53 0.2 295);
+  --brand-discord: oklch(0.5774 0.2091 273.85);
   --diff-removed: oklch(0.4 0.17 28);
   --border: color-mix(in oklch, var(--ink) 14%, var(--canvas));
   --border-hairline: color-mix(in oklch, var(--ink) 14.7%, var(--canvas));
@@ -520,7 +590,9 @@
   --sidebar-ring: var(--primary);
   --font-sans: "Inter Variable", Inter, sans-serif;
   --font-serif: Georgia, serif;
-  --font-mono: "Fira Code", monospace;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
   --radius: 0.5rem;
   --bb-sidebar-row-height: 1.75rem;
   --bb-sidebar-row-height-coarse: 2.5rem;
@@ -639,6 +711,8 @@
   --subtle-foreground: oklch(0.68 0 0);
   /* Recede tier between muted (9.14:1) and subtle (6.35:1); ~7.24:1 on canvas. */
   --readback-foreground: oklch(0.715 0 0);
+  /* See the light block: the version an update would move you to. */
+  --version-upgrade: color-mix(in oklch, var(--ink) 96%, var(--canvas));
   /* Soft "paper blue" timeline accent, lifted for the dark canvas (~6:1). */
   --timeline-accent: oklch(0.72 0.09 250);
   --file-accent: var(--timeline-accent);
@@ -669,6 +743,7 @@
   --diff-added: oklch(0.77 0.17 163);
   --diff-removed: oklch(0.72 0.19 22);
   --pr-merged: oklch(0.68 0.18 295);
+  --brand-discord: var(--foreground);
   --border: color-mix(in oklch, var(--ink) 19.4%, var(--canvas));
   --border-hairline: color-mix(in oklch, var(--ink) 21%, var(--canvas));
   /* One app-shell seam for top nav, sidebar, split, and panel boundaries. */
@@ -751,7 +826,9 @@
   --sidebar-ring: var(--primary);
   --font-sans: "Inter Variable", Inter, sans-serif;
   --font-serif: Georgia, serif;
-  --font-mono: "Fira Code", monospace;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
   --radius: 0.5rem;
   /* Dark shadows are pure black at higher alpha — a 20%-gray shadow is
    * invisible on the dark canvas, so floating surfaces (popovers, dropdowns)
@@ -848,6 +925,22 @@
   }
 }
 
+/*
+ * Non-inherited on purpose. The sidebar resize drag rewrites this length on
+ * every animation frame; an inherited custom property change makes the
+ * engine restyle every descendant of the element it is set on (measured at
+ * ~20-45 µs per element, so a long thread cost 50-400 ms per frame).
+ * `Sidebar` therefore sets it directly on the two elements that read it (the
+ * desktop gap and panel), and a change touches only those. The initial value
+ * mirrors the 16rem default in sidebar.tsx (`@property` requires an absolute
+ * length here).
+ */
+@property --sidebar-width {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 256px;
+}
+
 body.sidebar-resizing [data-sidebar="gap"],
 body.sidebar-resizing [data-sidebar="panel"] {
   transition-duration: 0ms !important;
@@ -865,6 +958,25 @@ body.sidebar-resizing [data-sidebar="panel"] {
 }
 
 @layer utilities {
+  .bb-thread-title {
+    @apply flex min-w-0 items-baseline;
+  }
+
+  .bb-thread-title .prompt-mention-pill {
+    @apply min-w-10;
+    flex: 1 1 0%;
+    max-width: max-content;
+  }
+
+  /*
+   * The sweep animates `background-position` / `mask-position`, which the
+   * compositor cannot run: every frame is a main-thread repaint. `will-change:
+   * transform` gives the shimmering element its own layer while the class is
+   * present (only while a row is active), so that repaint covers the small
+   * label or glyph instead of the tile of the scroller layer it sits in — on
+   * WebKit that tile otherwise re-rasterizes surrounding timeline text every
+   * frame of a streaming turn.
+   */
   .animate-shine {
     display: inline-block;
     background: linear-gradient(
@@ -878,6 +990,7 @@ body.sidebar-resizing [data-sidebar="panel"] {
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     animation: shine 2s linear infinite;
+    will-change: transform;
   }
 
   /*
@@ -903,6 +1016,22 @@ body.sidebar-resizing [data-sidebar="panel"] {
     -webkit-mask-size: 200% 100%;
     mask-size: 200% 100%;
     animation: shine-mask 2.6s linear infinite;
+    will-change: transform;
+  }
+
+  /*
+   * Hidden hosts keep shimmering rows mounted: the closed sidebar drawer's
+   * inert panel, a collapsed `aria-hidden` banner body, a retained overlay.
+   * Pause the sweep and release the layer there so nothing off-screen repaints
+   * every frame. The rightmost compound is a class, so toggling `inert` or
+   * `aria-hidden` on the host invalidates only these elements.
+   */
+  [inert] .animate-shine,
+  [inert] .animate-shine-icon,
+  [aria-hidden="true"] .animate-shine,
+  [aria-hidden="true"] .animate-shine-icon {
+    animation-play-state: paused;
+    will-change: auto;
   }
 
   /* Plugin status glyphs are the only visible progress cue. Keep their sweep
@@ -913,20 +1042,20 @@ body.sidebar-resizing [data-sidebar="panel"] {
   }
 
   /*
-   * Indeterminate progress sweep. Used while a plugin installs: the server does
-   * the work behind one blocking request, so the client can say that work is
-   * happening but not how far along it is. A first install on a machine also
-   * downloads the build toolchain, which is why this window can run ~17s.
+   * Indeterminate progress sweep, for work whose duration the client cannot
+   * predict: a plugin install (one blocking server request that can run ~17s on
+   * a machine's first install, because it also downloads the build toolchain),
+   * and route navigation that React has deprioritized behind a transition.
    */
-  .animate-plugin-install-progress {
-    animation: plugin-install-progress 1.5s ease-in-out infinite;
+  .animate-indeterminate-progress {
+    animation: indeterminate-progress 1.5s ease-in-out infinite;
   }
 
   /* Reduced motion: drop the shimmer sweep and render the active cue as plain
      full-strength foreground text/glyph instead of a frozen gradient/mask. */
   @media (prefers-reduced-motion: reduce) {
     /* A static half-width fill still reads as "busy" without the sweep. */
-    .animate-plugin-install-progress {
+    .animate-indeterminate-progress {
       animation: none;
       width: 50%;
     }
@@ -935,12 +1064,14 @@ body.sidebar-resizing [data-sidebar="panel"] {
       animation: none;
       background: none;
       -webkit-text-fill-color: currentColor;
+      will-change: auto;
     }
 
     .animate-shine-icon {
       animation: none;
       -webkit-mask-image: none;
       mask-image: none;
+      will-change: auto;
     }
   }
 }
@@ -954,7 +1085,7 @@ body.sidebar-resizing [data-sidebar="panel"] {
   }
 }
 
-@keyframes plugin-install-progress {
+@keyframes indeterminate-progress {
   0% {
     margin-inline-start: -35%;
   }
@@ -984,11 +1115,18 @@ body.sidebar-resizing [data-sidebar="panel"] {
   transition-property: opacity;
 }
 
-.scroll-bottom-anchor-content * {
+/*
+ * Bottom-anchored scroll bodies (see bottom-anchored-scroll-body.tsx). The
+ * class goes on the content wrapper alone: scroll anchoring skips an excluded
+ * element's whole subtree, so no descendant rule is needed. A `*` descendant
+ * rule here would restyle every timeline node each time the class toggles.
+ * The sentinel is a sibling of the wrapper, so it stays eligible.
+ */
+.scroll-bottom-anchor-content {
   overflow-anchor: none;
 }
 
-.scroll-bottom-anchor-content .scroll-bottom-anchor {
+.scroll-bottom-anchor {
   height: 1px;
   flex-shrink: 0;
   overflow-anchor: auto;

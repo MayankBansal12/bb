@@ -1,9 +1,22 @@
-import { Menu, WebContentsView, session, type Session } from "electron";
+import { createHash, randomUUID } from "node:crypto";
+import { captureDesktopBrowserPage } from "./desktop-browser-capture.js";
+import {
+  BrowserWindow,
+  Menu,
+  WebContentsView,
+  session,
+  type BrowserWindowConstructorOptions,
+  type Session,
+  type WebContents,
+  type WebPreferences,
+} from "electron";
 import {
   BB_DESKTOP_BROWSER_MAX_TITLE_LENGTH,
   BB_DESKTOP_BROWSER_MAX_URL_LENGTH,
   clampBbDesktopBrowserViewBounds,
   type BbDesktopBrowserAttachRequest,
+  type BbDesktopBrowserFindInPageRequest,
+  type BbDesktopBrowserFindResult,
   type BbDesktopBrowserNavigateRequest,
   type BbDesktopBrowserOpenTabRequest,
   type BbDesktopBrowserScopedOpenTabRequest,
@@ -11,12 +24,18 @@ import {
   type BbDesktopBrowserSetVisibleRequest,
   type BbDesktopBrowserSnapshot,
   type BbDesktopBrowserState,
+  type BbDesktopBrowserControlState,
+  type BbDesktopBrowserRevealRequest,
+  type BbDesktopBrowserTabRef,
+  type BbDesktopBrowserStopFindInPageRequest,
   type BbDesktopBrowserViewportBounds,
   type BbDesktopBrowserViewBounds,
 } from "@bb/desktop-contract";
 import type { AppCommandId, AppShortcutInput } from "@bb/domain";
 import {
+  BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL,
   BB_DESKTOP_BROWSER_OPEN_TAB_CHANNEL,
+  BB_DESKTOP_BROWSER_FOCUSED_CHANNEL,
   BB_DESKTOP_BROWSER_SCOPED_OPEN_TAB_CHANNEL,
   BB_DESKTOP_BROWSER_SNAPSHOT_CHANNEL,
   BB_DESKTOP_BROWSER_STATE_CHANNEL,
@@ -24,64 +43,150 @@ import {
 import {
   evaluatePopupRate,
   isAllowedBrowserUrl,
-  localRequestOriginKey,
-  resolveRequestingFrameLocalOriginKey,
-  resolveWindowOpenAction,
-  shouldBlockBrowserRequest,
 } from "./desktop-browser-policy.js";
 
-// At most this many popup → in-panel tabs may be spawned per view in a sliding
-// window, so a hostile page cannot flood the panel with tabs.
 const POPUP_RATE_WINDOW_MS = 10_000;
 const POPUP_RATE_MAX_IN_WINDOW = 3;
+const POPUP_MAX_OPEN_PER_TAB = 3;
+const POPUP_MAX_OPEN_GLOBAL = 8;
+const POPUP_DEFAULT_WIDTH = 520;
+const POPUP_DEFAULT_HEIGHT = 700;
+const POPUP_MIN_WIDTH = 320;
+const POPUP_MIN_HEIGHT = 240;
+const POPUP_MAX_WIDTH = 960;
+const POPUP_MAX_HEIGHT = 900;
 
-/**
- * At the start of a resize burst the view stays visible until its snapshot
- * capture resolves (capturing a hidden view is unreliable). This cap bounds
- * how long a stalled capture may leave the stale view on screen.
- */
 const RESIZE_SNAPSHOT_HIDE_CAP_MS = 80;
-/** Placeholder quality: transient, stretched during the drag — favor size. */
 const RESIZE_SNAPSHOT_JPEG_QUALITY = 70;
+const RENDERER_RECOVERY_DELAY_MS = 250;
+const RENDERER_RECOVERY_MAX_ATTEMPTS = 2;
 
 function truncate(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) : value;
 }
 
-/**
- * Isolated, persistent partition for the in-app browser. Cookies/storage never
- * touch the bb app session (`defaultSession`) or the user's real browser.
- */
-export const BB_BROWSER_PARTITION = "persist:bb-browser";
+function clampPopupDimension(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
 
-/**
- * `did-fail-load` reports aborted main-frame loads (a user navigating away, a
- * redirect) with this code; it is not a real error and must not surface one.
- */
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname === "[::1]" ||
+    /^127(?:\.\d{1,3}){3}$/.test(hostname)
+  );
+}
+
+function isAllowedPopupNavigationUrl(url: string): boolean {
+  if (url === "about:blank") {
+    return true;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return (
+    parsed.protocol === "https:" ||
+    (parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname))
+  );
+}
+
+function popupWindowTitle(url: string | null): string {
+  if (url === null || url === "about:blank" || url.length === 0) {
+    return "bb browser popup";
+  }
+  try {
+    return `bb browser — ${new URL(url).origin}`;
+  } catch {
+    return "bb browser popup";
+  }
+}
+
+type PopupCreateWindowOptions = BrowserWindowConstructorOptions & {
+  webContents?: WebContents;
+};
+
+function guardMainFrameNavigation(
+  webContents: WebContents,
+  isAllowedUrl: (url: string) => boolean,
+): void {
+  webContents.on("will-frame-navigate", (event) => {
+    if (event.isMainFrame && !isAllowedUrl(event.url)) {
+      event.preventDefault();
+    }
+  });
+  webContents.on("will-redirect", (event, url, _isInPlace, isMainFrame) => {
+    if (isMainFrame && !isAllowedUrl(url)) {
+      event.preventDefault();
+    }
+  });
+}
+
+const BB_BROWSER_PARTITION = "persist:bb-browser";
+
 const ERR_ABORTED = -3;
+
+export type DesktopBrowserTabProfile =
+  | { kind: "personal" }
+  | { kind: "automation"; id: string };
+
+export interface DesktopBrowserNativeTab extends BbDesktopBrowserState {
+  threadId: string;
+  generation: string;
+  profile: DesktopBrowserTabProfile;
+  presentation: "hidden" | "reveal";
+}
+
+interface NativeTabScope {
+  hostWebContentsId: number;
+  threadId: string | null;
+}
+
+interface NativeTabRef extends NativeTabScope {
+  threadId: string;
+  tabId: string;
+  generation: string;
+}
 
 interface BrowserViewEntry {
   view: WebContentsView;
+  hostWindow: DesktopBrowserHostWindow;
+  threadId: string;
+  generation: string;
+  profile: DesktopBrowserTabProfile;
+  partition: string;
   lastErrorText: string | null;
-  currentMainFrameLocalOriginKey: string | null;
-  /**
-   * The last renderer-measured panel rect. The renderer is the placement
-   * authority — it re-measures and pushes whenever its layout actually moves
-   * the panel. This cache exists only so native window resizes can re-clamp
-   * the view to the live window (see
-   * {@link DesktopBrowserViewManager.clampVisibleBoundsForWindow}) without
-   * losing the renderer's intent.
-   */
   desiredBounds: BbDesktopBrowserViewBounds;
   popupTimestamps: number[];
+  popupWindows: Set<BrowserWindow>;
+  rendererRecoveryAttempts: number;
+  rendererRecoveryState: "healthy" | "pending" | "blocked";
+  rendererRecoveryTimer: ReturnType<typeof setTimeout> | null;
+  suppressNextFocusNotification: boolean;
   visible: boolean;
+  activeFindRequestId: number | null;
 }
 
 export type DesktopBrowserHostWebContentsPayload =
+  | BbDesktopBrowserControlState
+  | BbDesktopBrowserRevealRequest
   | BbDesktopBrowserState
   | BbDesktopBrowserOpenTabRequest
   | BbDesktopBrowserScopedOpenTabRequest
-  | BbDesktopBrowserSnapshot;
+  | BbDesktopBrowserSnapshot
+  | BbDesktopBrowserTabRef
+  | BbDesktopBrowserFindResult;
 
 export interface DesktopBrowserHostContentBounds {
   height: number;
@@ -106,7 +211,7 @@ export interface DesktopBrowserHostWindow {
   webContents: DesktopBrowserHostWebContents;
 }
 
-export interface DispatchDesktopBrowserAppCommandArgs {
+interface DispatchDesktopBrowserAppCommandArgs {
   command: AppCommandId;
   hostWebContentsId: number;
 }
@@ -132,6 +237,8 @@ interface CreateEntryArgs {
   desiredBounds: BbDesktopBrowserViewBounds;
   hostWindow: DesktopBrowserHostWindow;
   tabId: string;
+  threadId: string;
+  profile: DesktopBrowserTabProfile;
 }
 
 interface HostWindowViewportBoundsArgs {
@@ -145,8 +252,32 @@ interface SetEntryDesiredBoundsArgs {
 }
 
 export interface DesktopBrowserViewManager {
+  createTab(args: {
+    hostWindow: DesktopBrowserHostWindow;
+    tabId: string;
+    threadId: string;
+    url: string;
+    profile: DesktopBrowserTabProfile;
+    viewport: BbDesktopBrowserViewportBounds;
+  }): DesktopBrowserNativeTab;
+  listTabs(args: NativeTabScope): DesktopBrowserNativeTab[];
+  closeTab(args: NativeTabRef): void;
+  captureTab(
+    args: NativeTabRef & {
+      maxWidth: number;
+      maxHeight: number;
+      quality: number;
+    },
+  ): Promise<{ data: Buffer; width: number; height: number }>;
+  getAutomationTabs(args: {
+    hostWebContentsId: number;
+    threadId: string;
+  }): Array<{ tabId: string; webContents: WebContents }>;
+  subscribeAutomationTabs(listener: () => void): () => void;
+  profileSession(profile: DesktopBrowserTabProfile): Session;
   attach(args: HostScopedRequestArgs<BbDesktopBrowserAttachRequest>): void;
   detach(args: HostScopedTabArgs): void;
+  focus(args: HostScopedTabArgs): void;
   navigate(args: HostScopedRequestArgs<BbDesktopBrowserNavigateRequest>): void;
   goBack(args: HostScopedTabArgs): void;
   goForward(args: HostScopedTabArgs): void;
@@ -158,35 +289,18 @@ export interface DesktopBrowserViewManager {
   setVisible(
     args: HostScopedRequestArgs<BbDesktopBrowserSetVisibleRequest>,
   ): void;
-  /**
-   * Hide every visible view owned by the window for the duration of a native
-   * resize burst. During an interactive window resize the host chrome
-   * repaints at its own (much slower) cadence while the native views
-   * composite independently — no bounds protocol keeps the two visually
-   * glued, so a tracked view bleeds over neighboring UI in one direction or
-   * the other. Each visible view is first captured and the bitmap pushed to
-   * the renderer, which paints it inside the panel as a stand-in that scales
-   * with the chrome; the view hides once its capture resolves (or after
-   * {@link RESIZE_SNAPSHOT_HIDE_CAP_MS}, whichever is first). Idempotent per
-   * window; renderer visibility changes made while hidden are recorded and
-   * take effect on {@link endWindowResize}.
-   */
+  setVisibleWithoutFocus(
+    args: HostScopedRequestArgs<BbDesktopBrowserSetVisibleRequest>,
+  ): void;
+  findInPage(
+    args: HostScopedRequestArgs<BbDesktopBrowserFindInPageRequest>,
+  ): void;
+  stopFindInPage(
+    args: HostScopedRequestArgs<BbDesktopBrowserStopFindInPageRequest>,
+  ): void;
   beginWindowResize(hostWindow: DesktopBrowserHostWindow): void;
-  /**
-   * End a resize burst: re-apply each view's renderer-desired bounds clamped
-   * to the live content bounds (bounds land before the view is shown),
-   * restore renderer-declared visibility, then push a null snapshot so the
-   * renderer drops its placeholder (after the reveal, so the swap never
-   * flashes an empty panel). The renderer's own post-resize re-measure
-   * typically lands within the caller's settle delay; if it arrives later the
-   * view nudges once, which is the acceptable residue.
-   */
   endWindowResize(hostWindow: DesktopBrowserHostWindow): void;
-  /**
-   * Drop every view owned by a closed host window. Keyed by the host
-   * `webContents.id` because the host `BrowserWindow` (and its child views) are
-   * already torn down by the time `closed` fires.
-   */
+  prepareWindowReload(hostWindow: DesktopBrowserHostWindow): void;
   releaseWindow(hostWebContentsId: number): void;
   destroyAll(): void;
 }
@@ -219,13 +333,6 @@ function hostWindowViewportBounds(
   };
 }
 
-/**
- * Apply the entry's renderer-desired rect, intersected with the live window
- * content bounds. The clamp happens HERE, against the same
- * `getContentBounds()` space native resize events re-clamp in — the renderer
- * already clamped the rect to its own layout viewport, which diverges from
- * the window content area when DevTools is docked.
- */
 function applyEntryDesiredBounds(
   entry: BrowserViewEntry,
   hostWindow: DesktopBrowserHostWindow,
@@ -243,39 +350,6 @@ function setEntryDesiredBounds(args: SetEntryDesiredBoundsArgs): void {
   applyEntryDesiredBounds(args.entry, args.hostWindow);
 }
 
-function clearEntryLocalOriginState(entry: BrowserViewEntry): void {
-  entry.currentMainFrameLocalOriginKey = null;
-}
-
-function commitEntryMainFrameUrl(entry: BrowserViewEntry, url: string): void {
-  const committedOriginKey = localRequestOriginKey(url);
-  if (committedOriginKey !== null) {
-    entry.currentMainFrameLocalOriginKey = committedOriginKey;
-    return;
-  }
-  clearEntryLocalOriginState(entry);
-}
-
-function shouldBlockEntryTopLevelRequest(
-  entry: BrowserViewEntry,
-  url: string,
-): boolean {
-  if (!isAllowedBrowserUrl(url)) {
-    return true;
-  }
-  const webContentsId = entry.view.webContents.id;
-  return shouldBlockBrowserRequest({
-    url,
-    method: "GET",
-    resourceType: "mainFrame",
-    isMainFrame: true,
-    targetWebContentsId: webContentsId,
-    entryWebContentsId: webContentsId,
-    currentMainFrameLocalOriginKey: entry.currentMainFrameLocalOriginKey,
-    requestingFrameOriginKey: null,
-  });
-}
-
 function buildBrowserState(
   tabId: string,
   entry: BrowserViewEntry,
@@ -284,8 +358,6 @@ function buildBrowserState(
   const url = webContents.getURL();
   const rawTitle = webContents.getTitle();
   const title = rawTitle.length > 0 && rawTitle !== url ? rawTitle : null;
-  // Truncate attacker-influenced strings to the contract caps so the push
-  // always validates and oversized values never reach the renderer/localStorage.
   return {
     tabId,
     url: truncate(url, BB_DESKTOP_BROWSER_MAX_URL_LENGTH),
@@ -303,13 +375,6 @@ function buildBrowserState(
   };
 }
 
-/**
- * The single browser-session permission we allow. `clipboard-sanitized-write`
- * is write-only: an in-page copy button calling `navigator.clipboard.writeText()`
- * can put sanitized text on the system clipboard, but the page can NOT read the
- * clipboard (`clipboard-read` stays denied). Every other device/capability
- * permission (camera, mic, geolocation, notifications, MIDI, …) stays denied.
- */
 export function isAllowedBrowserPermission(permission: string): boolean {
   return permission === "clipboard-sanitized-write";
 }
@@ -320,10 +385,16 @@ export function createDesktopBrowserViewManager(
   const partition = args.partition ?? BB_BROWSER_PARTITION;
   const entries = new Map<string, BrowserViewEntry>();
   const entriesByWebContentsId = new Map<number, BrowserViewEntry>();
-  // Host webContents ids with a native resize burst in flight: views of these
-  // windows stay hidden regardless of renderer-declared visibility.
+  const automationTabListeners = new Set<() => void>();
+  const popupWindows = new Set<BrowserWindow>();
   const resizingHostIds = new Set<number>();
-  let hardenedSession: Session | null = null;
+  const hardenedSessions = new Map<string, Session>();
+
+  function notifyAutomationTabs(): void {
+    for (const listener of automationTabListeners) {
+      listener();
+    }
+  }
 
   function isHostResizing(hostWindow: DesktopBrowserHostWindow): boolean {
     return resizingHostIds.has(hostWindow.webContents.id);
@@ -336,15 +407,62 @@ export function createDesktopBrowserViewManager(
     if (entry.view.webContents.isDestroyed()) {
       return;
     }
-    entry.view.setVisible(entry.visible && !isHostResizing(hostWindow));
+    entry.view.setVisible(
+      entry.visible &&
+        entry.rendererRecoveryState === "healthy" &&
+        !isHostResizing(hostWindow),
+    );
   }
 
-  /**
-   * Capture the (still visible) view, push the bitmap to the renderer as its
-   * resize placeholder, and only then hide the view. The capture result is
-   * dropped if the burst already ended — the live view is back by then and a
-   * late placeholder would linger under it into the next burst.
-   */
+  function clearEntryRendererRecoveryTimer(entry: BrowserViewEntry): void {
+    if (entry.rendererRecoveryTimer !== null) {
+      clearTimeout(entry.rendererRecoveryTimer);
+      entry.rendererRecoveryTimer = null;
+    }
+  }
+
+  function resetEntryRendererRecovery(entry: BrowserViewEntry): void {
+    clearEntryRendererRecoveryTimer(entry);
+    entry.rendererRecoveryAttempts = 0;
+    entry.rendererRecoveryState = "healthy";
+  }
+
+  function scheduleEntryRendererRecovery(
+    entry: BrowserViewEntry,
+    hostWindow: DesktopBrowserHostWindow,
+    tabId: string,
+  ): void {
+    if (
+      entry.rendererRecoveryState !== "pending" ||
+      !entry.visible ||
+      entry.rendererRecoveryTimer !== null
+    ) {
+      return;
+    }
+    if (entry.rendererRecoveryAttempts >= RENDERER_RECOVERY_MAX_ATTEMPTS) {
+      entry.rendererRecoveryState = "blocked";
+      entry.lastErrorText = "The page renderer stopped repeatedly";
+      pushState(hostWindow, tabId);
+      return;
+    }
+    entry.rendererRecoveryTimer = setTimeout(() => {
+      entry.rendererRecoveryTimer = null;
+      const webContents = entry.view.webContents;
+      if (
+        webContents.isDestroyed() ||
+        entry.rendererRecoveryState !== "pending" ||
+        !entry.visible
+      ) {
+        return;
+      }
+      entry.rendererRecoveryAttempts += 1;
+      entry.rendererRecoveryState = "healthy";
+      entry.lastErrorText = null;
+      webContents.reload();
+      applyEntryVisibility(entry, hostWindow);
+    }, RENDERER_RECOVERY_DELAY_MS);
+  }
+
   function startResizeSnapshot(
     hostWindow: DesktopBrowserHostWindow,
     tabId: string,
@@ -367,70 +485,35 @@ export function createDesktopBrowserViewManager(
           dataUrl,
         });
       })
-      .catch(() => {
-        // No placeholder; the renderer's bare panel background shows instead.
-      })
+      .catch(() => {})
       .finally(() => {
         clearTimeout(hideCap);
         applyEntryVisibility(entry, hostWindow);
       });
   }
 
-  function ensureHardenedSession(): Session {
-    if (hardenedSession !== null) {
-      return hardenedSession;
+  function partitionForProfile(profile: DesktopBrowserTabProfile): string {
+    return profile.kind === "personal"
+      ? partition
+      : `persist:bb-browser-automation-${createHash("sha256").update(profile.id).digest("hex")}`;
+  }
+
+  function ensureHardenedSession(tabPartition: string): Session {
+    const existing = hardenedSessions.get(tabPartition);
+    if (existing !== undefined) {
+      return existing;
     }
-    const browserSession = session.fromPartition(partition);
-    // Deny every device/capability permission by default in v1 (camera, mic,
-    // geolocation, notifications, MIDI, …). The single exception is
-    // `clipboard-sanitized-write`, allowed so in-page copy buttons (e.g.
-    // GitHub) that call `navigator.clipboard.writeText()` work; this is
-    // write-only, so `clipboard-read` stays denied. A prompt UI is a later
-    // phase.
+    const browserSession = session.fromPartition(tabPartition);
     browserSession.setPermissionRequestHandler((_wc, permission, callback) => {
       callback(isAllowedBrowserPermission(permission));
     });
     browserSession.setPermissionCheckHandler((_wc, permission) =>
       isAllowedBrowserPermission(permission),
     );
-    // Downloads are denied in v1 (lowest file-surface risk).
     browserSession.on("will-download", (event) => {
       event.preventDefault();
     });
-    // Network firewall: untrusted pages must not invisibly reach bb's loopback
-    // services or the user's LAN. Top-level http(s) navigation remains allowed;
-    // subresources, fetch/XHR, iframes, and WebSockets are guarded here.
-    browserSession.webRequest.onBeforeRequest((details, callback) => {
-      const targetWebContentsId = details.webContentsId ?? null;
-      const entry =
-        targetWebContentsId === null
-          ? null
-          : (entriesByWebContentsId.get(targetWebContentsId) ?? null);
-      const attributedEntry =
-        entry === null || entry.view.webContents.isDestroyed() ? null : entry;
-      const isMainFrameRequest = details.resourceType === "mainFrame";
-      callback({
-        cancel: shouldBlockBrowserRequest({
-          url: details.url,
-          method: details.method,
-          resourceType: details.resourceType,
-          isMainFrame: isMainFrameRequest,
-          targetWebContentsId,
-          entryWebContentsId: attributedEntry?.view.webContents.id ?? null,
-          currentMainFrameLocalOriginKey:
-            attributedEntry?.currentMainFrameLocalOriginKey ?? null,
-          requestingFrameOriginKey: resolveRequestingFrameLocalOriginKey({
-            origin: details.frame?.origin,
-            url: details.frame?.url,
-            // Electron blanks `frame.origin` for a document's initial
-            // subresources; fall back to the top frame's URL so a same-origin
-            // SPA dev server (Vite, etc.) is not blocked into a blank page.
-            isTopFrame: details.frame?.parent === null,
-          }),
-        }),
-      });
-    });
-    hardenedSession = browserSession;
+    hardenedSessions.set(tabPartition, browserSession);
     return browserSession;
   }
 
@@ -449,12 +532,95 @@ export function createDesktopBrowserViewManager(
     );
   }
 
+  function hardenedWebPreferences(tabPartition: string): WebPreferences {
+    return {
+      partition: tabPartition,
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+    };
+  }
+
+  function createPopupWindow(
+    options: PopupCreateWindowOptions,
+    url: string,
+    entry: BrowserViewEntry,
+  ): WebContents {
+    const popupOptions: PopupCreateWindowOptions = {
+      center: true,
+      frame: true,
+      height: clampPopupDimension(
+        options.height,
+        POPUP_DEFAULT_HEIGHT,
+        POPUP_MIN_HEIGHT,
+        POPUP_MAX_HEIGHT,
+      ),
+      show: true,
+      transparent: false,
+      webContents: options.webContents,
+      webPreferences: hardenedWebPreferences(entry.partition),
+      width: clampPopupDimension(
+        options.width,
+        POPUP_DEFAULT_WIDTH,
+        POPUP_MIN_WIDTH,
+        POPUP_MAX_WIDTH,
+      ),
+    };
+    const popupWindow = new BrowserWindow(popupOptions);
+    popupWindows.add(popupWindow);
+    entry.popupWindows.add(popupWindow);
+    popupWindow.once("closed", () => {
+      popupWindows.delete(popupWindow);
+      entry.popupWindows.delete(popupWindow);
+    });
+    const popupContents = popupWindow.webContents;
+    const updatePopupTitle = (currentUrl: string | null): void => {
+      if (!popupWindow.isDestroyed()) {
+        popupWindow.setTitle(popupWindowTitle(currentUrl));
+      }
+    };
+    updatePopupTitle(popupContents.getURL());
+    guardMainFrameNavigation(popupContents, isAllowedPopupNavigationUrl);
+    popupContents.on("did-navigate", (_event, currentUrl) => {
+      updatePopupTitle(currentUrl);
+    });
+    popupContents.on("page-title-updated", (event) => {
+      event.preventDefault();
+      updatePopupTitle(popupContents.getURL());
+    });
+    popupContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    if (options.webContents === undefined) {
+      void popupWindow.loadURL(url);
+    }
+    return popupContents;
+  }
+
   function wireWebContents(
     hostWindow: DesktopBrowserHostWindow,
     tabId: string,
     entry: BrowserViewEntry,
   ): void {
     const webContents = entry.view.webContents;
+
+    webContents.on("destroyed", () => {
+      const key = browserViewKey(hostWindow, tabId);
+      if (entries.get(key) === entry) {
+        destroyEntry(hostWindow, key);
+      }
+    });
+    webContents.on("did-navigate", notifyAutomationTabs);
+    webContents.on("did-navigate-in-page", notifyAutomationTabs);
+    webContents.on("page-title-updated", notifyAutomationTabs);
+
+    webContents.on("focus", () => {
+      if (entry.suppressNextFocusNotification) {
+        entry.suppressNextFocusNotification = false;
+        return;
+      }
+      send(hostWindow, BB_DESKTOP_BROWSER_FOCUSED_CHANNEL, { tabId });
+    });
 
     webContents.on("before-input-event", (event, input) => {
       if (input.type !== "keyDown" || input.isAutoRepeat || input.isComposing) {
@@ -469,10 +635,8 @@ export function createDesktopBrowserViewManager(
         shiftKey: input.shift,
       });
       if (command === null) return;
-      // Prevent both the untrusted page and Electron's application menu from
-      // also handling a chord that bb resolved as a browser command.
       event.preventDefault();
-      if (command === "browser.focusLocation") {
+      if (command === "browser.focusLocation" || command === "browser.find") {
         args.focusHostWebContents(hostWindow.webContents.id);
       }
       args.dispatchAppCommand({
@@ -481,56 +645,47 @@ export function createDesktopBrowserViewManager(
       });
     });
 
-    webContents.on("will-frame-navigate", (event) => {
-      if (!event.isMainFrame) {
-        return;
-      }
-      if (shouldBlockEntryTopLevelRequest(entry, event.url)) {
-        event.preventDefault();
-      }
-    });
-    webContents.on("will-navigate", (event, url) => {
-      if (shouldBlockEntryTopLevelRequest(entry, url)) {
-        event.preventDefault();
-      }
-    });
-    webContents.on("will-redirect", (event, url, _isInPlace, isMainFrame) => {
-      if (!isMainFrame) {
-        return;
-      }
-      if (shouldBlockEntryTopLevelRequest(entry, url)) {
-        event.preventDefault();
-      }
-    });
+    guardMainFrameNavigation(webContents, isAllowedBrowserUrl);
 
     webContents.setWindowOpenHandler((details) => {
-      const { openTabUrl } = resolveWindowOpenAction(details.url);
-      if (openTabUrl !== null) {
-        const decision = evaluatePopupRate({
-          timestamps: entry.popupTimestamps,
-          now: Date.now(),
-          windowMs: POPUP_RATE_WINDOW_MS,
-          maxInWindow: POPUP_RATE_MAX_IN_WINDOW,
-        });
-        entry.popupTimestamps = decision.timestamps;
-        if (decision.allowed) {
-          send(hostWindow, BB_DESKTOP_BROWSER_OPEN_TAB_CHANNEL, {
-            url: openTabUrl,
-          });
-          send(hostWindow, BB_DESKTOP_BROWSER_SCOPED_OPEN_TAB_CHANNEL, {
-            tabId,
-            url: openTabUrl,
-          });
-        }
+      const opensPopup = details.disposition === "new-window";
+      const allowedUrl = opensPopup
+        ? isAllowedPopupNavigationUrl(details.url)
+        : isAllowedBrowserUrl(details.url);
+      const popupCapReached =
+        opensPopup &&
+        (entry.popupWindows.size >= POPUP_MAX_OPEN_PER_TAB ||
+          popupWindows.size >= POPUP_MAX_OPEN_GLOBAL);
+      if (!allowedUrl || popupCapReached) {
+        return { action: "deny" };
       }
+      const decision = evaluatePopupRate({
+        timestamps: entry.popupTimestamps,
+        now: Date.now(),
+        windowMs: POPUP_RATE_WINDOW_MS,
+        maxInWindow: POPUP_RATE_MAX_IN_WINDOW,
+      });
+      entry.popupTimestamps = decision.timestamps;
+      if (!decision.allowed) {
+        return { action: "deny" };
+      }
+      if (opensPopup) {
+        return {
+          action: "allow",
+          createWindow: (options) =>
+            createPopupWindow(options, details.url, entry),
+        };
+      }
+      send(hostWindow, BB_DESKTOP_BROWSER_OPEN_TAB_CHANNEL, {
+        url: details.url,
+      });
+      send(hostWindow, BB_DESKTOP_BROWSER_SCOPED_OPEN_TAB_CHANNEL, {
+        tabId,
+        url: details.url,
+      });
       return { action: "deny" };
     });
 
-    // Right-click menu for the untrusted browser view. Built from this view's
-    // own webContents so the standard editing roles act on it (not the host
-    // React surface), giving Copy parity even when focus is elsewhere. Only
-    // plain editing roles are exposed — no dev tools, reload, or bb-bridge
-    // surface — keeping the untrusted-content posture.
     webContents.on("context-menu", (_event, params) => {
       if (webContents.isDestroyed()) {
         return;
@@ -558,18 +713,53 @@ export function createDesktopBrowserViewManager(
       menu.popup();
     });
 
+    webContents.on("found-in-page", (_event, result) => {
+      if (result.requestId !== entry.activeFindRequestId) {
+        return;
+      }
+      send(hostWindow, BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL, {
+        tabId,
+        requestId: result.requestId,
+        activeMatchOrdinal: result.activeMatchOrdinal,
+        matches: result.matches,
+        finalUpdate: result.finalUpdate,
+      });
+    });
+
+    webContents.on("render-process-gone", (_event, details) => {
+      if (webContents.isDestroyed() || webContents.getURL().length === 0) {
+        return;
+      }
+      clearEntryRendererRecoveryTimer(entry);
+      entry.rendererRecoveryState = "blocked";
+      if (
+        details.reason === "launch-failed" ||
+        details.reason === "integrity-failure"
+      ) {
+        entry.lastErrorText = "The page renderer could not start";
+        applyEntryVisibility(entry, hostWindow);
+        pushState(hostWindow, tabId);
+        return;
+      }
+      entry.rendererRecoveryState = "pending";
+      entry.lastErrorText = null;
+      applyEntryVisibility(entry, hostWindow);
+      scheduleEntryRendererRecovery(entry, hostWindow, tabId);
+    });
+
     const refresh = () => pushState(hostWindow, tabId);
+    webContents.on("did-finish-load", () => {
+      resetEntryRendererRecovery(entry);
+      applyEntryVisibility(entry, hostWindow);
+      refresh();
+    });
     webContents.on("did-start-loading", refresh);
     webContents.on("did-stop-loading", refresh);
-    webContents.on("did-navigate", (_event, url) => {
-      commitEntryMainFrameUrl(entry, url);
+    webContents.on("did-navigate", () => {
       entry.lastErrorText = null;
       refresh();
     });
-    webContents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
-      if (isMainFrame) {
-        commitEntryMainFrameUrl(entry, url);
-      }
+    webContents.on("did-navigate-in-page", () => {
       refresh();
     });
     webContents.on("did-start-navigation", () => {
@@ -577,9 +767,6 @@ export function createDesktopBrowserViewManager(
       refresh();
     });
     webContents.on("page-title-updated", refresh);
-    // Favicons are intentionally NOT forwarded: a remote, attacker-controlled
-    // favicon URL must never be rendered (or fetched) by the trusted bb app
-    // surface. The renderer shows a generic globe icon instead.
     webContents.on(
       "did-fail-load",
       (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
@@ -596,26 +783,31 @@ export function createDesktopBrowserViewManager(
   }
 
   function createEntry(args: CreateEntryArgs): BrowserViewEntry {
-    ensureHardenedSession();
+    const tabPartition = partitionForProfile(args.profile);
+    ensureHardenedSession(tabPartition);
     const view = new WebContentsView({
       webPreferences: {
-        partition,
-        sandbox: true,
-        contextIsolation: true,
-        nodeIntegration: false,
-        webSecurity: true,
-        allowRunningInsecureContent: false,
-        // Intentionally NO preload: browsed pages are untrusted and must never
-        // receive a bb bridge.
+        ...hardenedWebPreferences(tabPartition),
+        backgroundThrottling: args.profile.kind === "personal",
       },
     });
     const entry: BrowserViewEntry = {
       view,
+      hostWindow: args.hostWindow,
+      threadId: args.threadId,
+      generation: randomUUID(),
+      profile: { ...args.profile },
+      partition: tabPartition,
       lastErrorText: null,
-      currentMainFrameLocalOriginKey: null,
       desiredBounds: args.desiredBounds,
       popupTimestamps: [],
+      popupWindows: new Set(),
+      rendererRecoveryAttempts: 0,
+      rendererRecoveryState: "healthy",
+      rendererRecoveryTimer: null,
+      suppressNextFocusNotification: false,
       visible: false,
+      activeFindRequestId: null,
     };
     wireWebContents(args.hostWindow, args.tabId, entry);
     args.hostWindow.contentView.addChildView(view);
@@ -635,9 +827,7 @@ export function createDesktopBrowserViewManager(
       return;
     }
     entry.lastErrorText = null;
-    entry.view.webContents.loadURL(url).catch(() => {
-      // Usually surfaced through `did-fail-load`; swallow the rejection.
-    });
+    entry.view.webContents.loadURL(url).catch(() => {});
   }
 
   function destroyEntry(
@@ -650,13 +840,18 @@ export function createDesktopBrowserViewManager(
     }
     entries.delete(key);
     entriesByWebContentsId.delete(entry.view.webContents.id);
-    clearEntryLocalOriginState(entry);
+    clearEntryRendererRecoveryTimer(entry);
+    for (const popupWindow of [...entry.popupWindows]) {
+      if (!popupWindow.isDestroyed()) popupWindow.destroy();
+    }
+    entry.popupWindows.clear();
     if (!hostWindow.isDestroyed()) {
       hostWindow.contentView.removeChildView(entry.view);
     }
     if (!entry.view.webContents.isDestroyed()) {
       entry.view.webContents.close();
     }
+    notifyAutomationTabs();
   }
 
   function withEntry(
@@ -670,11 +865,189 @@ export function createDesktopBrowserViewManager(
     fn(entry);
   }
 
+  function requireNativeEntry(ref: NativeTabRef): BrowserViewEntry {
+    const entry = entries.get(`${ref.hostWebContentsId}:${ref.tabId}`);
+    if (
+      entry === undefined ||
+      entry.threadId !== ref.threadId ||
+      entry.generation !== ref.generation ||
+      entry.view.webContents.isDestroyed()
+    ) {
+      throw new Error("Native browser tab is unavailable or has been replaced");
+    }
+    return entry;
+  }
+
+  function nativeTab(
+    tabId: string,
+    entry: BrowserViewEntry,
+  ): DesktopBrowserNativeTab {
+    return {
+      ...buildBrowserState(tabId, entry),
+      threadId: entry.threadId,
+      generation: entry.generation,
+      profile: { ...entry.profile },
+      presentation: entry.visible ? "reveal" : "hidden",
+    };
+  }
+
+  function hasOtherVisibleEntry(
+    hostWindow: DesktopBrowserHostWindow,
+    tabId: string,
+  ): boolean {
+    const hostPrefix = `${hostWindow.webContents.id}:`;
+    const currentKey = browserViewKey(hostWindow, tabId);
+    for (const [key, entry] of entries) {
+      if (key !== currentKey && key.startsWith(hostPrefix) && entry.visible) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function focusEntryWithoutNotifying(entry: BrowserViewEntry): void {
+    entry.suppressNextFocusNotification = true;
+    entry.view.webContents.focus();
+    setTimeout(() => {
+      entry.suppressNextFocusNotification = false;
+    }, 0);
+  }
+
+  function setEntryVisibility(
+    {
+      hostWindow,
+      request,
+    }: HostScopedRequestArgs<BbDesktopBrowserSetVisibleRequest>,
+    focusOnShow: boolean,
+  ): void {
+    withEntry({ hostWindow, tabId: request.tabId }, (entry) => {
+      const wasVisible = entry.visible;
+      entry.visible = request.visible;
+      applyEntryVisibility(entry, hostWindow);
+      scheduleEntryRendererRecovery(entry, hostWindow, request.tabId);
+      if (
+        focusOnShow &&
+        request.visible &&
+        !wasVisible &&
+        !hasOtherVisibleEntry(hostWindow, request.tabId) &&
+        !entry.view.webContents.isDestroyed()
+      ) {
+        focusEntryWithoutNotifying(entry);
+      }
+    });
+  }
+
   return {
+    createTab(request) {
+      if (!isAllowedBrowserUrl(request.url))
+        throw new Error("Unsupported browser URL");
+      if (
+        request.hostWindow.isDestroyed() ||
+        request.hostWindow.webContents.isDestroyed()
+      ) {
+        throw new Error("Desktop window is unavailable");
+      }
+      const key = browserViewKey(request.hostWindow, request.tabId);
+      if (entries.has(key))
+        throw new Error("Native browser tab already exists");
+      const entry = createEntry({
+        ...request,
+        desiredBounds: { x: 0, y: 0, ...request.viewport },
+      });
+      applyEntryDesiredBounds(entry, request.hostWindow);
+      applyEntryVisibility(entry, request.hostWindow);
+      loadIfNeeded(entry, request.url);
+      notifyAutomationTabs();
+      pushState(request.hostWindow, request.tabId);
+      return nativeTab(request.tabId, entry);
+    },
+    listTabs({ hostWebContentsId, threadId }) {
+      const prefix = `${hostWebContentsId}:`;
+      const tabs: DesktopBrowserNativeTab[] = [];
+      for (const [key, entry] of entries) {
+        if (
+          key.startsWith(prefix) &&
+          (threadId === null || entry.threadId === threadId) &&
+          !entry.view.webContents.isDestroyed()
+        ) {
+          tabs.push(nativeTab(key.slice(prefix.length), entry));
+        }
+      }
+      return tabs;
+    },
+    closeTab(ref) {
+      const entry = requireNativeEntry(ref);
+      destroyEntry(
+        entry.hostWindow,
+        browserViewKey(entry.hostWindow, ref.tabId),
+      );
+    },
+    profileSession(profile) {
+      return ensureHardenedSession(partitionForProfile(profile));
+    },
+    async captureTab(request) {
+      const entry = requireNativeEntry(request);
+      if (
+        ![request.maxWidth, request.maxHeight].every(
+          (size) => Number.isInteger(size) && size > 0 && size <= 4096,
+        ) ||
+        !Number.isInteger(request.quality) ||
+        request.quality < 1 ||
+        request.quality > 100
+      ) {
+        throw new Error("Invalid browser capture dimensions or quality");
+      }
+      const image = await captureDesktopBrowserPage(entry.view.webContents);
+      requireNativeEntry(request);
+      if (image.isEmpty()) throw new Error("Native browser capture is empty");
+      const size = image.getSize();
+      const scale = Math.min(
+        1,
+        request.maxWidth / size.width,
+        request.maxHeight / size.height,
+      );
+      const resized =
+        scale < 1
+          ? image.resize({
+              width: Math.max(1, Math.round(size.width * scale)),
+              height: Math.max(1, Math.round(size.height * scale)),
+            })
+          : image;
+      const data = resized.toJPEG(request.quality);
+      if (data.byteLength > 8 * 1024 * 1024)
+        throw new Error("Native browser capture exceeds the size limit");
+      return { data, ...resized.getSize() };
+    },
+    getAutomationTabs({ hostWebContentsId, threadId }) {
+      const prefix = `${hostWebContentsId}:`;
+      const tabs: Array<{ tabId: string; webContents: WebContents }> = [];
+      for (const [key, entry] of entries) {
+        if (
+          key.startsWith(prefix) &&
+          entry.threadId === threadId &&
+          !entry.view.webContents.isDestroyed()
+        ) {
+          tabs.push({
+            tabId: key.slice(prefix.length),
+            webContents: entry.view.webContents,
+          });
+        }
+      }
+      return tabs;
+    },
+    subscribeAutomationTabs(listener) {
+      automationTabListeners.add(listener);
+      return () => {
+        automationTabListeners.delete(listener);
+      };
+    },
     attach({ hostWindow, request }) {
       const key = browserViewKey(hostWindow, request.tabId);
       const existing = entries.get(key) ?? null;
-      // A freshly-created entry starts hidden, so its prior visibility is false.
+      if (existing === null && request.existingOnly === true) return;
+      if (existing !== null && existing.threadId !== request.threadId) {
+        return;
+      }
       const wasVisible = existing?.visible ?? false;
       const entry =
         existing ??
@@ -682,34 +1055,44 @@ export function createDesktopBrowserViewManager(
           desiredBounds: request.bounds,
           hostWindow,
           tabId: request.tabId,
+          threadId: request.threadId,
+          profile: { kind: "personal" },
         });
       setEntryDesiredBounds({ bounds: request.bounds, entry, hostWindow });
       entry.visible = request.visible;
       applyEntryVisibility(entry, hostWindow);
-      // Focus on a real not-visible → visible transition so a freshly-mounted
-      // active tab (shown via attach, not setVisible) wires the Edit-menu
-      // copy/cut/paste roles and Cmd+C to this view's webContents.
       if (
         request.visible &&
         !wasVisible &&
+        !hasOtherVisibleEntry(hostWindow, request.tabId) &&
         !entry.view.webContents.isDestroyed()
       ) {
-        entry.view.webContents.focus();
+        focusEntryWithoutNotifying(entry);
       }
-      loadIfNeeded(entry, request.url);
+      if (existing === null) {
+        loadIfNeeded(entry, request.url);
+        notifyAutomationTabs();
+      }
       pushState(hostWindow, request.tabId);
     },
     detach({ hostWindow, tabId }) {
       destroyEntry(hostWindow, browserViewKey(hostWindow, tabId));
     },
+    focus({ hostWindow, tabId }) {
+      withEntry({ hostWindow, tabId }, focusEntryWithoutNotifying);
+    },
     navigate({ hostWindow, request }) {
       withEntry({ hostWindow, tabId: request.tabId }, (entry) => {
+        resetEntryRendererRecovery(entry);
+        applyEntryVisibility(entry, hostWindow);
         loadIfNeeded(entry, request.url);
       });
     },
     goBack({ hostWindow, tabId }) {
       withEntry({ hostWindow, tabId }, (entry) => {
         if (entry.view.webContents.navigationHistory.canGoBack()) {
+          resetEntryRendererRecovery(entry);
+          applyEntryVisibility(entry, hostWindow);
           entry.view.webContents.navigationHistory.goBack();
         }
       });
@@ -717,13 +1100,17 @@ export function createDesktopBrowserViewManager(
     goForward({ hostWindow, tabId }) {
       withEntry({ hostWindow, tabId }, (entry) => {
         if (entry.view.webContents.navigationHistory.canGoForward()) {
+          resetEntryRendererRecovery(entry);
+          applyEntryVisibility(entry, hostWindow);
           entry.view.webContents.navigationHistory.goForward();
         }
       });
     },
     reload({ hostWindow, tabId }) {
       withEntry({ hostWindow, tabId }, (entry) => {
+        resetEntryRendererRecovery(entry);
         entry.view.webContents.reload();
+        applyEntryVisibility(entry, hostWindow);
       });
     },
     stop({ hostWindow, tabId }) {
@@ -736,23 +1123,28 @@ export function createDesktopBrowserViewManager(
         setEntryDesiredBounds({ bounds: request.bounds, entry, hostWindow });
       });
     },
-    setVisible({ hostWindow, request }) {
+    findInPage({ hostWindow, request }) {
       withEntry({ hostWindow, tabId: request.tabId }, (entry) => {
-        const wasVisible = entry.visible;
-        entry.visible = request.visible;
-        applyEntryVisibility(entry, hostWindow);
-        // Focus the view only on a real not-visible → visible transition so the
-        // Edit-menu copy/cut/paste roles and Cmd+C target this view's
-        // webContents (the focused one). Skip redundant re-syncs so we never
-        // yank focus away from the React address bar mid-interaction.
-        if (
-          request.visible &&
-          !wasVisible &&
-          !entry.view.webContents.isDestroyed()
-        ) {
-          entry.view.webContents.focus();
-        }
+        entry.activeFindRequestId = entry.view.webContents.findInPage(
+          request.text,
+          {
+            forward: request.forward,
+            findNext: request.newSession,
+          },
+        );
       });
+    },
+    stopFindInPage({ hostWindow, request }) {
+      withEntry({ hostWindow, tabId: request.tabId }, (entry) => {
+        entry.activeFindRequestId = null;
+        entry.view.webContents.stopFindInPage(request.action);
+      });
+    },
+    setVisible({ hostWindow, request }) {
+      setEntryVisibility({ hostWindow, request }, true);
+    },
+    setVisibleWithoutFocus({ hostWindow, request }) {
+      setEntryVisibility({ hostWindow, request }, false);
     },
     beginWindowResize(hostWindow) {
       if (isHostResizing(hostWindow)) {
@@ -789,6 +1181,17 @@ export function createDesktopBrowserViewManager(
         });
       }
     },
+    prepareWindowReload(hostWindow) {
+      resizingHostIds.delete(hostWindow.webContents.id);
+      const prefix = `${hostWindow.webContents.id}:`;
+      for (const [key, entry] of entries.entries()) {
+        if (!key.startsWith(prefix) || entry.view.webContents.isDestroyed()) {
+          continue;
+        }
+        entry.visible = false;
+        applyEntryVisibility(entry, hostWindow);
+      }
+    },
     releaseWindow(hostWebContentsId) {
       resizingHostIds.delete(hostWebContentsId);
       const prefix = `${hostWebContentsId}:`;
@@ -798,21 +1201,35 @@ export function createDesktopBrowserViewManager(
         }
         entries.delete(key);
         entriesByWebContentsId.delete(entry.view.webContents.id);
-        clearEntryLocalOriginState(entry);
+        clearEntryRendererRecoveryTimer(entry);
+        for (const popupWindow of [...entry.popupWindows]) {
+          if (!popupWindow.isDestroyed()) {
+            popupWindow.destroy();
+          }
+        }
+        entry.popupWindows.clear();
         if (!entry.view.webContents.isDestroyed()) {
           entry.view.webContents.close();
         }
+        notifyAutomationTabs();
       }
     },
     destroyAll() {
       resizingHostIds.clear();
+      for (const popupWindow of [...popupWindows]) {
+        if (!popupWindow.isDestroyed()) {
+          popupWindow.destroy();
+        }
+      }
+      popupWindows.clear();
       for (const [key, entry] of [...entries.entries()]) {
         entries.delete(key);
         entriesByWebContentsId.delete(entry.view.webContents.id);
-        clearEntryLocalOriginState(entry);
+        clearEntryRendererRecoveryTimer(entry);
         if (!entry.view.webContents.isDestroyed()) {
           entry.view.webContents.close();
         }
+        notifyAutomationTabs();
       }
     },
   };

@@ -23,6 +23,7 @@ import {
   type HostDaemonToolCallResponse,
   type HostDaemonSkillTree,
 } from "@bb/host-daemon-contract";
+import { HOST_ARTIFACT_MAX_BYTES } from "@bb/host-daemon-contract/protocol";
 import type { PendingInteractionCreate, ToolCallRequest } from "@bb/domain";
 import type { HostDaemonLogger } from "./logger.js";
 import type { EventPostResult } from "./event-sink.js";
@@ -146,9 +147,6 @@ function toRetryControlError(error: ServerResponseError): Error {
   return error.retryable ? error : new AbortError(error);
 }
 
-// The client only ever calls fetchFn(url, init); it never uses fetch.preconnect.
-// Typing the dependency as fetch's call signature (not `typeof fetch`) keeps it
-// precise and lets plain function / vi.fn mocks satisfy it.
 export type FetchFn = (
   ...args: Parameters<typeof fetch>
 ) => ReturnType<typeof fetch>;
@@ -159,7 +157,6 @@ interface CreateServerClientOptions {
   logger: HostDaemonLogger;
   machineCredential?: string;
   getSessionId: () => string;
-  /** Runs before each POST attempt so retryable ordering preconditions can be repaired. */
   beforeInteractiveRequestRegistrationAttempt?: () => Promise<void>;
   fetchFn?: FetchFn;
 }
@@ -171,6 +168,7 @@ interface OpenSessionArgs {
   hostType: HostDaemonSessionOpenRequest["hostType"];
   dataDir: string;
   instanceId: string;
+  localApiPort: number | null;
   activeThreads: HostDaemonActiveThread[] | Promise<HostDaemonActiveThread[]>;
   loadedEnvironments:
     | HostDaemonLoadedEnvironment[]
@@ -183,6 +181,11 @@ export interface ServerClient {
     args: FetchProjectAttachmentArgs,
   ): Promise<FetchedProjectAttachment>;
   fetchSkillTree(treeHash: string): Promise<HostDaemonSkillTree>;
+  fetchPluginHostArtifact(args: {
+    pluginId: string;
+    digest: string;
+    expectedByteLength: number;
+  }): Promise<Uint8Array>;
   postEvents(events: HostDaemonEventEnvelope[]): Promise<EventPostResult>;
   callTool(request: ToolCallRequest): Promise<HostDaemonToolCallResponse>;
   registerInteractiveRequest(
@@ -292,6 +295,88 @@ async function readProjectAttachmentBytes(
   return bytes;
 }
 
+function validateHostArtifactPartialByteLength(
+  expectedByteLength: number,
+  byteLength: number,
+  maxBytes: number,
+): void {
+  if (byteLength > maxBytes) {
+    throw new Error(`Host artifact exceeds the ${maxBytes} byte limit`);
+  }
+  if (byteLength > expectedByteLength) {
+    throw new Error(
+      `Host artifact length mismatch: expected ${expectedByteLength}, received more than ${expectedByteLength}`,
+    );
+  }
+}
+
+function assertHostArtifactContentLength(
+  response: Response,
+  expectedByteLength: number,
+): void {
+  const contentLength = parseContentLength(
+    response.headers.get("content-length"),
+  );
+  if (contentLength === null) {
+    return;
+  }
+  if (contentLength > HOST_ARTIFACT_MAX_BYTES) {
+    throw new Error(
+      `Host artifact exceeds the ${HOST_ARTIFACT_MAX_BYTES} byte limit`,
+    );
+  }
+  if (contentLength !== expectedByteLength) {
+    throw new Error(
+      `Host artifact length mismatch: expected ${expectedByteLength}, received ${contentLength}`,
+    );
+  }
+}
+
+export async function readHostArtifactBytes(
+  response: Response,
+  expectedByteLength: number,
+  maxBytes = HOST_ARTIFACT_MAX_BYTES,
+): Promise<Uint8Array> {
+  if (!response.body) {
+    throw new Error(
+      `Host artifact length mismatch: expected ${expectedByteLength}, received 0`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      totalBytes += result.value.byteLength;
+      validateHostArtifactPartialByteLength(
+        expectedByteLength,
+        totalBytes,
+        maxBytes,
+      );
+      chunks.push(result.value);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  }
+
+  if (totalBytes !== expectedByteLength) {
+    throw new Error(
+      `Host artifact length mismatch: expected ${expectedByteLength}, received ${totalBytes}`,
+    );
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 export function createServerClient(
   options: CreateServerClientOptions,
 ): ServerClient {
@@ -363,6 +448,7 @@ export function createServerClient(
           options.machineCredential.trim().length > 0,
         platform: resolveHostPlatform(),
         dataDir: args.dataDir,
+        localApiPort: args.localApiPort,
         protocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
         activeThreads: await args.activeThreads,
         loadedEnvironments: await args.loadedEnvironments,
@@ -421,10 +507,6 @@ export function createServerClient(
     },
 
     async fetchSkillTree(treeHash: string): Promise<HostDaemonSkillTree> {
-      // Skill trees ride the same authenticated transport as the rest of the
-      // daemon protocol and are hash-verified after download. For a trusted-LAN
-      // setup, that declared network is the boundary even when it uses HTTP.
-      // Attachments and self-update intentionally retain stricter guards.
       const response = await fetchFn(
         buildInternalUrl(`/skills/tree/${encodeURIComponent(treeHash)}`),
         { method: "GET", headers: headers() },
@@ -433,6 +515,25 @@ export function createServerClient(
         throw await createResponseError("fetch skill tree", response);
       }
       return hostDaemonSkillTreeSchema.parse(await response.json());
+    },
+
+    async fetchPluginHostArtifact(args): Promise<Uint8Array> {
+      if (args.expectedByteLength > HOST_ARTIFACT_MAX_BYTES) {
+        throw new Error(
+          `Host artifact exceeds the ${HOST_ARTIFACT_MAX_BYTES} byte limit`,
+        );
+      }
+      const response = await fetchFn(
+        buildInternalUrl(
+          `/plugins/${encodeURIComponent(args.pluginId)}/host/${encodeURIComponent(args.digest)}`,
+        ),
+        { method: "GET", headers: headers() },
+      );
+      if (!response.ok) {
+        throw await createResponseError("fetch plugin host artifact", response);
+      }
+      assertHostArtifactContentLength(response, args.expectedByteLength);
+      return readHostArtifactBytes(response, args.expectedByteLength);
     },
 
     async postEvents(
@@ -456,7 +557,6 @@ export function createServerClient(
       const parsed = hostDaemonEventBatchResponseSchema.parse(json);
       return {
         acceptedEvents: parsed.acceptedEvents,
-        kind: "accepted",
         rejectedEvents: parsed.rejectedEvents,
       };
     },

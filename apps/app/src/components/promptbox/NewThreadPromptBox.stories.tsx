@@ -3,7 +3,6 @@ import type { PermissionMode, PromptTextMention } from "@bb/domain";
 import type { SystemExecutionOptionsModelLoadError } from "@bb/server-contract";
 import {
   NewThreadPromptBoxUI,
-  type NewThreadBranchConfig,
   type NewThreadEnvironmentConfig,
   type NewThreadModeConfig,
   type NewThreadProjectConfig,
@@ -17,20 +16,20 @@ import {
   AUTOMATION_PROMPT_ACTION,
   CREATE_PLUGIN_PROMPT_ACTION,
 } from "@/components/promptbox/PromptBoxActionsMenu";
-import { CodexCliVersionBanner } from "@/components/promptbox/banner/CodexCliVersionBanner";
+import { ProviderCliVersionBanner } from "@/components/promptbox/banner/ProviderCliVersionBanner";
 import type { PickerOption } from "@/components/pickers/OptionPicker";
 import { StoryCard, StoryRow } from "../../../.ladle/story-card";
 import { ModelPickerStoryQueryProvider } from "../../../.ladle/model-picker-query-provider";
 import {
   HOST_IDS,
   PROJECT_IDS,
-  STORY_BRANCH_OPTIONS,
   STORY_CLAUDE_CODE_MORE_MODELS,
   STORY_PROJECTS,
   STORY_PROJECT_SOURCES,
   STORY_WORKTREE_OPTIONS,
   makeAttachmentsConfig as makeAttachments,
   makeExecutionControlsProps,
+  useInteractiveExecutionControls,
   makeTypeaheadConfig as makeTypeahead,
   makeHost,
 } from "../../../.ladle/story-fixtures";
@@ -57,21 +56,6 @@ const baseEnvironment: NewThreadEnvironmentConfig = {
   sources: STORY_PROJECT_SOURCES,
   host: makeHost({ id: HOST_IDS.local }),
   isLocal: true,
-};
-
-const baseBranch: NewThreadBranchConfig = {
-  value: null,
-  currentBranch: "main",
-  isNew: false,
-  options: STORY_BRANCH_OPTIONS,
-  loading: false,
-  currentOptionLabel: "Current: main",
-  placeholder: "Current checkout",
-  triggerLabel: "Current (main)",
-  triggerTitle: "Current: main",
-  onChange: noop,
-  onClear: noop,
-  onCreate: noop,
 };
 
 const baseWorktree: NewThreadWorktreeConfig = {
@@ -140,14 +124,10 @@ function useControlledValue(initial: string) {
 
 const baseModeConfig: NewThreadModeConfig = {
   environment: baseEnvironment,
-  branch: baseBranch,
   worktree: baseWorktree,
   permission: basePermission,
 };
 
-// Match production: RootComposeView wraps the prompt area in PageShell which
-// caps content at 760px. Without this constraint the env-permission strip's
-// justify-between drifts the permission picker far to the right.
 interface PromptStageProps {
   children: React.ReactNode;
 }
@@ -158,6 +138,7 @@ function PromptStage({ children }: PromptStageProps) {
 
 function DefaultRow() {
   const { value, mentionRanges, onChange } = useControlledValue("");
+  const execution = useInteractiveExecutionControls(baseExecution);
   return (
     <PromptStage>
       <NewThreadPromptBoxUI
@@ -168,14 +149,13 @@ function DefaultRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled={false}
-        zenModeStorageKey="bb.story.new-thread.default"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
         promptActions={promptActions}
         modeConfig={baseModeConfig}
         project={baseProject}
-        execution={baseExecution}
+        execution={execution}
       />
     </PromptStage>
   );
@@ -195,7 +175,6 @@ function SubmittingRow() {
         onSubmit={noop}
         isSubmitting
         disabled
-        zenModeStorageKey="bb.story.new-thread.submitting"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -221,7 +200,6 @@ function LoadingModelsRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled
-        zenModeStorageKey="bb.story.new-thread.loading-models"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -256,7 +234,6 @@ function ModelLoadFailedRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled
-        zenModeStorageKey="bb.story.new-thread.model-load-failed"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -294,7 +271,6 @@ function UnsupportedCodexCliRow() {
         isSubmitting={false}
         disabled
         autoFocus={false}
-        zenModeStorageKey="bb.story.new-thread.unsupported-codex-cli"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -302,7 +278,8 @@ function UnsupportedCodexCliRow() {
         modeConfig={{
           ...baseModeConfig,
           banner: (
-            <CodexCliVersionBanner
+            <ProviderCliVersionBanner
+              displayName="Codex"
               currentVersion="0.135.0"
               minimumSupportedVersion="0.136.0"
               canUpdate
@@ -332,7 +309,6 @@ function MissingCodexCliRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled
-        zenModeStorageKey="bb.story.new-thread.missing-codex-cli"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -369,7 +345,6 @@ function GenericModelRequestFailedRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled
-        zenModeStorageKey="bb.story.new-thread.model-request-failed"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -412,7 +387,6 @@ function NoModelsAvailableRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled
-        zenModeStorageKey="bb.story.new-thread.no-models"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -447,7 +421,6 @@ function CustomModelAfterLoadErrorRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled={false}
-        zenModeStorageKey="bb.story.new-thread.custom-model-after-load-error"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -487,7 +460,6 @@ function ClaudeProviderRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled={false}
-        zenModeStorageKey="bb.story.new-thread.claude"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -528,7 +500,6 @@ function FullAccessRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled={false}
-        zenModeStorageKey="bb.story.new-thread.full-access"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -555,7 +526,6 @@ function ProjectlessThreadRow() {
         onSubmit={noop}
         isSubmitting={false}
         disabled={false}
-        zenModeStorageKey="bb.story.new-thread.projectless"
         history={baseHistory}
         typeahead={makeTypeahead()}
         attachments={makeAttachments()}
@@ -577,7 +547,7 @@ export function Overview() {
       <StoryCard>
         <StoryRow
           label="default"
-          hint="codex + workspace-write + local-direct env"
+          hint="interactive provider, model, reasoning, and fast mode"
         >
           <DefaultRow />
         </StoryRow>

@@ -65,32 +65,6 @@ export function listQueuedCommands(
     .map((queued) => hostDaemonRpcCommandSchema.parse(queued.command));
 }
 
-type ManagedWorktreeEnvironmentProvisionCommand = Extract<
-  HostDaemonCommand,
-  { type: "environment.provision"; workspaceProvisionType: "managed-worktree" }
->;
-
-export type ManagedWorktreeEnvironmentProvisionLiveCommand =
-  QueuedCommand<ManagedWorktreeEnvironmentProvisionCommand>;
-
-export function isManagedWorktreeEnvironmentProvisionLiveCommand(
-  queued: QueuedCommand,
-): queued is ManagedWorktreeEnvironmentProvisionLiveCommand {
-  return (
-    queued.command.type === "environment.provision" &&
-    queued.command.workspaceProvisionType === "managed-worktree"
-  );
-}
-
-export function requireManagedWorktreeEnvironmentProvisionLiveCommand(
-  queued: QueuedCommand,
-): ManagedWorktreeEnvironmentProvisionLiveCommand {
-  if (isManagedWorktreeEnvironmentProvisionLiveCommand(queued)) {
-    return queued;
-  }
-  throw new Error("Expected managed-worktree environment.provision command");
-}
-
 export function listQueuedThreadCommands(
   harness: TestAppHarness,
   type: HostDaemonCommand["type"],
@@ -129,9 +103,27 @@ const testRpcCursorByHost = new Map<string, number>();
 interface RegisterTestHostRpcCaptureArgs {
   hostId: string;
   sessionId: string;
+  queueBranchOptions?: boolean;
+  onEnvironmentHook?: (
+    command: Extract<HostDaemonRpcCommand, { type: "environment.hook.run" }>,
+  ) => Promise<void>;
+  onEnvironmentHookCancel?: (
+    operationId: string,
+  ) => Promise<void | { status: "unknown" | "terminated" }>;
+  gitBranchOptionsResult?: HostDaemonOnlineRpcResult<"host.list_branch_options">;
+  onListBranchOptions?: (
+    command: Extract<
+      HostDaemonRpcCommand,
+      { type: "host.list_branch_options" }
+    >,
+  ) => void;
+  gitSourceInspectionResult?: HostDaemonOnlineRpcResult<"host.inspect_git_source">;
+  onInspectGitSource?: (
+    command: Extract<HostDaemonRpcCommand, { type: "host.inspect_git_source" }>,
+  ) => void;
 }
 
-interface TestHostRpcSocket {
+export interface TestHostRpcSocket {
   close(code?: number, reason?: string): void;
   send(data: string): void;
 }
@@ -259,12 +251,9 @@ function respondToProviderModelListCommand(
   return true;
 }
 
-function buildDefaultBranchListResult(
-  selectedBranch: string | undefined,
-): HostDaemonOnlineRpcResult<"host.list_branches"> {
+function buildDefaultGitSourceInspectionResult(): HostDaemonOnlineRpcResult<"host.inspect_git_source"> {
   return {
-    branches: ["main"],
-    branchesTruncated: false,
+    isWorktree: false,
     checkout: {
       kind: "branch",
       branchName: "main",
@@ -275,6 +264,15 @@ function buildDefaultBranchListResult(
     hasUncommittedChanges: false,
     operation: { kind: "none" },
     originDefaultBranch: "origin/main",
+  };
+}
+
+function buildDefaultGitBranchOptionsResult(
+  selectedBranch: string | undefined,
+): HostDaemonOnlineRpcResult<"host.list_branch_options"> {
+  return {
+    branches: ["main"],
+    branchesTruncated: false,
     remoteBranches: ["origin/main"],
     remoteBranchesTruncated: false,
     selectedBranch: selectedBranch
@@ -286,7 +284,7 @@ function buildDefaultBranchListResult(
   };
 }
 
-export interface CreateTestDaemonEventEnvelopeArgs {
+interface CreateTestDaemonEventEnvelopeArgs {
   event: ThreadEvent;
   threadId?: string;
 }
@@ -335,10 +333,15 @@ function nextTestRpcCursor(
   return nextCursor;
 }
 
+/**
+ * Registers the capturing daemon socket for a host and returns it, so a test
+ * that reconnects a host can hand the same socket to the real
+ * `onDaemonSocketOpen` instead of replacing the capture with a stub.
+ */
 export function registerTestHostRpcCapture(
   deps: Pick<TestAppHarness, "db" | "hub">,
   args: RegisterTestHostRpcCaptureArgs,
-): void {
+): TestHostRpcSocket {
   testRpcCursorByHost.delete(args.hostId);
   for (let index = pendingHostRpcRequests.length - 1; index >= 0; index -= 1) {
     const queued = pendingHostRpcRequests[index];
@@ -354,20 +357,102 @@ export function registerTestHostRpcCapture(
         return;
       }
       const command = hostDaemonRpcCommandSchema.parse(message.command);
-      if (respondToRuntimeWorkspaceFileCommand(deps, args, message)) {
-        return;
-      }
-      if (respondToProviderModelListCommand(deps, args, message)) {
-        return;
-      }
-      if (command.type === "host.list_branches") {
+      if (
+        command.type === "plugin.host.dispose" ||
+        command.type === "plugin.host.cancel"
+      ) {
         deps.hub.recordHostOnlineRpcResponse({
           message: hostDaemonOnlineRpcResponseMessageSchema.parse({
             type: "host-rpc.response",
             requestId: message.requestId,
             commandType: command.type,
             ok: true,
-            result: buildDefaultBranchListResult(command.selectedBranch),
+            result:
+              command.type === "plugin.host.dispose"
+                ? { disposed: true }
+                : { cancelled: true },
+          }),
+          sessionId: args.sessionId,
+        });
+        return;
+      }
+      if (
+        command.type === "environment.hook.run" ||
+        command.type === "environment.hook.cancel"
+      ) {
+        void Promise.resolve()
+          .then(() =>
+            command.type === "environment.hook.run"
+              ? args.onEnvironmentHook?.(command)
+              : args.onEnvironmentHookCancel?.(command.operationId),
+          )
+          .then(
+            (result) =>
+              deps.hub.recordHostOnlineRpcResponse({
+                message: hostDaemonOnlineRpcResponseMessageSchema.parse({
+                  type: "host-rpc.response",
+                  requestId: message.requestId,
+                  commandType: command.type,
+                  ok: true,
+                  result:
+                    command.type === "environment.hook.cancel"
+                      ? (result ?? { status: "terminated" })
+                      : {},
+                }),
+                sessionId: args.sessionId,
+              }),
+            (error: unknown) =>
+              deps.hub.recordHostOnlineRpcResponse({
+                message: hostDaemonOnlineRpcResponseMessageSchema.parse({
+                  type: "host-rpc.response",
+                  requestId: message.requestId,
+                  commandType: command.type,
+                  ok: false,
+                  errorCode: "setup_script_failed",
+                  errorMessage:
+                    error instanceof Error ? error.message : String(error),
+                }),
+                sessionId: args.sessionId,
+              }),
+          );
+        return;
+      }
+      if (respondToRuntimeWorkspaceFileCommand(deps, args, message)) {
+        return;
+      }
+      if (respondToProviderModelListCommand(deps, args, message)) {
+        return;
+      }
+      if (
+        command.type === "host.list_branch_options" &&
+        !args.queueBranchOptions
+      ) {
+        args.onListBranchOptions?.(command);
+        deps.hub.recordHostOnlineRpcResponse({
+          message: hostDaemonOnlineRpcResponseMessageSchema.parse({
+            type: "host-rpc.response",
+            requestId: message.requestId,
+            commandType: command.type,
+            ok: true,
+            result:
+              args.gitBranchOptionsResult ??
+              buildDefaultGitBranchOptionsResult(command.selectedBranch),
+          }),
+          sessionId: args.sessionId,
+        });
+        return;
+      }
+      if (command.type === "host.inspect_git_source") {
+        args.onInspectGitSource?.(command);
+        deps.hub.recordHostOnlineRpcResponse({
+          message: hostDaemonOnlineRpcResponseMessageSchema.parse({
+            type: "host-rpc.response",
+            requestId: message.requestId,
+            commandType: command.type,
+            ok: true,
+            result:
+              args.gitSourceInspectionResult ??
+              buildDefaultGitSourceInspectionResult(),
           }),
           sessionId: args.sessionId,
         });
@@ -396,6 +481,7 @@ export function registerTestHostRpcCapture(
     },
   };
   deps.hub.registerDaemon(args.sessionId, args.hostId, socket);
+  return socket;
 }
 
 function removePendingHostRpcRequest(requestId: string): void {
@@ -437,7 +523,16 @@ export async function waitForQueuedCommand(
     await sleep(10);
   }
 
-  throw new Error("Timed out waiting for queued command");
+  const captured = pendingHostRpcRequests
+    .filter((queued) => isCapturedRpcForHarness(harness, queued))
+    .map((queued) =>
+      queued.command.type === "plugin.host.call"
+        ? `${queued.command.type}:${queued.command.pluginId}/${queued.command.method}`
+        : queued.command.type,
+    );
+  throw new Error(
+    `Timed out waiting for queued command; captured: ${captured.join(", ") || "none"}`,
+  );
 }
 
 export async function waitForQueuedCommandAfter(
@@ -486,6 +581,29 @@ export async function reportQueuedCommandSuccess<
   await sleep(0);
   void args;
   return new Response(null, { status: 200 });
+}
+
+export async function reportNextEnvironmentAttachSuccess(
+  harness: TestAppHarness,
+  threadId: string,
+): Promise<void> {
+  const queued = await waitForQueuedCommand(
+    harness,
+    ({ command }) =>
+      command.type === "environment.attach" &&
+      command.initiator?.threadId === threadId,
+  );
+  if (queued.command.type !== "environment.attach") {
+    throw new Error("Expected environment.attach command");
+  }
+  await reportQueuedCommandSuccess(harness, queued, {
+    path: queued.command.path,
+    isGitRepo: true,
+    isWorktree: false,
+    branchName: "main",
+    defaultBranch: "main",
+    transcript: [],
+  });
 }
 
 export async function reportQueuedCommandError(

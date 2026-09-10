@@ -3,6 +3,10 @@ import {
   makeWorkspaceStatus,
 } from "@bb/test-helpers";
 import type { WorkspaceResolutionFailure } from "@bb/host-daemon-contract";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
+import { gitBranchSelectionSchema } from "@bb/domain";
 import { describe, expect, it } from "vitest";
 import * as contract from "../src/index.js";
 import {
@@ -16,13 +20,14 @@ import {
   createPublicApiClient,
   createThreadRequestSchema,
   environmentActionRequestSchema,
-  baseBranchSpecSchema,
   gitBranchNameSchema,
   reorderPinnedThreadRequestSchema,
   reorderQueuedMessageRequestSchema,
   resolvePendingInteractionRequestSchema,
   sendQueuedMessageRequestSchema,
   sendMessageRequestSchema,
+  systemEnvironmentProviderSchema,
+  systemEnvironmentProvidersQuerySchema,
   terminalClientMessageSchema,
   terminalOutputChunkSchema,
   terminalOutputResponseSchema,
@@ -57,12 +62,18 @@ const OPTIONAL_SERVER_FIELD_GROUPS: readonly OptionalServerFieldGroup[] = [
   {
     reason:
       "Unmanaged workspaces may omit branch checkout intent when the daemon should leave HEAD untouched.",
-    fields: ["createThreadRequestSchema.environment.workspace.branch"],
+    fields: [
+      "createThreadRequestSchema.environment.workspace.branch",
+      "forkThreadRequestSchema.environment.workspace.branch",
+    ],
   },
   {
     reason:
       "Personal workspace requests may omit hostId so the server can use the default connected local host.",
-    fields: ["createThreadRequestSchema.environment.hostId"],
+    fields: [
+      "createThreadRequestSchema.environment.hostId",
+      "forkThreadRequestSchema.environment.hostId",
+    ],
   },
   {
     reason:
@@ -79,6 +90,7 @@ const OPTIONAL_SERVER_FIELD_GROUPS: readonly OptionalServerFieldGroup[] = [
       "Fork creation requires only a source thread; all other fields either select an optional behavior or receive an explicit server-boundary default.",
     fields: [
       "forkThreadRequestSchema.agentContextSeed",
+      "forkThreadRequestSchema.environment",
       "forkThreadRequestSchema.input",
       "forkThreadRequestSchema.originPluginId",
       "forkThreadRequestSchema.permissionMode",
@@ -200,21 +212,25 @@ const OPTIONAL_SERVER_FIELD_GROUPS: readonly OptionalServerFieldGroup[] = [
   },
   {
     reason:
-      "System provider lookups may target a host indirectly or directly and may omit provider id to use the host default.",
+      "System provider lookups may target a host indirectly or directly, omit provider id to use the host default, and omit capability to return the full roster.",
     fields: [
       "systemExecutionOptionsQuerySchema.environmentId",
       "systemExecutionOptionsQuerySchema.hostId",
       "systemExecutionOptionsQuerySchema.providerId",
+      "systemProvidersQuerySchema.capability",
       "systemProvidersQuerySchema.environmentId",
       "systemProvidersQuerySchema.hostId",
     ],
   },
   {
     reason:
-      "Thread event queries may omit pagination parameters to start from the beginning with the default page size.",
+      "Thread event queries may omit filters and pagination to read the default ascending page from the beginning.",
     fields: [
       "threadEventsQuerySchema.afterSeq",
+      "threadEventsQuerySchema.beforeSeq",
       "threadEventsQuerySchema.limit",
+      "threadEventsQuerySchema.order",
+      "threadEventsQuerySchema.types",
     ],
   },
   {
@@ -222,6 +238,7 @@ const OPTIONAL_SERVER_FIELD_GROUPS: readonly OptionalServerFieldGroup[] = [
       "Thread list queries may omit filters and pagination to include the corresponding unfiltered/default set.",
     fields: [
       "threadListQuerySchema.archived",
+      "threadListQuerySchema.environmentId",
       "threadListQuerySchema.sectionId",
       "threadListQuerySchema.limit",
       "threadListQuerySchema.hasParent",
@@ -264,6 +281,37 @@ const OPTIONAL_SERVER_FIELD_GROUPS: readonly OptionalServerFieldGroup[] = [
     reason:
       "Uploaded attachments may omit mime type when the client could not determine one.",
     fields: ["uploadedPromptAttachmentSchema.mimeType"],
+  },
+  {
+    reason:
+      "sendAt is present only when the caller is scheduling the dispatch; omission means attempt the dispatch now, which allocates no queued row at all when nothing blocks it.",
+    fields: [
+      "createThreadRequestSchema.sendAt",
+      "sendMessageRequestSchema.sendAt",
+    ],
+  },
+  {
+    reason:
+      "GET /threads/count filters are all genuinely absent by default: omitting one does not filter on it, and groups is present only when groupBy was asked for.",
+    fields: [
+      "threadCountQuerySchema.status",
+      "threadCountQuerySchema.hostId",
+      "threadCountQuerySchema.providerId",
+      "threadCountQuerySchema.projectId",
+      "threadCountQuerySchema.parentThreadId",
+      "threadCountQuerySchema.groupBy",
+      "threadCountQuerySchema.includeArchived",
+      "threadCountQuerySchema.includeHidden",
+      "threadCountResponseSchema.groups",
+    ],
+  },
+  {
+    reason:
+      "The cross-thread queue list is unfiltered by default: omitting threadId or waitHolder means every live queued row, which is what a workspace-wide pending view asks for.",
+    fields: [
+      "queuedMessageListQuerySchema.threadId",
+      "queuedMessageListQuerySchema.waitHolder",
+    ],
   },
 ];
 
@@ -423,13 +471,13 @@ describe("git branch name contract", () => {
 
   it("uses the shared validator for managed and unmanaged branch specs", () => {
     expect(
-      baseBranchSpecSchema.safeParse({
+      gitBranchSelectionSchema.safeParse({
         kind: "named",
         name: "release/1.2",
       }).success,
     ).toBe(true);
     expect(
-      baseBranchSpecSchema.safeParse({ kind: "named", name: "-release" })
+      gitBranchSelectionSchema.safeParse({ kind: "named", name: "-release" })
         .success,
     ).toBe(false);
     expect(
@@ -482,17 +530,13 @@ describe("git branch name contract", () => {
     expect(
       contract.projectBranchesQuerySchema.safeParse({
         hostId: "host_123",
-        selectedBranch: "upstream/main lock",
+        refresh: "blocking",
       }).success,
     ).toBe(false);
     expect(
-      contract.squashMergeOptionsSchema.safeParse({
-        mergeBaseBranch: "origin/main",
-      }).success,
-    ).toBe(true);
-    expect(
-      contract.squashMergeOptionsSchema.safeParse({
-        mergeBaseBranch: "origin/main lock",
+      contract.projectBranchesQuerySchema.safeParse({
+        hostId: "host_123",
+        selectedBranch: "upstream/main lock",
       }).success,
     ).toBe(false);
     expect(
@@ -749,6 +793,29 @@ describe("server-contract canonical schemas", () => {
     ).toThrow();
   });
 
+  it("fills a provider's path ownership once at the boundary", () => {
+    expect(
+      contract.providerReadyEnvironmentSchema.parse({
+        type: "host",
+        hostId: "host_1",
+        path: "/tmp/produced",
+      }),
+    ).toEqual({
+      type: "host",
+      hostId: "host_1",
+      path: "/tmp/produced",
+      ownsPath: true,
+    });
+    expect(
+      contract.providerReadyEnvironmentSchema.parse({
+        type: "host",
+        hostId: "host_1",
+        path: "/tmp/attached",
+        ownsPath: false,
+      }),
+    ).toMatchObject({ ownsPath: false });
+  });
+
   it("parses request contracts", () => {
     expect(
       createThreadRequestSchema.parse({
@@ -858,7 +925,11 @@ describe("server-contract canonical schemas", () => {
           environmentHostId: "host_123",
           environmentName: null,
           environmentBranchName: "bb/test",
+          environmentPath: null,
+          environmentProviderId: "git-worktree",
+          environmentIsWorktree: true,
           environmentWorkspaceDisplayKind: "managed-worktree",
+          queuedWork: "none",
         },
       ]),
     ).toMatchObject([
@@ -868,7 +939,11 @@ describe("server-contract canonical schemas", () => {
         environmentHostId: "host_123",
         environmentName: null,
         environmentBranchName: "bb/test",
+        environmentPath: null,
+        environmentProviderId: "git-worktree",
+        environmentIsWorktree: true,
         environmentWorkspaceDisplayKind: "managed-worktree",
+        queuedWork: "none",
       },
     ]);
 
@@ -956,6 +1031,13 @@ describe("server-contract canonical schemas", () => {
 
     expect(() =>
       environmentActionRequestSchema.parse({
+        action: "squash_merge",
+        options: { mergeBaseBranch: "main" },
+      }),
+    ).toThrow();
+
+    expect(() =>
+      environmentActionRequestSchema.parse({
         action: "pull_request_merge",
         options: { method: "admin" },
       }),
@@ -984,7 +1066,7 @@ describe("server-contract canonical schemas", () => {
         commitSha: "sha",
         commitSubject: "subject",
         merged: true,
-        message: "",
+        message: "Squash merge completed",
         ok: true,
       }),
     ).toThrow();
@@ -1224,7 +1306,6 @@ describe("server-contract canonical schemas", () => {
     });
     expect(parsed.input[0]).toMatchObject({ mentions: [pluginMention] });
 
-    // All plugin resource fields are required — a partial resource fails.
     expect(() =>
       sendMessageRequestSchema.parse({
         input: [
@@ -1399,21 +1480,18 @@ describe("server-contract canonical schemas", () => {
         workspace: { type: "unmanaged" as const, path: null },
       },
     };
-    // Missing senderThreadId.
     expect(() =>
       createThreadRequestSchema.parse({
         ...baseRequest,
         startedOnBehalfOf: { initiator: "agent" },
       }),
     ).toThrow();
-    // Empty senderThreadId.
     expect(() =>
       createThreadRequestSchema.parse({
         ...baseRequest,
         startedOnBehalfOf: { initiator: "agent", senderThreadId: "" },
       }),
     ).toThrow();
-    // "user" is not a valid started-on-behalf-of initiator.
     expect(() =>
       createThreadRequestSchema.parse({
         ...baseRequest,
@@ -1460,6 +1538,64 @@ describe("server-contract canonical schemas", () => {
 });
 
 describe("server-contract clients", () => {
+  it("keeps the api client off the route table's value import graph", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../src/api-client.ts", import.meta.url)),
+      "utf8",
+    );
+    const file = ts.createSourceFile(
+      "api-client.ts",
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const edges = file.statements.flatMap((statement) => {
+      if (
+        ts.isImportDeclaration(statement) &&
+        ts.isStringLiteral(statement.moduleSpecifier)
+      ) {
+        return [
+          {
+            specifier: statement.moduleSpecifier.text,
+            typeOnly:
+              statement.importClause?.phaseModifier ===
+              ts.SyntaxKind.TypeKeyword,
+          },
+        ];
+      }
+      if (
+        ts.isExportDeclaration(statement) &&
+        statement.moduleSpecifier !== undefined &&
+        ts.isStringLiteral(statement.moduleSpecifier)
+      ) {
+        return [
+          {
+            specifier: statement.moduleSpecifier.text,
+            typeOnly: statement.isTypeOnly,
+          },
+        ];
+      }
+      return [];
+    });
+
+    const valueSpecifiers = edges
+      .filter((edge) => !edge.typeOnly)
+      .map((edge) => edge.specifier);
+    expect(new Set(valueSpecifiers)).toEqual(new Set(["hono/client"]));
+    expect(
+      edges.filter((edge) => edge.specifier === "./public-api.js"),
+    ).toEqual([{ specifier: "./public-api.js", typeOnly: true }]);
+  });
+
+  it("declares the package side-effect free so the barrel's route-table edge is droppable", () => {
+    const manifest = readFileSync(
+      fileURLToPath(new URL("../package.json", import.meta.url)),
+      "utf8",
+    );
+    expect(JSON.parse(manifest)).toHaveProperty("sideEffects", false);
+  });
+
   it("builds canonical public routes", () => {
     const publicClient = createPublicApiClient("http://localhost:3334");
 
@@ -1529,6 +1665,11 @@ describe("server-contract clients", () => {
       }).pathname,
     ).toBe("/api/v1/threads/thr_123/thread-storage/files");
     expect(
+      publicClient.threads[":id"]["thread-storage"].location.$url({
+        param: { id: "thr_123" },
+      }).pathname,
+    ).toBe("/api/v1/threads/thr_123/thread-storage/location");
+    expect(
       publicClient.threads[":id"]["thread-storage"].paths.$url({
         param: { id: "thr_123" },
         query: {
@@ -1549,8 +1690,6 @@ describe("server-contract clients", () => {
         query: { path: "/Users/me/notes/plan.md" },
       }).pathname,
     ).toBe("/api/v1/threads/thr_123/host-files/content");
-    // Path-suffix file routes: `:filePath{.+}` spans slashes and the caller
-    // passes a pre-encoded value ($url substitutes params verbatim).
     expect(
       publicClient.threads[":id"]["thread-storage"].files[":filePath{.+}"].$url(
         {
@@ -1705,6 +1844,7 @@ describe("server-contract clients", () => {
       createQueuedMessageRequestSchema:
         contract.createQueuedMessageRequestSchema,
       createThreadRequestSchema: contract.createThreadRequestSchema,
+      queuedMessageListQuerySchema: contract.queuedMessageListQuerySchema,
       forkThreadRequestSchema: contract.forkThreadRequestSchema,
       environmentActionApiErrorSchema: contract.environmentActionApiErrorSchema,
       environmentStatusResponseSchema: contract.environmentStatusResponseSchema,
@@ -1718,11 +1858,12 @@ describe("server-contract clients", () => {
       sendQueuedMessageRequestSchema: contract.sendQueuedMessageRequestSchema,
       sendQueuedMessageResponseSchema: contract.sendQueuedMessageResponseSchema,
       sendMessageRequestSchema: contract.sendMessageRequestSchema,
-      squashMergeActionResponseSchema: contract.squashMergeActionResponseSchema,
       systemExecutionOptionsQuerySchema:
         contract.systemExecutionOptionsQuerySchema,
       systemProvidersQuerySchema: contract.systemProvidersQuerySchema,
       threadEventsQuerySchema: contract.threadEventsQuerySchema,
+      threadCountQuerySchema: contract.threadCountQuerySchema,
+      threadCountResponseSchema: contract.threadCountResponseSchema,
       threadListQuerySchema: contract.threadListQuerySchema,
       threadPendingInteractionsResponseSchema:
         contract.threadPendingInteractionsResponseSchema,
@@ -1760,5 +1901,64 @@ describe("server-contract clients", () => {
         (reason) => reason.trim().length > 0,
       ),
     ).toBe(true);
+  });
+});
+
+describe("environment provider contracts", () => {
+  it("lists provider requirements, input defaults, and availability", () => {
+    const base = {
+      id: "container",
+      displayName: "Container",
+      icon: null,
+      logoUrl: null,
+      pluginId: "sandbox",
+      acceptsEmptyInputs: false,
+      availability: {
+        status: "setup-required" as const,
+        message: "Add credentials",
+      },
+      requires: {
+        projectCheckout: false,
+        gitCheckout: false,
+        gitRemote: false,
+        projectless: false,
+      },
+    };
+    expect(
+      systemEnvironmentProviderSchema.parse({
+        ...base,
+        inputs: { type: "object", properties: { image: { type: "string" } } },
+      }).inputs,
+    ).toEqual({ type: "object", properties: { image: { type: "string" } } });
+    expect(
+      systemEnvironmentProviderSchema.parse({ ...base, inputs: null }).inputs,
+    ).toBeNull();
+    expect(
+      systemEnvironmentProviderSchema.safeParse({
+        ...base,
+        requires: { ...base.requires, gitBranch: true },
+        inputs: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      systemEnvironmentProviderSchema.safeParse({
+        ...base,
+        requires: { host: true, gitBranch: false, custom: false },
+        inputs: null,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires a project when provider availability names a machine", () => {
+    expect(
+      systemEnvironmentProvidersQuerySchema.safeParse({ hostId: "host_1" })
+        .success,
+    ).toBe(false);
+    expect(
+      systemEnvironmentProvidersQuerySchema.parse({
+        projectId: "proj_1",
+        hostId: "host_1",
+      }),
+    ).toEqual({ projectId: "proj_1", hostId: "host_1" });
   });
 });

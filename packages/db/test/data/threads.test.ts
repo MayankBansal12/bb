@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { isRawThreadId } from "@bb/domain";
 import { createConnection } from "../../src/connection.js";
-import { migrate } from "../../src/migrate.js";
 import { noopNotifier } from "../../src/notifier.js";
 import type { DbNotifier } from "../../src/notifier.js";
 import {
@@ -39,16 +38,13 @@ import {
   listThreadSections,
   renameThreadSection,
 } from "../../src/data/thread-sections.js";
-import {
-  createProject,
-  markProjectDeleted,
-} from "../../src/data/projects.js";
+import { createProject, markProjectDeleted } from "../../src/data/projects.js";
 import { upsertHost } from "../../src/data/hosts.js";
 import { createEnvironment } from "../../src/data/environments.js";
+import { createMigratedConnection } from "../helpers/migrated-connection.js";
 
 function setup() {
-  const db = createConnection(":memory:");
-  migrate(db);
+  const db = createMigratedConnection();
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
     type: "persistent",
@@ -211,7 +207,6 @@ describe("threads", () => {
         (thread) => thread.id,
       ),
     ).not.toContain(hidden.id);
-    // Fail closed: omitting includeHidden also excludes hidden threads.
     expect(
       listThreads(db, { projectId: project.id }).map((thread) => thread.id),
     ).not.toContain(hidden.id);
@@ -265,7 +260,6 @@ describe("threads", () => {
       providerId: "claude-code",
     });
 
-    // No override on a fresh thread.
     expect(getThreadExecutionOverride(db, thread.id)).toEqual({
       modelOverride: null,
       reasoningLevelOverride: null,
@@ -281,7 +275,6 @@ describe("threads", () => {
       reasoningLevelOverride: "high",
     });
 
-    // Presence-sensitive: an omitted field is left unchanged.
     setThreadExecutionOverride(db, {
       threadId: thread.id,
       reasoningLevelOverride: "max",
@@ -291,7 +284,6 @@ describe("threads", () => {
       reasoningLevelOverride: "max",
     });
 
-    // Explicit null clears.
     setThreadExecutionOverride(db, {
       threadId: thread.id,
       modelOverride: null,
@@ -412,8 +404,9 @@ describe("threads", () => {
     pinThread(db, noopNotifier, { threadId: third.id });
     pinThread(db, noopNotifier, { threadId: otherProjectThread.id });
 
-    expect(listActiveVisiblePinnedThreadRoots(db).map((thread) => thread.id))
-      .toEqual([otherProjectThread.id, third.id, second.id, first.id]);
+    expect(
+      listActiveVisiblePinnedThreadRoots(db).map((thread) => thread.id),
+    ).toEqual([otherProjectThread.id, third.id, second.id, first.id]);
 
     const result = reorderPinnedThread({
       db,
@@ -424,8 +417,9 @@ describe("threads", () => {
     });
 
     expect(result.kind).toBe("reordered");
-    expect(listActiveVisiblePinnedThreadRoots(db).map((thread) => thread.id))
-      .toEqual([first.id, otherProjectThread.id, third.id, second.id]);
+    expect(
+      listActiveVisiblePinnedThreadRoots(db).map((thread) => thread.id),
+    ).toEqual([first.id, otherProjectThread.id, third.id, second.id]);
   });
 
   it("rejects pinned reorder for unpinned threads, stale neighbors, and hidden child pins", () => {
@@ -521,7 +515,6 @@ describe("threads", () => {
       providerId: "codex",
       sectionId: playSection.id,
     });
-    // Active (non-archived) thread in the same section must be excluded.
     createThread(db, noopNotifier, {
       projectId: project.id,
       providerId: "codex",
@@ -662,11 +655,8 @@ describe("threads", () => {
       });
       created.push(thread);
     }
-    // Archive in a specific order so the most recently archived is "thr_4".
     for (const thread of created) {
       archiveThread(db, noopNotifier, thread.id);
-      // Sqlite Date.now() resolution can collapse archives within a tick;
-      // use a tiny delay to keep archivedAt strictly increasing.
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
 
@@ -777,30 +767,29 @@ describe("threads", () => {
     ).toBe(0);
   });
 
-  it("lists thread environment workspace display kind without per-thread lookups", () => {
+  it("lists each thread's environment identity without per-thread lookups", () => {
     const { db, host, project } = setup();
     const directEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
-      workspaceProvisionType: "unmanaged",
       isGitRepo: true,
-      isWorktree: false,
       branchName: "main",
     });
     const worktreeEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       name: "Review workspace",
-      workspaceProvisionType: "managed-worktree",
-      isWorktree: true,
       branchName: "bb/worktree",
-    });
-    const personalEnvironment = createEnvironment(db, noopNotifier, {
-      projectId: project.id,
-      hostId: host.id,
-      workspaceProvisionType: "personal",
-      isGitRepo: false,
-      isWorktree: false,
+      environmentProvider: {
+        environmentProviderId: "git-worktree",
+        instanceKey: null,
+        selection: {
+          machine: { type: "existing", hostId: host.id },
+          inputs: { branch: { kind: "default" } },
+        },
+      },
     });
     const directThread = createThread(db, noopNotifier, {
       projectId: project.id,
@@ -812,23 +801,6 @@ describe("threads", () => {
       environmentId: worktreeEnvironment.id,
       providerId: "codex",
     });
-    const personalThread = createThread(db, noopNotifier, {
-      projectId: project.id,
-      environmentId: personalEnvironment.id,
-      providerId: "codex",
-    });
-
-    const displayKindsByThreadId = new Map(
-      listThreadsWithPendingInteractionState(db, { projectId: project.id }).map(
-        (thread) => [thread.id, thread.environmentWorkspaceDisplayKind],
-      ),
-    );
-
-    expect(displayKindsByThreadId.get(directThread.id)).toBe("other");
-    expect(displayKindsByThreadId.get(worktreeThread.id)).toBe(
-      "managed-worktree",
-    );
-    expect(displayKindsByThreadId.get(personalThread.id)).toBe("other");
 
     const environmentIdentityByThreadId = new Map(
       listThreadsWithPendingInteractionState(db, { projectId: project.id }).map(
@@ -836,6 +808,7 @@ describe("threads", () => {
           thread.id,
           {
             environmentBranchName: thread.environmentBranchName,
+            environmentProviderId: thread.environmentProviderId,
             environmentHostId: thread.environmentHostId,
             environmentName: thread.environmentName,
           },
@@ -845,11 +818,13 @@ describe("threads", () => {
 
     expect(environmentIdentityByThreadId.get(directThread.id)).toEqual({
       environmentBranchName: "main",
+      environmentProviderId: null,
       environmentHostId: host.id,
       environmentName: null,
     });
     expect(environmentIdentityByThreadId.get(worktreeThread.id)).toEqual({
       environmentBranchName: "bb/worktree",
+      environmentProviderId: "git-worktree",
       environmentHostId: host.id,
       environmentName: "Review workspace",
     });
@@ -1103,9 +1078,9 @@ describe("threads", () => {
       notifySystem: vi.fn(),
     };
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
-      workspaceProvisionType: "managed-worktree",
       path: "/tmp/test-workspace",
       status: "ready",
     });
@@ -1275,7 +1250,7 @@ describe("threads", () => {
     });
 
     const stopping = requireThreadLifecycleEventApplied(
-      applyThreadLifecycleEvent(db, noopNotifier, {
+      applyThreadLifecycleEvent(db, {
         event: { type: "stop.requested" },
         threadId: thread.id,
       }),
@@ -1284,7 +1259,7 @@ describe("threads", () => {
     expect(getThread(db, thread.id)?.status).toBe("stopping");
 
     const settled = requireThreadLifecycleEventApplied(
-      applyThreadLifecycleEvent(db, noopNotifier, {
+      applyThreadLifecycleEvent(db, {
         event: { type: "stop.settled" },
         threadId: thread.id,
       }),
@@ -1296,10 +1271,10 @@ describe("threads", () => {
   it("counts only non-archived, non-deleted threads as live", () => {
     const { db, project, host } = setup();
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       path: "/tmp/thread-live-count",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const liveThread = createThread(db, noopNotifier, {
@@ -1337,22 +1312,21 @@ describe("threads", () => {
 
   it("lists canonical thread environments for a host", () => {
     const { db, project, host } = setup();
-    const otherHost = upsertHost(db, noopNotifier, {
+    const otherHost = upsertHost(db, noopNotifier, { type: "persistent",
       name: "other-host",
-      type: "persistent",
     });
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       path: "/tmp/thread-host-match",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const otherEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: otherHost.id,
       path: "/tmp/thread-host-other",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const matchingThread = createThread(db, noopNotifier, {
@@ -1381,22 +1355,21 @@ describe("threads", () => {
 
   it("lists host thread ids and detects pending shutdowns by environment", () => {
     const { db, project, host } = setup();
-    const otherHost = upsertHost(db, noopNotifier, {
+    const otherHost = upsertHost(db, noopNotifier, { type: "persistent",
       name: "other-host",
-      type: "persistent",
     });
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       path: "/tmp/thread-host-match",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const otherEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: otherHost.id,
       path: "/tmp/thread-host-other",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const activeThread = createThread(db, noopNotifier, {
@@ -1415,7 +1388,7 @@ describe("threads", () => {
       providerId: "codex",
     });
     requireThreadLifecycleEventApplied(
-      applyThreadLifecycleEvent(db, noopNotifier, {
+      applyThreadLifecycleEvent(db, {
         event: { type: "stop.requested" },
         threadId: stoppingThread.id,
       }),
@@ -1441,17 +1414,17 @@ describe("threads", () => {
   it("lists every host thread id including archived, deleted, and destroyed-environment threads", () => {
     const { db, project, host } = setup();
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       path: "/tmp/thread-storage-targets",
-      workspaceProvisionType: "unmanaged",
       status: "ready",
     });
     const destroyedEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
       path: "/tmp/destroyed-thread-storage-targets",
-      workspaceProvisionType: "managed-worktree",
       status: "destroyed",
     });
     const activeThread = createThread(db, noopNotifier, {
@@ -1505,7 +1478,7 @@ describe("thread lifecycle transitions and read state", () => {
 
       vi.setSystemTime(2_000);
       const idleThread = requireThreadLifecycleEventApplied(
-        applyThreadLifecycleEvent(db, noopNotifier, {
+        applyThreadLifecycleEvent(db, {
           event: { type: "run.succeeded" },
           threadId: activeThread.id,
         }),
@@ -1520,7 +1493,7 @@ describe("thread lifecycle transitions and read state", () => {
       });
       vi.setSystemTime(3_000);
       const activeAgainThread = requireThreadLifecycleEventApplied(
-        applyThreadLifecycleEvent(db, noopNotifier, {
+        applyThreadLifecycleEvent(db, {
           event: { type: "run.started" },
           threadId: activeThread.id,
         }),
@@ -1555,7 +1528,7 @@ describe("thread lifecycle transitions and read state", () => {
 
       vi.setSystemTime(2_000);
       const idleThread = requireThreadLifecycleEventApplied(
-        applyThreadLifecycleEvent(db, noopNotifier, {
+        applyThreadLifecycleEvent(db, {
           event: { type: "run.succeeded" },
           threadId: childThread.id,
         }),
@@ -1586,7 +1559,7 @@ describe("thread lifecycle transitions and read state", () => {
 
       vi.setSystemTime(2_000);
       const erroredThread = requireThreadLifecycleEventApplied(
-        applyThreadLifecycleEvent(db, noopNotifier, {
+        applyThreadLifecycleEvent(db, {
           event: { type: "run.failed" },
           threadId: stoppingThread.id,
         }),
@@ -1640,8 +1613,6 @@ describe("thread originKind", () => {
     );
   });
 
-  // A plugin sweeping its own spawned threads must not read another plugin's
-  // rows, so this narrowing belongs in the query.
   it("filters listings by originPluginId", () => {
     const { db, project } = setup();
     const parent = createThread(db, noopNotifier, {

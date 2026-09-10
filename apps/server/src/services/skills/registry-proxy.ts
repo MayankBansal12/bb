@@ -1,6 +1,7 @@
 import { ApiError } from "../../errors.js";
 import type {
   RegistryPagination,
+  RegistryRanking,
   RegistrySkill,
   RegistrySkillDetail,
   RegistrySkillFile,
@@ -12,7 +13,7 @@ import {
   isApiSkill,
   isRecord,
   parsePublicDetailSkill,
-  parsePublicHomepageSkills,
+  parsePublicDirectorySkills,
   parsePublicSkillMarkdown,
   parseRegistryDetailFiles,
   parseRegistrySkillId,
@@ -26,12 +27,6 @@ import {
 const MAX_SEARCH_RESULTS = 200;
 const GITHUB_SKILL_PATH_CACHE_TTL_MS = 30 * 60 * 1000;
 const GITHUB_REPOSITORY_STARS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-/**
- * Failures are cached too, on a short TTL. Unauthenticated api.github.com
- * allows 60 requests/hour/IP; without this, one exhausted budget makes every
- * subsequent browse re-issue the whole burst, which keeps the budget
- * exhausted. A short TTL still lets a transient failure recover quickly.
- */
 const GITHUB_REPOSITORY_STARS_FAILURE_TTL_MS = 5 * 60 * 1000;
 const REGISTRY_ENTRY_CACHE_TTL_MS = 30 * 60 * 1000;
 const REGISTRY_DETAIL_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -101,9 +96,6 @@ async function fetchAuthenticatedRegistryDetail(
 ): Promise<RegistrySkillDetail | null> {
   const token = process.env.VERCEL_OIDC_TOKEN;
   if (!token) return null;
-  // Guarded here rather than only at the route: this builds an authenticated
-  // URL, and `encodeURIComponent` leaves `..` intact for `new URL` to then
-  // normalize away — which would walk the bearer token to another path.
   if (hasUnsafePathSegment(source) || hasUnsafePathSegment(skillId)) {
     throw new ApiError(
       400,
@@ -345,20 +337,39 @@ export async function fetchRegistrySkillDetail(
   return detail;
 }
 
+async function fetchPublicDirectoryRecords(
+  directoryPath: string,
+): Promise<RegistrySkill[] | null> {
+  try {
+    const response = await registryFetch(`${SKILLS_BASE_URL}${directoryPath}`);
+    if (!response.ok) return null;
+    const skills = parsePublicDirectorySkills(await response.text());
+    return skills.length === 0 ? null : skills;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchPublicDirectorySkills(
   query: string,
   page: number,
   perPage: number,
+  ranking: RegistryRanking,
 ): Promise<RegistrySkillsPage> {
-  const response = await registryFetch(`${SKILLS_BASE_URL}/`);
-  if (!response.ok) {
+  const trending = ranking === "trending";
+  let servedRanking = ranking;
+  let skills = await fetchPublicDirectoryRecords(trending ? "/trending" : "/");
+  if (skills === null && trending) {
+    skills = await fetchPublicDirectoryRecords("/");
+    if (skills !== null) servedRanking = "all-time";
+  }
+  if (skills === null) {
     throw new ApiError(
       503,
       "skills_registry_unavailable",
       "skills.sh is unavailable",
     );
   }
-  const skills = parsePublicHomepageSkills(await response.text());
   const normalizedQuery = query.trim().toLowerCase();
   const filtered =
     normalizedQuery.length === 0
@@ -368,13 +379,14 @@ async function fetchPublicDirectorySkills(
             skill.name.toLowerCase().includes(normalizedQuery) ||
             skill.source.toLowerCase().includes(normalizedQuery),
         );
-  const ranked = [...filtered].sort(
-    (left, right) =>
-      right.installs - left.installs || left.name.localeCompare(right.name),
-  );
-  // The public directory includes package hosts that only its authenticated
-  // API can resolve. Exclude those records before deriving page boundaries;
-  // filtering them after slicing produced sparse middle pages and false totals.
+  const ranked =
+    normalizedQuery.length === 0
+      ? filtered
+      : [...filtered].sort(
+          (left, right) =>
+            right.installs - left.installs ||
+            left.name.localeCompare(right.name),
+        );
   const supported = ranked.filter(
     (skill) => githubRepoForSource(skill.source) !== null,
   );
@@ -387,6 +399,7 @@ async function fetchPublicDirectorySkills(
       total: supported.length,
       hasMore: start + perPage < supported.length,
     },
+    ranking: servedRanking,
   };
 }
 
@@ -396,6 +409,8 @@ export async function listRegistrySkills(
   perPage: number,
 ): Promise<RegistrySkillsPage> {
   const normalizedQuery = query.trim();
+  const ranking: RegistryRanking =
+    normalizedQuery.length > 0 ? "all-time" : "trending";
   const apiUrl = new URL(
     normalizedQuery.length > 0 ? "/api/v1/skills/search" : "/api/v1/skills",
     SKILLS_BASE_URL,
@@ -404,14 +419,14 @@ export async function listRegistrySkills(
     apiUrl.searchParams.set("q", normalizedQuery);
     apiUrl.searchParams.set("limit", String(MAX_SEARCH_RESULTS));
   } else {
-    apiUrl.searchParams.set("view", "all-time");
+    apiUrl.searchParams.set("view", ranking);
     apiUrl.searchParams.set("page", String(page));
     apiUrl.searchParams.set("per_page", String(perPage));
   }
   const apiPage = await fetchRegistryJson(apiUrl);
   const publicPage = apiPage
     ? null
-    : await fetchPublicDirectorySkills(normalizedQuery, page, perPage);
+    : await fetchPublicDirectorySkills(normalizedQuery, page, perPage, ranking);
   const mappedApiSkills =
     apiPage?.skills.map((skill) => ({
       id: skill.id,
@@ -447,7 +462,7 @@ export async function listRegistrySkills(
           ? start + perPage < fetchedTotal
           : (apiPage?.hasMore ?? false),
     } satisfies RegistryPagination);
-  return { skills, pagination };
+  return { skills, pagination, ranking: publicPage?.ranking ?? ranking };
 }
 
 export async function resolveRegistrySkillById(
@@ -489,11 +504,6 @@ export async function resolveRegistrySkillById(
     });
     return entry;
   })();
-  // Register the cleanup *after* the map write rather than in a `finally`
-  // inside the promise. Anything that throws synchronously before the first
-  // await — `encodeURIComponent` on a lone surrogate, say — would otherwise run
-  // the cleanup before the entry existed, stranding a rejected promise in the
-  // map forever under a raw query param. Ordering can no longer matter.
   registryEntryRequests.set(id, request);
   void request.finally(() => registryEntryRequests.delete(id)).catch(() => {});
   return request;

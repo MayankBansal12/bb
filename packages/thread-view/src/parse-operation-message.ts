@@ -1,9 +1,17 @@
 import type {
+  ApprovalInteractionLifecycle,
+  PendingInteractionPermissionGrantApprovalSubject,
   ThreadEvent,
   SystemThreadProvisioningStatus,
   SystemThreadInterruptedReason,
+  UserQuestionInteractionLifecycle,
 } from "@bb/domain";
-import { ownershipChangeOperationMetadataSchema } from "@bb/domain";
+import {
+  THREAD_CONTEXT_CLEAR_OPERATION,
+  isApprovalInteractionLifecycle,
+  isUserQuestionInteractionLifecycle,
+  ownershipChangeOperationMetadataSchema,
+} from "@bb/domain";
 import { assertNever } from "./assert-never.js";
 import { getCompactionKey } from "./compaction-lifecycle.js";
 import { OWNERSHIP_CHANGE_VERBS } from "./family-a-verbs.js";
@@ -31,45 +39,24 @@ import { getProviderModelFallbackData } from "./model-fallback-extraction.js";
 
 type ParseOperationMessageOptions = Pick<
   BuildEventProjectionMessagesOptions,
-  "includeProviderUnhandledOperations" | "providerDisplayName" | "threadName"
+  "includeDiagnosticOperations" | "providerDisplayName" | "threadName"
 >;
 
-/**
- * Prefix a thread name onto a bare action verb, e.g. ("Fix auth bug",
- * "assigned to parent") → "Fix auth bug assigned to parent". Falls back to
- * capitalizing the verb when the thread has no name so the title is never an
- * orphaned fragment.
- */
 function withThreadName(threadName: string, verb: string): string {
   const name = threadName.trim();
   return name.length > 0 ? `${name} ${verb}` : capitalize(verb);
 }
 
-type PermissionGrantLifecycleEvent = Extract<
+type InteractionLifecycleEvent = Extract<
   ThreadEvent,
-  { type: "system/permissionGrant/lifecycle" }
->;
-type UserQuestionLifecycleEvent = Extract<
-  ThreadEvent,
-  { type: "system/userQuestion/lifecycle" }
+  { type: "system/interaction/lifecycle" }
 >;
 
 function providerDisplayName(
   providerId: string,
   projectedDisplayName: string | undefined,
 ): string {
-  switch (providerId) {
-    case "claude-code":
-      return "Claude Code";
-    case "codex":
-      return "Codex";
-    case "pi":
-      return "Pi";
-    case "acp-cursor":
-      return "Cursor";
-    default:
-      return projectedDisplayName?.trim() || providerId;
-  }
+  return projectedDisplayName?.trim() || providerId;
 }
 
 function normalizeThreadOperationKind(
@@ -123,13 +110,18 @@ function createThreadOperationMetadata(
   };
 }
 
-function threadInterruptedTitle(reason: SystemThreadInterruptedReason): string {
+function threadInterruptedTitle(
+  reason: SystemThreadInterruptedReason,
+  cause?: "host-connection-lost",
+): string {
+  if (cause === "host-connection-lost") {
+    return "Stopped — connection to host was lost";
+  }
   switch (reason) {
     case "manual-stop":
       return "Stopped manually";
     case "host-daemon-restarted":
       return "Stopped — host daemon restarted";
-    // Legacy persisted watchdog interruption; no current producer.
     case "provider-turn-idle":
       return "Stopped — provider turn stopped responding";
     default:
@@ -137,10 +129,6 @@ function threadInterruptedTitle(reason: SystemThreadInterruptedReason): string {
   }
 }
 
-/**
- * Compose "{thread} {verb} {parent}", falling back to "{thread} {verb} parent"
- * when the parent thread name is null (deleted/renamed/untitled parent).
- */
 function ownershipTitleWithParent(
   threadName: string,
   verb: string,
@@ -192,7 +180,7 @@ function ownershipChangeOperationTitle(
   }
 }
 
-export function threadOperationTitle(
+function threadOperationTitle(
   meta: EventProjectionThreadOperationMetadata | null,
   threadName: string,
 ): string {
@@ -202,6 +190,12 @@ export function threadOperationTitle(
     case "ownership_change":
       return ownershipChangeOperationTitle(meta, threadName);
     case "other":
+      if (
+        meta.rawOperation === THREAD_CONTEXT_CLEAR_OPERATION &&
+        meta.status === "completed"
+      ) {
+        return "Context cleared";
+      }
       return `${capitalize(meta.rawOperation.replace(/_/g, " "))} ${
         meta.rawStatus
       }`;
@@ -210,7 +204,7 @@ export function threadOperationTitle(
   }
 }
 
-export function threadOperationStatus(
+function threadOperationStatus(
   meta: EventProjectionThreadOperationMetadata | null,
 ): EventProjectionOperationMessage["status"] {
   if (!meta) return undefined;
@@ -246,19 +240,19 @@ function provisioningOperationStatus(
 }
 
 function permissionGrantLifecycle(
-  decoded: PermissionGrantLifecycleEvent,
+  interaction: ApprovalInteractionLifecycle,
 ): EventProjectionPermissionGrantLifecycle {
-  switch (decoded.status) {
+  switch (interaction.status) {
     case "pending":
       return "pending";
     case "resolving":
       return "resolving";
     case "resolved":
-      return decoded.resolution?.decision === "deny" ? "denied" : "granted";
+      return interaction.resolution?.decision === "deny" ? "denied" : "granted";
     case "interrupted":
       return "interrupted";
     default:
-      return assertNever(decoded.status);
+      return assertNever(interaction.status);
   }
 }
 
@@ -280,9 +274,9 @@ function permissionGrantLifecycleStatus(
 }
 
 function permissionGrantScope(
-  decoded: PermissionGrantLifecycleEvent,
+  interaction: ApprovalInteractionLifecycle,
 ): EventProjectionPermissionGrantGrantScope | null {
-  const decision = decoded.resolution?.decision;
+  const decision = interaction.resolution?.decision;
   switch (decision) {
     case "allow_once":
       return "turn";
@@ -297,35 +291,37 @@ function permissionGrantScope(
 }
 
 function buildPermissionGrantLifecycleMessage(
-  decoded: PermissionGrantLifecycleEvent,
+  decoded: InteractionLifecycleEvent,
+  interaction: ApprovalInteractionLifecycle,
+  subject: PendingInteractionPermissionGrantApprovalSubject,
   meta: EventMeta,
 ): EventProjectionPermissionGrantLifecycleMessage {
-  const lifecycle = permissionGrantLifecycle(decoded);
+  const lifecycle = permissionGrantLifecycle(interaction);
   return {
     kind: "permission-grant-lifecycle",
-    id: messageId(decoded.threadId, "approval", decoded.interactionId),
+    id: messageId(decoded.threadId, "approval", interaction.id),
     threadId: decoded.threadId,
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
     startedAt: meta.createdAt,
     scope: decoded.scope,
-    interactionId: decoded.interactionId,
+    interactionId: interaction.id,
     lifecycle,
     status: permissionGrantLifecycleStatus(lifecycle),
     approvalTarget: {
-      itemId: decoded.subject.itemId,
-      toolName: decoded.subject.toolName,
+      itemId: subject.itemId,
+      toolName: subject.toolName,
     },
-    grantScope: permissionGrantScope(decoded),
-    statusReason: decoded.statusReason,
+    grantScope: permissionGrantScope(interaction),
+    statusReason: interaction.statusReason,
   };
 }
 
 function userQuestionLifecycle(
-  decoded: UserQuestionLifecycleEvent,
+  interaction: UserQuestionInteractionLifecycle,
 ): EventProjectionUserQuestionLifecycle {
-  switch (decoded.status) {
+  switch (interaction.status) {
     case "pending":
       return "pending";
     case "resolving":
@@ -335,7 +331,7 @@ function userQuestionLifecycle(
     case "interrupted":
       return "interrupted";
     default:
-      return assertNever(decoded.status);
+      return assertNever(interaction.status);
   }
 }
 
@@ -356,29 +352,49 @@ function userQuestionLifecycleStatus(
 }
 
 function buildUserQuestionLifecycleMessage(
-  decoded: UserQuestionLifecycleEvent,
+  decoded: InteractionLifecycleEvent,
+  interaction: UserQuestionInteractionLifecycle,
   meta: EventMeta,
 ): EventProjectionUserQuestionLifecycleMessage {
-  const lifecycle = userQuestionLifecycle(decoded);
+  const lifecycle = userQuestionLifecycle(interaction);
   return {
     kind: "user-question-lifecycle",
-    id: messageId(decoded.threadId, "question", decoded.interactionId),
+    id: messageId(decoded.threadId, "question", interaction.id),
     threadId: decoded.threadId,
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
     startedAt: meta.createdAt,
     scope: decoded.scope,
-    interactionId: decoded.interactionId,
+    interactionId: interaction.id,
     lifecycle,
     status: userQuestionLifecycleStatus(lifecycle),
-    questions: decoded.payload.questions,
-    answers: decoded.resolution?.answers ?? null,
-    statusReason: decoded.statusReason,
+    questions: interaction.payload.questions,
+    answers: interaction.resolution?.answers ?? null,
+    statusReason: interaction.statusReason,
   };
 }
 
-/** Build the common scaffolding shared by all operation messages. */
+function buildInteractionLifecycleMessage(
+  decoded: InteractionLifecycleEvent,
+  meta: EventMeta,
+):
+  | EventProjectionPermissionGrantLifecycleMessage
+  | EventProjectionUserQuestionLifecycleMessage
+  | null {
+  const { interaction } = decoded;
+  if (isUserQuestionInteractionLifecycle(interaction)) {
+    return buildUserQuestionLifecycleMessage(decoded, interaction, meta);
+  }
+  if (!isApprovalInteractionLifecycle(interaction)) {
+    return null;
+  }
+  const subject = interaction.payload.subject;
+  return subject.kind === "permission_grant"
+    ? buildPermissionGrantLifecycleMessage(decoded, interaction, subject, meta)
+    : null;
+}
+
 function op(
   decoded: ThreadEvent,
   meta: EventMeta,
@@ -445,7 +461,7 @@ export function parseOperationMessage(
   }
 
   if (decoded.type === "provider/unhandled") {
-    if (options?.includeProviderUnhandledOperations !== true) {
+    if (options?.includeDiagnosticOperations !== true) {
       return null;
     }
 
@@ -460,8 +476,29 @@ export function parseOperationMessage(
     });
   }
 
+  if (decoded.type === "provider.env-resolved") {
+    if (options?.includeDiagnosticOperations !== true) {
+      return null;
+    }
+
+    const detail = decoded.entries
+      .map((entry) => {
+        const source = entry.source === "shell" ? "shell" : entry.source.plugin;
+        const value = typeof entry.value === "string" ? entry.value : "••••••";
+        const reason = entry.reason ? ` — ${entry.reason}` : "";
+        return `${entry.name}=${value} (${source})${reason}`;
+      })
+      .join("\n");
+    return op(decoded, meta, "provider-environment", {
+      opType: "provider-environment",
+      title: "Provider environment resolved",
+      detail: detail || undefined,
+      status: "completed",
+    });
+  }
+
   if (decoded.type === "provider/warning") {
-    const category = decoded.category ?? "general";
+    const category = decoded.category;
     const isDeprecation = category === "deprecation";
     const isConfig = category === "config";
     const title = isDeprecation
@@ -487,13 +524,12 @@ export function parseOperationMessage(
   if (decoded.type === "system/thread/interrupted") {
     return op(decoded, meta, "thread-interrupted", {
       opType: "thread-interrupted",
-      title: threadInterruptedTitle(decoded.reason),
+      title: threadInterruptedTitle(decoded.reason, decoded.cause),
       status: "interrupted",
     });
   }
 
   if (decoded.type === "system/provider-turn-watchdog") {
-    // Legacy persisted watchdog diagnostic; no current producer.
     return op(decoded, meta, "provider-turn-watchdog", {
       opType: "operation",
       title: "Provider turn stopped responding",
@@ -516,7 +552,7 @@ export function parseOperationMessage(
       title: provisioningTitleForStatus(operationStatus),
       status: operationStatus,
       provisioning: {
-        environmentId,
+        ...(environmentId !== null ? { environmentId } : {}),
         provisioningId,
         ...(transcript ? { transcript } : {}),
       },
@@ -528,9 +564,6 @@ export function parseOperationMessage(
   }
 
   if (decoded.type === "system/operation") {
-    // Plugin interaction lifecycle events drive composer/realtime state, but
-    // their generic operation rows duplicate the plugin form and briefly
-    // linger as "Plugin interaction pending" after submission.
     if (
       decoded.operation === "plugin_interaction" ||
       decoded.operation === "edit_message"
@@ -562,12 +595,8 @@ export function parseOperationMessage(
     });
   }
 
-  if (decoded.type === "system/permissionGrant/lifecycle") {
-    return buildPermissionGrantLifecycleMessage(decoded, meta);
-  }
-
-  if (decoded.type === "system/userQuestion/lifecycle") {
-    return buildUserQuestionLifecycleMessage(decoded, meta);
+  if (decoded.type === "system/interaction/lifecycle") {
+    return buildInteractionLifecycleMessage(decoded, meta);
   }
 
   if (decoded.type === "thread/compacted") {

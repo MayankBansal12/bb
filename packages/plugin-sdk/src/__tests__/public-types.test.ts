@@ -7,11 +7,15 @@ type ExpectedBbPluginApiKey =
   | "background"
   | "cli"
   | "events"
+  | "experimental_aiServices"
+  | "experimental_environments"
+  | "experimental_hooks"
   | "hosts"
   | "http"
   | "log"
   | "onDispose"
   | "pluginId"
+  | "providers"
   | "realtime"
   | "rpc"
   | "sdk"
@@ -23,12 +27,18 @@ type ExpectedBbPluginApiKey =
 
 const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "BbPluginApi",
+  "MessageDispatchHookContext",
+  "MessageDispatchHookDecision",
   "PluginAgents",
+  "PluginAiServiceDeclaration",
+  "PluginAiServiceKind",
+  "PluginAiServices",
   "PluginAgentConfiguration",
   "PluginAgentConfigurationContext",
   "PluginAgentToolContentPart",
   "PluginAgentToolContext",
-  "PluginAgentToolExperimentalStatusLabels",
+  "PluginAgentToolLabels",
+  "PluginAgentToolPresentation",
   "PluginAgentToolRegistrationBase",
   "PluginAgentToolResult",
   "PluginAgentToolSelection",
@@ -40,7 +50,24 @@ const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "PluginCliOutputLimitError",
   "PluginCliRegistration",
   "PluginCliResult",
+  "PluginDispatchAttemptKind",
+  "PluginEnvironmentValidateDecision",
+  "PluginEnvironmentProviderDeclaration",
+  "PluginEnvironmentProviderRequirements",
+  "PluginEnvironments",
+  "PluginDispatchEnvironmentIntent",
+  "PluginDispatchExecution",
+  "PluginDispatchExecutionSources",
+  "PluginDispatchInput",
   "PluginEvents",
+  "ExperimentalPluginWebSocket",
+  "ExperimentalPluginWebSocketContext",
+  "ExperimentalPluginWebSocketHandler",
+  "ExperimentalPluginWebSocketHandlers",
+  "PluginHookHandler",
+  "PluginHookName",
+  "PluginHookSignatures",
+  "PluginHooks",
   "PluginHosts",
   "PluginHttp",
   "PluginHttpAuthMode",
@@ -54,6 +81,25 @@ const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "PluginMentionProviderRegistration",
   "PluginMentionSearchContext",
   "PluginMentionTrigger",
+  "PluginProviderCapabilities",
+  "PluginProviderComposerAction",
+  "PluginProviderDeclaration",
+  "ExperimentalPluginProviderEnvContext",
+  "ExperimentalPluginProviderEnvEntry",
+  "ExperimentalPluginProviderEnvHealth",
+  "ExperimentalPluginProviderEnvHealthContext",
+  "PluginProviderExtensionKindDeclaration",
+  "PluginProviderFallbackModel",
+  "PluginProviderMaintenance",
+  "PluginProviderModelCatalogScope",
+  "PluginProviderNativeRootEntry",
+  "PluginProviderNativeRoots",
+  "PluginProviderOptionDescriptor",
+  "PluginProviderOptionsContext",
+  "PluginProviderPermissionMode",
+  "PluginProviderReasoningLevel",
+  "PluginProviderStrings",
+  "PluginProviders",
   "PluginRealtime",
   "PluginRpc",
   "PluginServerApi",
@@ -69,6 +115,7 @@ const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "PluginThreadEventHandler",
   "PluginThreadEventName",
   "PluginThreadEventPayloads",
+  "PluginTurnFailedEvent",
   "PluginUi",
 ] as const;
 
@@ -94,6 +141,29 @@ const EXPECTED_RPC_ROOT_TYPE_EXPORTS = [
 ] as const;
 
 const EXPECTED_RPC_ROOT_VALUE_EXPORTS = ["defineRpcContract"] as const;
+
+const EXPECTED_HOST_ROOT_TYPE_EXPORTS = [
+  "ExperimentalHostCallOptions",
+  "ExperimentalHostClient",
+  "ExperimentalHostEntry",
+  "ExperimentalHostPaths",
+  "ExperimentalHostRpcContext",
+  "ExperimentalHostRpcHandlers",
+  "ExperimentalHostSignalContract",
+  "ExperimentalHostSignalEvent",
+  "ExperimentalHostSignals",
+  "ExperimentalHostWatchChange",
+  "ExperimentalHostWatchChangeType",
+  "ExperimentalHostWatchEvent",
+  "ExperimentalHostWatchListener",
+  "ExperimentalHostWatchOptions",
+  "ExperimentalHostWatchSubscription",
+  "ExperimentalHostWorkerLease",
+] as const;
+
+const EXPECTED_HOST_ROOT_VALUE_EXPORTS = [
+  "experimental_defineHostEntry",
+] as const;
 
 function namesFromMatches(source: string, pattern: RegExp): string[] {
   return Array.from(source.matchAll(pattern), (match) => match[1]).sort();
@@ -174,6 +244,37 @@ describe("backend plugin SDK public surface", () => {
       expect(rootTypeExports.has(exportName), exportName).toBe(true);
     }
     for (const exportName of EXPECTED_RPC_ROOT_VALUE_EXPORTS) {
+      expect(rootValueExports.has(exportName), exportName).toBe(true);
+    }
+  });
+
+  it("keeps every host contract export in the root declaration bundle", async () => {
+    const [hostContract, declarations] = await Promise.all([
+      readFile(new URL("../host-contract.ts", import.meta.url), "utf8"),
+      readFile(
+        new URL("../../bundled-types/bb-plugin-sdk.d.ts", import.meta.url),
+        "utf8",
+      ),
+    ]);
+    const declaredTypes = namesFromMatches(
+      hostContract,
+      /^export (?:interface|type) ([A-Za-z0-9_]+)/gmu,
+    );
+    const declaredValues = namesFromMatches(
+      hostContract,
+      /^export (?:class|const|function) ([A-Za-z0-9_]+)/gmu,
+    );
+    expect(declaredTypes).toEqual([...EXPECTED_HOST_ROOT_TYPE_EXPORTS].sort());
+    expect(declaredValues).toEqual(
+      [...EXPECTED_HOST_ROOT_VALUE_EXPORTS].sort(),
+    );
+
+    const rootTypeExports = rootExportNames(declarations, "type");
+    const rootValueExports = rootExportNames(declarations, "value");
+    for (const exportName of EXPECTED_HOST_ROOT_TYPE_EXPORTS) {
+      expect(rootTypeExports.has(exportName), exportName).toBe(true);
+    }
+    for (const exportName of EXPECTED_HOST_ROOT_VALUE_EXPORTS) {
       expect(rootValueExports.has(exportName), exportName).toBe(true);
     }
   });

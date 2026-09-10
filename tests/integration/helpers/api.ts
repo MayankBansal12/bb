@@ -32,7 +32,6 @@ import type {
   ThreadPendingInteractionsResponse,
   ThreadTimelineResponse,
   ThreadResponse,
-  UpdateEnvironmentRequest,
   UpdateThreadRequest,
   WorkspaceArgs,
 } from "@bb/server-contract";
@@ -49,6 +48,7 @@ import {
   threadPendingInteractionsResponseSchema,
   threadResponseSchema,
   threadTimelineResponseSchema,
+  THREAD_EVENT_LIST_PAGE_SIZE,
 } from "@bb/server-contract";
 
 export interface CreateHostThreadOptions {
@@ -62,6 +62,7 @@ export interface CreateHostThreadOptions {
   title?: string;
   workspace:
     | { type: "managed-worktree" }
+    | { type: "personal" }
     | { path: string | null; type: "unmanaged" };
 }
 
@@ -132,7 +133,7 @@ function defaultModelForProvider(providerId: string): string {
 function toWorkspaceArgs(
   workspace: CreateHostThreadOptions["workspace"],
 ): WorkspaceArgs {
-  if (workspace.type === "unmanaged") {
+  if (workspace.type === "unmanaged" || workspace.type === "personal") {
     return workspace;
   }
   return { ...workspace, baseBranch: { kind: "default" } };
@@ -320,8 +321,6 @@ export async function getEnvironmentDiffPatch(
   environmentId: string,
   paths: string[],
 ): Promise<EnvironmentDiffPatchResponse> {
-  // The patch route takes the domain diff target in its body (POST), unlike
-  // the flat `target` query string the GET diff routes use.
   const response = await api.environments[":id"].diff.patch.$post({
     param: { id: environmentId },
     json: { target: { type: "uncommitted" }, paths },
@@ -394,12 +393,26 @@ export async function getThreadEvents(
   api: PublicApiClient,
   threadId: string,
 ): Promise<ThreadEventRow[]> {
-  const response = await api.threads[":id"].events.$get({
-    param: { id: threadId },
-    query: { limit: "10000" },
-  });
-  await expectStatus(response, 200, `get thread events ${threadId}`);
-  return threadEventRowSchema.array().parse(await response.json());
+  const rows: ThreadEventRow[] = [];
+  let afterSeq: string | undefined;
+  for (;;) {
+    const response = await api.threads[":id"].events.$get({
+      param: { id: threadId },
+      query: {
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        limit: String(THREAD_EVENT_LIST_PAGE_SIZE),
+        order: "asc",
+      },
+    });
+    await expectStatus(response, 200, `get thread events ${threadId}`);
+    const page = threadEventRowSchema.array().parse(await response.json());
+    rows.push(...page);
+    const last = page.at(-1);
+    if (last === undefined || page.length < THREAD_EVENT_LIST_PAGE_SIZE) {
+      return rows;
+    }
+    afterSeq = String(last.seq);
+  }
 }
 
 export async function getThreadOutput(
@@ -506,19 +519,6 @@ export async function unarchiveThread(
     param: { id: threadId },
   });
   await expectStatus(response, 200, `unarchive thread ${threadId}`);
-}
-
-export async function updateEnvironment(
-  api: PublicApiClient,
-  environmentId: string,
-  request: UpdateEnvironmentRequest,
-): Promise<Environment> {
-  const response = await api.environments[":id"].$patch({
-    param: { id: environmentId },
-    json: request,
-  });
-  await expectStatus(response, 200, `update environment ${environmentId}`);
-  return environmentSchema.parse(await response.json());
 }
 
 export async function updateThread(

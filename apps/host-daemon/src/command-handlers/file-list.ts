@@ -6,48 +6,59 @@ import type {
   HostPathEntryKind,
 } from "@bb/host-daemon-contract";
 
-export interface FinalizeListedFilesArgs {
+interface FinalizeListedFilesArgs {
   filePaths: string[];
   limit: number;
   query?: string;
 }
 
-export interface FinalizedFileList {
+interface FinalizedFileList {
   files: FileListEntry[];
   truncated: boolean;
 }
 
-export interface FileListEntry {
+interface FileListEntry {
   path: string;
   name: string;
 }
 
-export interface ListedPath {
+interface ListedPath {
   kind: HostPathEntryKind;
   path: string;
   name: string;
 }
 
-export interface PathListInclusion {
+interface PathListInclusion {
   includeFiles: boolean;
   includeDirectories: boolean;
 }
 
-export interface FinalizeListedPathsArgs extends PathListInclusion {
+interface FinalizeListedPathsArgs extends PathListInclusion {
   paths: ListedPath[];
   limit: number;
   query?: string;
 }
 
-export interface FinalizedPathList {
+interface FinalizedPathList {
   paths: HostPathEntry[];
   truncated: boolean;
 }
 
-export interface ListPathsRecursivelyArgs extends PathListInclusion {
+interface ListPathsRecursivelyArgs extends PathListInclusion {
   dir: string;
   root: string;
+  includeHidden: boolean;
+  excludeNames: ReadonlySet<string>;
 }
+
+interface ListFilesRecursivelyArgs {
+  dir: string;
+  root: string;
+  includeHidden: boolean;
+  excludeNames: ReadonlySet<string>;
+}
+
+const ALWAYS_EXCLUDED_NAMES: ReadonlySet<string> = new Set([".git"]);
 
 function shouldIncludePath(
   pathKind: HostPathEntryKind,
@@ -140,8 +151,9 @@ export async function listPathsRecursively(
   const entries = await fs.readdir(args.dir, { withFileTypes: true });
   const results: ListedPath[] = [];
   for (const entry of entries) {
-    if (entry.name.startsWith(".")) continue;
-    if (entry.name === "node_modules") continue;
+    if (ALWAYS_EXCLUDED_NAMES.has(entry.name)) continue;
+    if (args.excludeNames.has(entry.name)) continue;
+    if (!args.includeHidden && entry.name.startsWith(".")) continue;
     if (entry.isSymbolicLink()) continue;
 
     const fullPath = path.join(args.dir, entry.name);
@@ -156,12 +168,11 @@ export async function listPathsRecursively(
           name: entry.name,
         });
       }
-      results.push(
-        ...(await listPathsRecursively({
-          ...args,
-          dir: fullPath,
-        })),
-      );
+      const childResults = await listPathsRecursively({
+        ...args,
+        dir: fullPath,
+      });
+      for (const childResult of childResults) results.push(childResult);
       continue;
     }
 
@@ -177,12 +188,10 @@ export async function listPathsRecursively(
 }
 
 export async function listFilesRecursively(
-  dir: string,
-  root: string,
+  args: ListFilesRecursivelyArgs,
 ): Promise<string[]> {
   const paths = await listPathsRecursively({
-    dir,
-    root,
+    ...args,
     includeFiles: true,
     includeDirectories: false,
   });

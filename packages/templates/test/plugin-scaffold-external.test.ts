@@ -14,7 +14,16 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
+import { PLUGIN_SDK_VERSION } from "@bb/domain";
 import { scaffoldPlugin } from "../src/plugin-scaffold.js";
 
 const execFileAsync = promisify(execFile);
@@ -47,23 +56,31 @@ const EXTERNAL_DEPENDENCIES = [
 
 const BACKEND_TEST = `
 import { describe, expect, it } from "vitest";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
 
 describe("scaffold backend", () => {
   it("loads, inspects, and atomically reloads through the packed harness", async () => {
     const host = createFakePluginHost({ pluginId: "external-backend" });
     await plugin(host.bb);
-    await expect(host.harness.behavior.callRpc("greeting")).resolves.toEqual({
-      greeting: "hello",
-      loadCount: 1,
+    await expect(host.harness.behavior.callRpc("todos_list")).resolves.toEqual({
+      todos: [],
     });
-    expect(host.harness.inspection.registrations.rpcMethods).toEqual(["greeting"]);
+    const added = await host.harness.behavior.callRpc("todos_add", {
+      title: "Ship it",
+    });
+    expect(added).toMatchObject({ title: "Ship it", done: false });
+    expect(host.harness.inspection.registrations.rpcMethods).toEqual([
+      "todos_list",
+      "todos_add",
+      "todos_set_done",
+      "todos_remove",
+    ]);
 
+    // The todo store lives in bb.storage.kv, so it survives a reload.
     const next = await host.harness.lifecycle.reload(plugin);
-    await expect(next.harness.behavior.callRpc("greeting")).resolves.toEqual({
-      greeting: "hello",
-      loadCount: 2,
+    await expect(next.harness.behavior.callRpc("todos_list")).resolves.toEqual({
+      todos: [added],
     });
     await next.harness.lifecycle.dispose();
   });
@@ -74,23 +91,46 @@ const FRONTEND_TEST = `
 // @vitest-environment jsdom
 import { fireEvent } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
 describe("scaffold frontend", () => {
-  it("loads and renders a slot through the packed harness", async () => {
+  it("loads and renders the Example todos page through the packed harness", async () => {
     const app = await loadPluginApp(() => import("./app"));
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    let todos = [{ id: "a1", title: "Ship it", done: false, createdAt }];
     const slot = renderSlot(
-      app.homepageSections[0]!,
-      { projectId: "proj_external" },
+      app.navPanels[0]!,
+      { subPath: "" },
       {
         context: { projectId: "proj_external", threadId: null },
-        rpc: { greeting: () => ({ greeting: "external", loadCount: 3 }) },
+        rpc: {
+          todos_list: () => ({ todos }),
+          todos_add: (input: unknown) => {
+            const { title } = input as { title: string };
+            const todo = { id: "b2", title, done: false, createdAt };
+            todos = [...todos, todo];
+            return todo;
+          },
+        },
       },
     );
+    await slot.findByText("Ship it");
 
-    fireEvent.click(slot.getByText("Say hello"));
-    await slot.findByText("external (#3)");
-    expect(slot.inspection.rpcCalls).toEqual([{ method: "greeting", input: null }]);
+    fireEvent.change(slot.getByLabelText("New todo"), {
+      target: { value: "Write docs" },
+    });
+    fireEvent.click(slot.getByText("Add"));
+    await slot.findByText("Write docs");
+    expect(slot.inspection.rpcCalls.map((call) => call.method)).toEqual([
+      "todos_list",
+      "todos_add",
+      "todos_list",
+    ]);
+
+    // A server-side write (bb <id> remove …) reaches the page as a signal.
+    todos = [];
+    await slot.behavior.emitRealtime("todos-changed", { count: 0 });
+    await slot.findByText(/Nothing to do/);
     slot.lifecycle.unmount();
   });
 });
@@ -106,7 +146,7 @@ export default defineConfig({
 `;
 
 const REPRESENTATIVE_SERVER = `
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 export const rpcContract = defineRpcContract({
@@ -160,7 +200,7 @@ export default function plugin(bb: BbPluginApi) {
 `;
 
 const REPRESENTATIVE_APP = `
-import { definePluginApp, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 function Panel() {
@@ -188,9 +228,7 @@ function packageRoot(name: string): string {
           readFileSync(join(current, "package.json"), "utf8"),
         ) as { name?: string };
         if (manifest.name === name) return current;
-      } catch {
-        // Keep walking to the package root.
-      }
+      } catch {}
       const parent = dirname(current);
       if (parent === current)
         throw new Error(`package root not found: ${name}`);
@@ -203,12 +241,53 @@ async function linkExternalDependencies(targetDir: string): Promise<void> {
   for (const name of EXTERNAL_DEPENDENCIES) {
     const target = join(targetDir, "node_modules", name);
     await mkdir(dirname(target), { recursive: true });
-    // The scaffold declares some of these as real dependencies (zod), so the
-    // install above may already have fetched a registry copy. Replace it, so
-    // what is typechecked and executed is always this repo's version.
     await rm(target, { recursive: true, force: true });
     await symlink(packageRoot(name), target, "dir");
   }
+}
+
+async function packPluginSdk(packDir: string): Promise<string> {
+  await mkdir(packDir, { recursive: true });
+  await execFileAsync(
+    "npm",
+    ["pack", "--silent", "--ignore-scripts", "--pack-destination", packDir],
+    {
+      cwd: pluginSdkRoot,
+    },
+  );
+  const tarballs = (await readdir(packDir)).filter((name) =>
+    name.endsWith(".tgz"),
+  );
+  expect(tarballs).toHaveLength(1);
+  return join(packDir, tarballs[0]!);
+}
+
+async function installPackedSdk(
+  targetDir: string,
+  tarball: string,
+): Promise<void> {
+  await execFileAsync(
+    "npm",
+    [
+      "install",
+      "--ignore-scripts",
+      "--legacy-peer-deps",
+      "--no-package-lock",
+      "--no-save",
+      "--no-audit",
+      "--no-fund",
+      "--prefer-offline",
+      tarball,
+    ],
+    { cwd: targetDir },
+  );
+}
+
+async function scaffoldSdkPin(targetDir: string): Promise<string | undefined> {
+  const manifest = JSON.parse(
+    await readFile(join(targetDir, "package.json"), "utf8"),
+  ) as { devDependencies?: Record<string, string> };
+  return manifest.devDependencies?.["@get-bb/plugin-sdk"];
 }
 
 async function includeTestsInTypecheck(targetDir: string): Promise<void> {
@@ -254,6 +333,31 @@ async function runVitest(targetDir: string): Promise<void> {
 
 describe("external plugin scaffold types", () => {
   let workDir: string;
+  let packRoot: string;
+  let tarball: string;
+  let installedNodeModules: string;
+
+  async function useInstalledNodeModules(targetDir: string): Promise<void> {
+    await symlink(installedNodeModules, join(targetDir, "node_modules"), "dir");
+  }
+
+  beforeAll(async () => {
+    packRoot = await mkdtemp(join(tmpdir(), "bb-external-pack-"));
+    tarball = await packPluginSdk(join(packRoot, "pack"));
+    const templateDir = join(packRoot, "template");
+    await scaffoldPlugin({
+      targetDir: templateDir,
+      packageName: "bb-plugin-external-template",
+      bbVersion: "0.9.0",
+    });
+    await installPackedSdk(templateDir, tarball);
+    await linkExternalDependencies(templateDir);
+    installedNodeModules = join(templateDir, "node_modules");
+  }, 180_000);
+
+  afterAll(async () => {
+    await rm(packRoot, { recursive: true, force: true });
+  });
 
   beforeEach(async () => {
     workDir = await mkdtemp(join(tmpdir(), "bb-external-scaffold-"));
@@ -263,42 +367,48 @@ describe("external plugin scaffold types", () => {
     await rm(workDir, { recursive: true, force: true });
   });
 
-  it("typechecks full SDK results without workspace packages and with library checks enabled", async () => {
+  it("typechecks full SDK results against the installed package, with library checks enabled", async () => {
     const targetDir = join(workDir, "bb-plugin-external");
     await scaffoldPlugin({
       targetDir,
       packageName: "bb-plugin-external",
       bbVersion: "0.9.0",
-      app: true,
     });
     await writeFile(join(targetDir, "server.ts"), REPRESENTATIVE_SERVER);
     await writeFile(join(targetDir, "app.tsx"), REPRESENTATIVE_APP);
-    await linkExternalDependencies(targetDir);
+    expect(await scaffoldSdkPin(targetDir)).toBe(PLUGIN_SDK_VERSION);
+    await useInstalledNodeModules(targetDir);
 
     const tsconfig = JSON.parse(
       await readFile(join(targetDir, "tsconfig.json"), "utf8"),
-    ) as { compilerOptions: { skipLibCheck: boolean } };
+    ) as {
+      compilerOptions: {
+        skipLibCheck: boolean;
+        paths?: Record<string, string[]>;
+      };
+    };
     expect(tsconfig.compilerOptions.skipLibCheck).toBe(false);
+    expect(Object.keys(tsconfig.compilerOptions.paths ?? {})).toEqual(["@/*"]);
     await expect(
-      access(join(targetDir, "node_modules", "@bb")),
+      access(join(targetDir, "types", "bb-plugin-sdk.d.ts")),
     ).rejects.toThrow();
+    await expect(
+      access(
+        join(
+          targetDir,
+          "node_modules",
+          "@get-bb",
+          "plugin-sdk",
+          "bundled-types",
+          "bb-plugin-sdk.d.ts",
+        ),
+      ),
+    ).resolves.toBeUndefined();
 
     await runTypecheck(targetDir);
-  }, 120_000);
+  }, 300_000);
 
   it("installs the packed testing runtimes and executes scaffold backend and frontend tests", async () => {
-    const packDir = join(workDir, "pack");
-    await mkdir(packDir);
-    await execFileAsync(
-      "npm",
-      ["pack", "--silent", "--pack-destination", packDir],
-      { cwd: pluginSdkRoot },
-    );
-    const tarballs = (await readdir(packDir)).filter((name) =>
-      name.endsWith(".tgz"),
-    );
-    expect(tarballs).toHaveLength(1);
-    const tarball = join(packDir, tarballs[0]!);
     const packedListing = (
       await execFileAsync("tar", ["-tzf", tarball])
     ).stdout.split("\n");
@@ -323,27 +433,19 @@ describe("external plugin scaffold types", () => {
       packageName: "bb-plugin-external-backend",
       bbVersion: "0.9.0",
     });
-    await execFileAsync(
-      "npm",
-      [
-        "install",
-        "--ignore-scripts",
-        "--legacy-peer-deps",
-        "--no-package-lock",
-        "--no-save",
-        "--omit=dev",
-        tarball,
-      ],
-      { cwd: backendDir },
-    );
-    await linkExternalDependencies(backendDir);
+    await useInstalledNodeModules(backendDir);
     await writeFile(join(backendDir, "server.test.ts"), BACKEND_TEST);
     await includeTestsInTypecheck(backendDir);
 
-    expect(await readdir(join(backendDir, "node_modules", "@bb"))).toEqual([
+    expect(await readdir(join(backendDir, "node_modules", "@get-bb"))).toEqual([
       "plugin-sdk",
     ]);
-    const installedSdk = join(backendDir, "node_modules", "@bb", "plugin-sdk");
+    const installedSdk = join(
+      backendDir,
+      "node_modules",
+      "@get-bb",
+      "plugin-sdk",
+    );
     const installedManifest = JSON.parse(
       await readFile(join(installedSdk, "package.json"), "utf8"),
     ) as {
@@ -354,7 +456,7 @@ describe("external plugin scaffold types", () => {
       peerDependencies?: Record<string, string>;
       exports: Record<string, { import: string; types: string }>;
     };
-    expect(installedManifest.version).toBe("0.4.2");
+    expect(installedManifest.version).toBe(PLUGIN_SDK_VERSION);
     expect(installedManifest.private).not.toBe(true);
     expect(JSON.stringify(installedManifest.dependencies ?? {})).not.toContain(
       "workspace:",
@@ -375,9 +477,9 @@ describe("external plugin scaffold types", () => {
         "utf8",
       );
       const bbImports = [
-        ...declarations.matchAll(/from ['"](@bb\/[^'"]+)['"]/gu),
+        ...declarations.matchAll(/from ['"](@(?:get-)?bb\/[^'"]+)['"]/gu),
       ].map((match) => match[1]);
-      expect(new Set(bbImports)).toEqual(new Set(["@bb/plugin-sdk"]));
+      expect(new Set(bbImports)).toEqual(new Set(["@get-bb/plugin-sdk"]));
       expect(declarations).not.toContain("@bb/sdk");
       expect(declarations).not.toContain("@bb/server-contract");
     }
@@ -389,44 +491,33 @@ describe("external plugin scaffold types", () => {
       expect(runtime).not.toMatch(/from ['"]@bb\//u);
     }
     await expect(access(join(installedSdk, "src"))).rejects.toThrow();
-    const backendTsconfigPath = join(backendDir, "tsconfig.json");
     const backendTsconfig = JSON.parse(
-      await readFile(backendTsconfigPath, "utf8"),
+      await readFile(join(backendDir, "tsconfig.json"), "utf8"),
     ) as {
       compilerOptions: {
         skipLibCheck: boolean;
-        paths: Record<string, string[]>;
+        paths?: Record<string, string[]>;
       };
     };
     expect(backendTsconfig.compilerOptions.skipLibCheck).toBe(false);
-    await runTypecheck(backendDir);
-
-    // Also prove package self-reference works without the scaffold's vendored
-    // root declaration mapping. The testing declarations intentionally import
-    // the installed package root instead of flattening the full SDK again.
-    delete backendTsconfig.compilerOptions.paths["@bb/plugin-sdk"];
-    await writeFile(
-      backendTsconfigPath,
-      `${JSON.stringify(backendTsconfig, null, 2)}\n`,
-    );
-    await runTypecheck(backendDir);
-    await runVitest(backendDir);
+    expect(backendTsconfig.compilerOptions.paths).toEqual({ "@/*": ["./*"] });
 
     const frontendDir = join(workDir, "bb-plugin-external-frontend");
     await scaffoldPlugin({
       targetDir: frontendDir,
       packageName: "bb-plugin-external-frontend",
       bbVersion: "0.9.0",
-      app: true,
     });
-    const frontendSdk = join(frontendDir, "node_modules", "@bb", "plugin-sdk");
-    await mkdir(dirname(frontendSdk), { recursive: true });
-    await symlink(installedSdk, frontendSdk, "dir");
-    await linkExternalDependencies(frontendDir);
+    await useInstalledNodeModules(frontendDir);
     await writeFile(join(frontendDir, "app.test.tsx"), FRONTEND_TEST);
     await writeFile(join(frontendDir, "vitest.config.ts"), VITEST_CONFIG);
     await includeTestsInTypecheck(frontendDir);
-    await runTypecheck(frontendDir);
-    await runVitest(frontendDir);
+
+    await Promise.all(
+      [backendDir, frontendDir].map(async (dir) => {
+        await runTypecheck(dir);
+        await runVitest(dir);
+      }),
+    );
   }, 300_000);
 });

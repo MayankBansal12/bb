@@ -1,8 +1,8 @@
 ---
 kind: instruction
 title: bb Guide — Customization
-summary: Command reference for customizing the bb app color palette and keyboard shortcuts.
-intent: Explain the CLI theme surface and server-backed app customization.
+summary: Command reference for customizing the bb app color palette, keyboard shortcuts, and mobile push notifications.
+intent: Explain the CLI theme surface, server-backed app customization, and push-notification device registration.
 editingNotes: Keep flags accurate against the CLI implementation. Theme details live in the bb-cli skill's references/theming.md.
 ---
 Customization commands
@@ -20,7 +20,8 @@ app uses ~/.bb/theme/…). The folder name is the theme id.
   bb theme set <id> [--favicon-color <color>]
                                  Activate a theme, preserving the favicon color
                                  unless the flag supplies the complete selection
-  bb theme show [--css]          Print the active palette; --css dumps the CSS
+  bb theme show [id] [--css]     Print the active palette, or resolve <id> without
+                                 activating it; --css dumps the CSS
   bb theme reset                 Back to the default theme; preserve favicon color
   bb theme favicon set <color>   Set favicon color; preserve the active theme
   bb theme favicon reset         Reset favicon color; preserve the active theme
@@ -34,6 +35,9 @@ the bb-cli skill (references/theming.md).
 Favicon colors are `default`, `red`, `orange`, `yellow`, `green`, `teal`,
 `blue`, `purple`, and `pink`. Theme and favicon-only commands carry the other
 appearance value forward explicitly.
+
+Hovering a palette in Settings → Appearance previews it live in that window
+without saving; `bb theme show <id>` is the CLI counterpart.
 
 Add --json to any theme command for machine-readable output.
 
@@ -65,55 +69,90 @@ service-unavailable failure. Their defaults are `codex/gpt-5.6-luna` and
 Server-backed General settings
 
 Settings → General includes app-wide preferences stored server-side so every
-window and restart sees the same value. On macOS, the Caffeinate toggle asks the
-primary host daemon to run `/usr/bin/caffeinate -i -w <daemon-pid>`, preventing
-system idle sleep while bb is running; turning it off stops that process. It
-only blocks idle sleep: closing a laptop lid or choosing Sleep manually still
-sleeps the Mac. This setting is only shown when the connected primary host
-daemon reports macOS.
+window and restart sees the same value. Keep Awake is instead owned by its
+builtin plugin: use its autosaving page under Extensions → Plugins or run
+`bb keep-awake enable` or `bb keep-awake disable`. Choose every host with `bb
+keep-awake hosts all`, or name individual host ids after `bb keep-awake hosts`.
+On macOS it prevents system idle sleep while bb is running; closing the lid or
+choosing Sleep still sleeps the Mac.
+
+Concurrency limit is also owned by its builtin plugin. Its autosaving page
+under Extensions → Plugins leaves the overall limit unlimited by default and
+uses an automatic per-host limit of one thread per available processor. Use
+`bb concurrency-limit global [unlimited|<limit>]` and `bb
+concurrency-limit host <host-id> [auto|<limit>]`; 0 pauses new work.
 
 Settings → Keyboard also includes `showKeyboardHints`, which defaults to true.
 Turn it off to hide the delayed shortcut badges shown while holding Command or
 Control on macOS, or Control on Windows/Linux. Shortcut commands continue to
 work.
 
-Settings → General includes `showUnhandledProviderEvents`, which defaults to
-false in packaged builds. Turn it on to show raw provider events bb does not yet
-understand; development builds always show these diagnostic rows.
+Settings → General includes `showDiagnosticEvents`, which defaults to false
+in all builds. Turn it on to show provider environment resolution and unhandled
+provider events. Warnings, errors, and model fallback stay visible. Existing
+unhandled-event preferences are preserved. Set it with
+`bb settings general showDiagnosticEvents <true|false>`.
 
 Settings → General also includes `steerActiveThreadOnEnter`, which defaults to
+true for a new install. An earlier install with saved settings or work keeps
 false. Outside an open typeahead menu, enabling it makes Enter steer a running
 thread and Command+Enter queue a follow-up; when disabled, those actions are
-reversed. Shift+Enter inserts a newline, and unmodified Enter inserts a newline
-in zen mode. On coarse-pointer touch devices, the software-keyboard Return path
-inserts a newline. iPadOS WebKit preserves these Enter shortcuts for a connected
-Magic Keyboard.
+reversed. Shift+Enter inserts a newline. On coarse-pointer touch devices, the
+software-keyboard Return path inserts a newline. iPadOS WebKit preserves these
+Enter shortcuts for a connected Magic Keyboard.
+
+Settings → General also includes `streamerMode`, which defaults to false. Turn
+it on to hide every `customModels` entry from `~/.bb/config.json` in all model
+lists (pickers, `bb provider models`, and the SDK) during a screen share. The
+entries stay in the config file.
+
+Settings → General includes `managedBranchPrefix`, which defaults to
+`bb/`. bb puts it in front of every branch name it creates for a worktree, so
+the default gives `bb/fix-login-flow-thr_ab12cd34ef`. Set `sawyer/wt-` to get
+`sawyer/wt-fix-login-flow-thr_ab12cd34ef`, or clear it for no prefix. bb rejects
+a prefix that cannot start a valid git branch name. The new prefix applies to
+branches bb creates after the change.
 
   bb settings show
-  bb settings general <key> <true|false>
-  bb settings replay-onboarding
+  bb settings ai-services
+  bb settings general <key> <value>
   bb settings experiment <key> <value>
   bb settings usage [--machine <id-or-name>]
   bb settings version [--force]
   bb settings reload
 
-`bb settings replay-onboarding` enables the `newOnboarding` experiment and
-clears `onboardingCompletedAt`. The first-run setup guide then shows again on
-the next app load. The same button lives in Settings → General → Setup guide
-while the experiment is on.
+`bb settings ai-services` shows the helper-inference and voice-transcription
+settings (`BB_INFERENCE`, `BB_INFERENCE_FALLBACK`, `BB_TRANSCRIPTION`, set with
+`bb-app config`) and the plugin-registered AI services they may name as
+`<service>/<model>`.
 
-The `newOnboarding` experiment exposes the first-run agent and project setup
-guide.
-The `toolsHub` experiment exposes Extensions for managing skills and plugins.
-Automations stays in the Plugins section beside threads. It does not enable or
-disable installed skills, automation execution, plugin runtimes, CLI commands,
-or backend APIs.
+`bb settings general` accepts any key from `generalSettings` in
+`bb settings show`. Boolean preferences take `true`, `false`, `on`, or `off`,
+and `null` clears a preference that can be unset.
+
+The default-off `changelogPreview` experiment shows the latest release notes
+as a compact, dismissible card on Settings → Updates.
 The default-on `editMessages` experiment enables editing eligible, accepted
 root user messages in Codex, Claude Code, and Pi threads, including failed or
 incomplete turns; turn it off to hide the editor. Opening the editor is
 client-local; submitting stops and settles a running thread, then replaces the
 selected turn and all later conversation history while retaining workspace side
 effects. Grouped multi-message requests are not yet editable.
+
+BB releases restorable provider sessions after 30 idle minutes. The daemon
+checks for these sessions every five minutes. Active turns, commands, agents,
+workflows, and monitors keep their sessions loaded.
+
+The default-off `sidebarProgressiveDisclosure` experiment shows the first five
+groups in the current sort order in **By project** and **By machine**, keeps
+attention groups visible, and reveals ten more per **Show more** click. Revealed
+groups stay visible through activity and sort-order changes.
+**Manually** is unchanged. Enable it with `bb settings experiment
+sidebarProgressiveDisclosure true`.
+
+The default-off `timelineWindowing` experiment mounts only nearby rows in long
+timelines and large expanded timeline details. Enable it with
+`bb settings experiment timelineWindowing true`.
 
 Thread timeline windows are bounded by event count as well as user-message
 count (`BB_FF_TIMELINE_WINDOW_EVENT_BUDGET`, default 1500), so a long thread
@@ -138,6 +177,30 @@ same resolved bindings. The complete default table is in docs/configuration.md.
   bb settings keyboard set <command> <shortcut|disabled>
   bb settings keyboard reset [command]
 
+Push notifications
+
+The built-in Push notifications plugin sends mobile updates through Expo and
+system notifications to connected web and desktop clients. Web tabs or desktop
+windows must stay open; browser permission is requested in the plugin settings.
+
+  bb push-notifications list
+  bb push-notifications add --token <expo-push-token>
+      --platform <ios|android> --label <device-name>
+  bb push-notifications remove <id>
+  bb push-notifications status
+  bb push-notifications test <web|desktop>
+  bb plugin config push-notifications set <mobileEnabled|webEnabled|desktopEnabled> <true|false>
+
+`add` is an upsert by token: a known token refreshes its label and last-seen
+time and keeps its id. Expo tokens that are no longer registered are removed
+automatically after a failed delivery. Use `bb plugin disable
+push-notifications` to stop delivery. Change the relay URL with `bb plugin
+config push-notifications set expoPushUrl <url>`. Add `--json` to `list` or
+`status` for machine-readable output. The list returns token suffixes only.
+The three channel switches default to true and apply immediately across this
+server. `test` broadcasts to all connected clients of the selected type with
+permission; OS notification settings still control whether a banner appears.
+
 Host files and voice transcription
 
   bb file read|write|list|paths|mkdir|move|remove ...
@@ -148,12 +211,36 @@ Voice transcription uses the `BB_TRANSCRIPTION` model, which defaults to
 `bb-app config set BB_TRANSCRIPTION <provider/model>`.
 
 `bb file` supports `--host` for remote machines and `--root` on mutating
-commands to confine access beneath an absolute directory. Use `--json` for
-metadata and machine-readable results.
+commands to confine access beneath an absolute directory. `bb file list` and
+`bb file paths` include dot-prefixed entries; pass `--no-hidden` to skip them.
+Both skip a default set of dependency and cache directories such as
+`node_modules` and `.venv`; `--exclude <names...>` replaces that set. Use
+`--json` for metadata and machine-readable results.
+
+Server-backed sidebar preferences
+
+Sidebar layout lives on the server in a keyed, revisioned registry so every
+window, device, and the CLI share it: organization mode, chronological sort,
+section orders, collapsed rows and sections, navigation entry order and
+visibility, and the navigation and thread-list provider pickers. The sidebar
+waits for them alongside the project list, and an upgrade uploads the old
+browser-stored layout once.
+
+  bb settings ui list [--json]
+  bb settings ui get <key> [--json]
+  bb settings ui set <key> <value> [--json]
+  bb settings ui reset <key> [--json]
+
+`bb settings ui list` prints every key with its value, revision, and a short
+description. `set` takes plain strings for enum and provider keys and JSON for
+lists and `null`; it reads the current revision, writes with it, and retries
+once on a conflict. `reset` writes the default. The SDK offers
+`sdk.system.uiPreferences.list()`, `.set()`, and `.reset()`.
 
 Client-local UI preferences
 
-Some Settings values live only in the current browser/client. The Voice Input
+Some Settings values live only in the current browser/client. Sidebar width
+and open state stay local because they depend on the window size. The Voice Input
 microphone picker stores the selected browser MediaDevices device id in
 localStorage as `bb.voiceInput.audioInputDeviceId`; it does not have a `bb`
 command and does not change the server-side transcription model.

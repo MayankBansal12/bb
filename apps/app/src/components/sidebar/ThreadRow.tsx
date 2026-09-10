@@ -6,17 +6,20 @@ import {
   type MouseEventHandler,
   type PointerEventHandler,
   type ReactNode,
+  useRef,
 } from "react";
 import { useSetAtom } from "jotai";
 import type { ThreadListEntry } from "@bb/domain";
-import type { PluginComposerThreadRowStatus } from "@bb/plugin-sdk";
+import type { PluginComposerThreadRowStatus } from "@get-bb/plugin-sdk";
 import { getThreadConversationCollapsedAtom } from "@/components/secondary-panel/threadSecondaryPanelAtoms";
 import { Icon } from "@bb/shared-ui/icon";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@bb/shared-ui/tooltip";
 import { SidebarStickyTier } from "@/components/ui/sidebar.js";
 import { NavLink } from "react-router-dom";
 import {
   ThreadActionsContextMenu,
   ThreadActionsMenu,
+  ThreadArchiveQuickAction,
 } from "@/components/thread/ThreadActionsMenu";
 import { useThreadActions } from "@/components/thread/ThreadActionsProvider";
 import { useInlineThreadTitle } from "@/components/thread/InlineThreadTitle";
@@ -30,6 +33,7 @@ import {
 import {
   SIDEBAR_HOVER_ACTIONS_CLASS,
   SIDEBAR_HOVER_ACTIONS_FADE_CLASS,
+  SIDEBAR_HOVER_ACTIONS_INSET_CLASS,
   SIDEBAR_HOVER_ACTIONS_ROW_CLASS,
 } from "@/components/ui/sidebar-hover-actions.js";
 import {
@@ -46,7 +50,7 @@ import {
   resolveThreadListIndicator,
   type CollapsedChildActivity,
   type ThreadListIndicatorState,
-} from "@/lib/thread-activity";
+} from "@bb/client-core";
 import { getThreadDisplayTitle } from "@/lib/thread-title";
 import { getThreadRoutePath } from "@/lib/route-paths";
 import { cn } from "@bb/shared-ui/lib/utils";
@@ -57,6 +61,8 @@ import {
   SIDEBAR_ROW_INTERACTIVE_STATE_CLASS,
   SIDEBAR_ROW_SELECTED_STATE_CLASS,
   SIDEBAR_MORE_ACTION_TRIGGER_CLASS,
+  SIDEBAR_PAIRED_ACTION_LEADING_TARGET_CLASS,
+  SIDEBAR_PAIRED_ACTION_TRAILING_TARGET_CLASS,
   SIDEBAR_ROW_OPEN_IN_SPLIT_STATE_CLASS,
   SIDEBAR_SUCCESS_STATUS_COLOR_CLASS,
   SIDEBAR_SUCCESS_STATUS_DOT_CLASS,
@@ -67,13 +73,15 @@ import type { ConsumeDragClickSuppression } from "@/components/ui/use-drag-click
 import type { SidebarSortableDragBindings } from "./sortableMotion";
 import { SidebarChildToggleChevron } from "./SidebarChildToggleChevron";
 import { useSidebarThreadShortcut } from "./sidebarThreadShortcuts";
-import { SidebarThreadTitle } from "./SidebarThreadTitleMentions";
 import { SplitPaneMiniMap } from "./SplitPaneMiniMap";
 import { usePaneContentSplitIndicator } from "./paneContentSplitIndicator";
-import { useThreadSplitsEnabled } from "@/hooks/useThreadSplitsEnabled";
 import { useThreadRowSplitDrag } from "./useThreadRowSplitDrag";
 import { AppCommandShortcutPill } from "@/components/commands/AppCommandShortcutHint";
-import { useThreadTitleDisplayText } from "@/components/thread/ThreadTitleMentions";
+import {
+  ThreadTitleMentions,
+  useSidebarProjectName,
+  useThreadTitleDisplayText,
+} from "@/components/thread/ThreadTitleMentions";
 import { pluginIconName } from "@/components/plugin/PluginIcon";
 import { usePluginThreadRowStatus } from "@/lib/plugin-thread-row-status";
 
@@ -112,8 +120,6 @@ export type ThreadRowOptions =
       isCollapsed: boolean;
       childCount: number;
       childActivity: CollapsedChildActivity;
-      // Depth among pinned parents when this row is sticky; absent = not pinned
-      // (deeper than the sticky cap, or not a sticky parent role).
       stickyLevel?: number;
       onToggleCollapsed: (threadId: string) => void;
     });
@@ -121,14 +127,11 @@ export type ThreadRowOptions =
 interface ThreadRowProps {
   projectId: string;
   thread: ThreadListEntry;
+  crossProjectId: string | null;
   isActive: boolean;
   hasComposerDraft: boolean;
   onProjectSelect?: () => void;
   options: ThreadRowOptions;
-  // Visible row text override. Defaults to the thread title.
-  displayTitle?: string;
-  // Accessible name + hover tooltip override. Defaults to the thread title.
-  accessibleTitle?: string;
 }
 
 type ThreadRowClickCaptureHandler = MouseEventHandler<HTMLDivElement>;
@@ -138,8 +141,6 @@ interface ThreadRowContainerArgs {
   className: string;
   dragBindings?: SidebarSortableDragBindings;
   onClickCapture?: ThreadRowClickCaptureHandler;
-  // Split-drag initiator; engages only when the pointer leaves the sidebar, so
-  // it coexists with the dnd-kit reorder listeners in `dragBindings`.
   onSplitDragPointerDown?: PointerEventHandler<HTMLElement>;
   stickyLevel?: number;
   style: CSSProperties;
@@ -231,8 +232,6 @@ function renderThreadRowContainer({
   stickyLevel,
   style,
 }: ThreadRowContainerArgs) {
-  // Never show a grab cursor on thread rows. Section DnD still works after the
-  // activation distance; the link still selects on click.
   if (stickyLevel !== undefined) {
     return (
       <SidebarStickyTier
@@ -282,6 +281,7 @@ export function ThreadStatusGlyph({
   isPlanModeActive,
   isRuntimeActive,
   isWorkflowActive,
+  queuedWork,
 }: ThreadStatusGlyphProps) {
   const kind = resolveThreadListIndicator({
     hasPendingInteraction,
@@ -294,10 +294,12 @@ export function ThreadStatusGlyph({
     isPlanModeActive,
     isRuntimeActive,
     isWorkflowActive,
+    queuedWork,
   });
 
   switch (kind) {
     case "unread-error":
+    case "queued-failed":
       return (
         <Icon
           name="CircleX"
@@ -390,6 +392,17 @@ export function ThreadStatusGlyph({
           aria-label={getThreadListIndicatorLabel(kind) ?? undefined}
         />
       );
+    case "queued-waiting":
+      return (
+        <Icon
+          name="Clock"
+          className={cn(
+            "text-muted-foreground/75",
+            COARSE_POINTER_ICON_SIZE_CLASS,
+          )}
+          aria-label={getThreadListIndicatorLabel(kind) ?? undefined}
+        />
+      );
     case "draft":
       return (
         <ThreadDraftIndicator
@@ -411,25 +424,36 @@ export function ThreadStatusGlyph({
 
 interface CollapsedThreadStatusGlyphProps {
   activity: CollapsedChildActivity;
+  pluginStatus?: PluginComposerThreadRowStatus | null;
 }
 
 export function CollapsedThreadStatusGlyph({
   activity,
+  pluginStatus = null,
 }: CollapsedThreadStatusGlyphProps) {
-  return (
-    <ThreadStatusGlyph
-      hasPendingInteraction={activity.pending}
-      hasUnsubmittedDraft={activity.hasUnsubmittedDraft}
-      hasUnreadError={activity.unreadError}
-      hasUnreadSuccess={activity.unread}
-      isBackgroundAgentActive={activity.backgroundAgent}
-      isBackgroundCommandActive={activity.backgroundCommand}
-      isGoalActive={activity.goal}
-      isPlanModeActive={activity.planMode}
-      isRuntimeActive={activity.runtimeWorking}
-      isWorkflowActive={activity.workflow}
-    />
+  const statusProps: ThreadListIndicatorState = {
+    hasPendingInteraction: activity.pending,
+    hasUnsubmittedDraft: activity.hasUnsubmittedDraft,
+    hasUnreadError: activity.unreadError,
+    hasUnreadSuccess: activity.unread,
+    isBackgroundAgentActive: activity.backgroundAgent,
+    isBackgroundCommandActive: activity.backgroundCommand,
+    isGoalActive: activity.goal,
+    queuedWork: "none",
+    isPlanModeActive: activity.planMode,
+    isRuntimeActive: activity.runtimeWorking,
+    isWorkflowActive: activity.workflow,
+  };
+  const { pluginStatusIsVisible } = resolveThreadTrailingIndicatorStatus(
+    statusProps,
+    pluginStatus,
   );
+
+  if (pluginStatusIsVisible && pluginStatus) {
+    return <PluginThreadRowStatusIndicator status={pluginStatus} />;
+  }
+
+  return <ThreadStatusGlyph {...statusProps} />;
 }
 type ThreadTrailingIndicatorProps = ThreadStatusGlyphProps & {
   pluginStatus: PluginComposerThreadRowStatus | null;
@@ -492,12 +516,11 @@ function ThreadTrailingIndicator({
 function ThreadRowComponent({
   projectId,
   thread,
+  crossProjectId,
   isActive,
   hasComposerDraft,
   onProjectSelect,
   options,
-  displayTitle,
-  accessibleTitle,
 }: ThreadRowProps) {
   const [isDropdownActionsOpen, setIsDropdownActionsOpen] = useState(false);
   const [isContextActionsOpen, setIsContextActionsOpen] = useState(false);
@@ -520,9 +543,14 @@ function ThreadRowComponent({
   const threadUnreadError = threadUnreadDone && thread.status === "error";
   const threadUnreadSuccess = threadUnreadDone && !threadUnreadError;
   const threadTitle = getThreadDisplayTitle(thread);
-  // Inside a section the row shows the leaf but keeps the full path for a11y.
-  const visibleTitle = displayTitle ?? threadTitle;
-  const labelTitle = useThreadTitleDisplayText(accessibleTitle ?? threadTitle);
+  const labelTitle = useThreadTitleDisplayText(threadTitle);
+  const crossProjectName = useSidebarProjectName(crossProjectId);
+  const crossProjectLabel =
+    crossProjectId === null
+      ? null
+      : crossProjectName
+        ? `In project ${crossProjectName}`
+        : "In another project";
   const handleRename = useCallback(
     (nextTitle: string) => {
       renameThread(thread.id, nextTitle);
@@ -542,10 +570,9 @@ function ThreadRowComponent({
     },
     [startEditing],
   );
-  const threadSplitsEnabled = useThreadSplitsEnabled();
   const splitIndicator = usePaneContentSplitIndicator(
     { kind: "thread", projectId, threadId: thread.id },
-    threadSplitsEnabled,
+    true,
   );
   const { onPointerDown: onSplitDragPointerDown, openInSplit } =
     useThreadRowSplitDrag({
@@ -553,8 +580,6 @@ function ThreadRowComponent({
       threadId: thread.id,
       title: labelTitle,
     });
-  // Splits are disabled on compact viewports; the drag hook signals that by
-  // withholding its pointer handler, so gate the click/menu entry points on it.
   const splitAvailable = onSplitDragPointerDown !== undefined;
   const parentOptions = options.kind === "parent" ? options : null;
   const isParentRow = parentOptions !== null;
@@ -563,9 +588,6 @@ function ThreadRowComponent({
   const childActivity =
     parentOptions?.childActivity ?? NO_COLLAPSED_CHILD_ACTIVITY;
   const hasChildren = childCount > 0;
-  // A collapsed parent hides its descendants behind one glyph, so it must
-  // surface its own status combined with the rolled-up child activity. Expanded
-  // parents and leaves show only their own status.
   const hasHiddenChildren = isParentRow && isParentCollapsed && hasChildren;
   const trailingHasPendingInteraction = hasHiddenChildren
     ? hasPendingInteraction || childActivity.pending
@@ -605,6 +627,7 @@ function ThreadRowComponent({
     isBackgroundAgentActive: trailingBackgroundAgentActive,
     isBackgroundCommandActive: trailingBackgroundCommandActive,
     isGoalActive: trailingGoalActive,
+    queuedWork: thread.queuedWork,
     isPlanModeActive: trailingPlanModeActive,
     isRuntimeActive: trailingRuntimeBusy,
     isWorkflowActive: trailingIsWorkflowActive,
@@ -637,9 +660,6 @@ function ThreadRowComponent({
     showActive
       ? SIDEBAR_ROW_SELECTED_STATE_CLASS
       : SIDEBAR_ROW_INTERACTIVE_STATE_CLASS,
-    // Subtle open-in-split tint, weaker than the active-row treatment. The
-    // focused pane's thread is already the active row, so this only marks the
-    // other open panes; hover still wins over it.
     !showActive &&
       splitIndicator.isOpenInSplit &&
       SIDEBAR_ROW_OPEN_IN_SPLIT_STATE_CLASS,
@@ -659,9 +679,11 @@ function ThreadRowComponent({
     [options],
   );
 
+  const rowLinkRef = useRef<HTMLAnchorElement>(null);
   const rowContent = (
     <>
       <NavLink
+        ref={rowLinkRef}
         to={getThreadRoutePath({ projectId, threadId: thread.id })}
         data-sidebar-thread-shortcut-target=""
         data-sidebar-thread-id={thread.id}
@@ -671,20 +693,12 @@ function ThreadRowComponent({
             event.stopPropagation();
             return;
           }
-          // Selecting a thread/agent row restores its conversation without
-          // disturbing any other thread's collapsed conversation state.
           setConversationCollapsed(false);
-          // Cmd/Ctrl-click is the split feature's second entry point: open the
-          // thread in the split instead of replacing the focused pane. Match the
-          // drag rules (right split / focus if open / replace at the cap).
           if (splitAvailable && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
             openInSplit();
             return;
           }
-          // A first click may navigate and remount this row. Remember that
-          // click so the second click of a double-click can still open the
-          // editor after the remount.
           if (consumeSidebarTitleDoubleClick(thread.id)) {
             event.preventDefault();
             event.stopPropagation();
@@ -698,27 +712,52 @@ function ThreadRowComponent({
         aria-keyshortcuts={shortcut?.ariaKeyshortcuts}
         className="absolute inset-0 rounded-md outline-none ring-sidebar-ring focus-visible:ring-2"
       />
-      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+      <span
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1.5",
+          !shortcut && SIDEBAR_HOVER_ACTIONS_INSET_CLASS,
+        )}
+      >
         {isEditing ? (
           <span className="relative z-10 min-w-0 flex-1 overflow-visible">
             {editor}
           </span>
         ) : (
           <span
-            className="min-w-0 truncate"
+            className="bb-thread-title"
             title={labelTitle}
             onDoubleClick={startTitleEditing}
           >
-            <SidebarThreadTitle title={visibleTitle} />
+            <ThreadTitleMentions title={threadTitle} />
           </span>
         )}
+        {crossProjectLabel !== null ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                data-sidebar-thread-cross-project=""
+                role="img"
+                aria-label={crossProjectLabel}
+                className="relative top-px z-10 flex shrink-0 items-center text-muted-foreground"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  rowLinkRef.current?.click();
+                }}
+              >
+                <Icon name="FolderExport" className="size-3.5" aria-hidden />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top">{crossProjectLabel}</TooltipContent>
+          </Tooltip>
+        ) : null}
         {parentOptions && hasChildren ? (
           <SidebarChildToggleChevron
             isCollapsed={isParentCollapsed}
             expandLabel={`Expand ${labelTitle} threads`}
             collapseLabel={`Collapse ${labelTitle} threads`}
             onToggle={() => parentOptions.onToggleCollapsed(thread.id)}
-            revealOnHover
+            revealOnHover={!isParentCollapsed}
           />
         ) : null}
       </span>
@@ -777,14 +816,24 @@ function ThreadRowComponent({
                 }
                 className={cn(
                   SIDEBAR_HOVER_ACTIONS_CLASS,
-                  "absolute inset-0 z-10 flex items-center justify-end max-md:pointer-coarse:hidden",
+                  "absolute inset-y-0 right-0 z-10 flex items-center justify-end max-md:pointer-coarse:hidden",
                 )}
               >
+                <ThreadArchiveQuickAction
+                  thread={thread}
+                  className={cn(
+                    "text-subtle-foreground hover:bg-transparent hover:text-foreground",
+                    SIDEBAR_MORE_ACTION_TRIGGER_CLASS,
+                    "-mr-0.5",
+                    SIDEBAR_PAIRED_ACTION_LEADING_TARGET_CLASS,
+                  )}
+                />
                 <ThreadActionsMenu
                   thread={thread}
                   triggerClassName={cn(
                     "text-subtle-foreground hover:bg-transparent hover:text-foreground",
                     SIDEBAR_MORE_ACTION_TRIGGER_CLASS,
+                    SIDEBAR_PAIRED_ACTION_TRAILING_TARGET_CLASS,
                   )}
                   onOpenInSplit={splitAvailable ? openInSplit : undefined}
                   onOpenChange={setIsDropdownActionsOpen}

@@ -12,26 +12,20 @@ import type {
 } from "@bb/server-contract";
 import { ApiError } from "../../errors.js";
 
-export type EnvironmentReadinessFields = Pick<
-  Environment,
-  "path" | "status"
->;
+type EnvironmentReadinessFields = Pick<Environment, "path" | "status">;
 
-export type ThreadEnvironmentStatusFields = Pick<Environment, "status">;
+type ThreadEnvironmentStatusFields = Pick<Environment, "status">;
 
-export type ThreadWritableFields = Pick<
-  Thread,
-  "archivedAt" | "deletedAt" | "status"
->;
+type ThreadWritableFields = Pick<Thread, "archivedAt" | "deletedAt" | "status">;
 
-export type HostUnavailableStatus = 404 | 502;
+type HostUnavailableStatus = 404 | 502;
 
 interface ParentThreadInvalidDetailsArgs {
   reason: ParentThreadInvalidReason;
   subject: ParentThreadInvalidSubject;
 }
 
-export function environmentNotReadyDetails(
+function environmentNotReadyDetails(
   environment: EnvironmentReadinessFields,
 ): EnvironmentNotReadyErrorDetails {
   return {
@@ -64,20 +58,10 @@ export function destroyedThreadEnvironmentDetails(
   return threadEnvironmentUnavailableDetails("destroyed", environment.status);
 }
 
-/**
- * The single definition of "the environment is gone": an environment with a
- * destroy RPC in flight (`destroying`) or already gone (`destroyed`) is never
- * reprovisioned, so any work request against it is rejected with the
- * "environment is gone" surface the frontend banner keys off. `retiring` is
- * deliberately absent because it is revivable before destroy starts.
- */
 export function goneThreadEnvironmentDetails(
   environment: ThreadEnvironmentStatusFields,
 ): ThreadEnvironmentUnavailableErrorDetails | null {
-  if (
-    environment.status !== "destroying" &&
-    environment.status !== "destroyed"
-  ) {
+  if (environment.status !== "destroyed") {
     return null;
   }
   return threadEnvironmentUnavailableDetails(
@@ -97,7 +81,7 @@ export function throwThreadEnvironmentUnavailable(
   );
 }
 
-export function threadNotWritableDetails(
+function threadNotWritableDetails(
   thread: ThreadWritableFields,
   reason: ThreadNotWritableReason,
 ): ThreadNotWritableErrorDetails {
@@ -112,6 +96,12 @@ export function threadNotWritableReasonForStatus(
   status: ThreadStatus,
 ): ThreadNotWritableReason {
   switch (status) {
+    // A pending thread has never dispatched, so "not started" is literally
+    // what it is. It reuses `starting`'s reason rather than earning its own:
+    // the caller's remedy is identical (wait for the first dispatch to clear),
+    // and a distinct reason would only be worth its fan-out once a surface
+    // renders pending differently.
+    case "pending":
     case "starting":
       return "not_started";
     case "idle":
@@ -178,23 +168,17 @@ export function throwProjectUnavailable(
 export function throwParentThreadInvalid(
   reason: ParentThreadInvalidReason,
 ): never {
-  throw new ApiError(
-    400,
-    "parent_thread_invalid",
-    "Parent thread is invalid",
-    { details: parentThreadInvalidDetails({ reason, subject: "parent" }) },
-  );
+  throw new ApiError(400, "parent_thread_invalid", "Parent thread is invalid", {
+    details: parentThreadInvalidDetails({ reason, subject: "parent" }),
+  });
 }
 
 export function throwSenderThreadInvalid(
   reason: Extract<ParentThreadInvalidReason, "deleted" | "not_found">,
 ): never {
-  throw new ApiError(
-    400,
-    "parent_thread_invalid",
-    "Sender thread is invalid",
-    { details: parentThreadInvalidDetails({ reason, subject: "sender" }) },
-  );
+  throw new ApiError(400, "parent_thread_invalid", "Sender thread is invalid", {
+    details: parentThreadInvalidDetails({ reason, subject: "sender" }),
+  });
 }
 
 function parentThreadInvalidDetails({

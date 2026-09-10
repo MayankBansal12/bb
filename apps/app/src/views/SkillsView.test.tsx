@@ -9,22 +9,34 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import { focusManager } from "@tanstack/react-query";
+import type { ProviderInfo } from "@bb/domain";
 import type { SkillSummary } from "@bb/server-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
+import { makeProviderInfo } from "@bb/test-helpers/domain-fixtures";
 import { sdk } from "@/lib/sdk";
-import { buildRegistrySkillReferencePrompt } from "@/lib/skills-registry";
-import { SkillDetailView } from "../components/tools/SkillDetailView";
-import { RegistrySkillDetailView } from "../components/tools/SkillsBrowse";
 import {
-  RegistrySkillsBrowsePage,
-  SkillDetailDialogView,
-  SkillsLibrary,
-  SkillsOverview,
+  buildRegistrySkillReferencePrompt,
   type RegistrySkill,
-} from "./SkillsView";
+} from "@/lib/skills-registry";
+import { SkillDetailView } from "../components/tools/SkillDetailView";
+import {
+  RegistrySkillDetailView,
+  RegistrySkillsBrowsePage,
+} from "../components/tools/SkillsBrowse";
+import {
+  SkillDetailDialogView,
+  SkillsOverview,
+} from "../components/tools/SkillsCollection";
+import { SkillsLibrary } from "../components/tools/SkillsLibrary";
 
 afterEach(() => {
   focusManager.setFocused(undefined);
@@ -39,7 +51,7 @@ function makeSkill(overrides: Partial<SkillSummary> = {}): SkillSummary {
     name: "code-review",
     description: "Review the current diff.",
     provider: "claude-code",
-    scope: "claude-user",
+    scope: "provider-user",
     pluginId: null,
     filePath: "/home/u/.claude/skills/code-review/SKILL.md",
     manageable: true,
@@ -81,6 +93,7 @@ function LocationStateProbe() {
 }
 
 function renderLibrarySkillRoute() {
+  vi.spyOn(sdk.providers, "list").mockResolvedValue([]);
   const fetchMock = vi.fn(
     async () =>
       new Response(
@@ -97,11 +110,11 @@ function renderLibrarySkillRoute() {
   vi.stubGlobal("fetch", fetchMock);
   const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
   renderDom(
-    <MemoryRouter initialEntries={["/tools/skills/library/skill_missing"]}>
+    <MemoryRouter initialEntries={["/extensions/skills/library/skill_missing"]}>
       <QueryClientWrapper>
         <Routes>
           <Route
-            path="/tools/skills/library/:skillId"
+            path="/extensions/skills/library/:skillId"
             element={<SkillsLibrary />}
           />
         </Routes>
@@ -111,9 +124,19 @@ function renderLibrarySkillRoute() {
   return fetchMock;
 }
 
+const NO_PROVIDER_ROSTER: ReadonlyMap<string, ProviderInfo> = new Map();
+const DEFAULT_PROVIDER_ROSTER: ReadonlyMap<string, ProviderInfo> = new Map(
+  [
+    makeProviderInfo({ id: "codex", displayName: "Codex" }),
+    makeProviderInfo({ id: "claude-code", displayName: "Claude Code" }),
+    makeProviderInfo({ id: "acp-cursor", displayName: "Cursor" }),
+  ].map((provider) => [provider.id, provider]),
+);
+
 function render(props: Partial<Parameters<typeof SkillsOverview>[0]>): string {
   return renderToStaticMarkup(
     <SkillsOverview
+      providerRoster={props.providerRoster ?? DEFAULT_PROVIDER_ROSTER}
       skills={props.skills ?? []}
       isLoading={props.isLoading ?? false}
       hasError={props.hasError ?? false}
@@ -131,6 +154,7 @@ function renderSkillDetailDialog(
   return renderDom(
     <SkillDetailDialogView
       skill={skill}
+      providerRoster={DEFAULT_PROVIDER_ROSTER}
       files={["SKILL.md"]}
       selectedPath="SKILL.md"
       onSelectPath={() => {}}
@@ -157,12 +181,14 @@ function renderRegistryBrowse(
     <RegistrySkillsBrowsePage
       skills={[makeRegistrySkill()]}
       pendingSkillIds={new Set()}
-      pagination={{ page: 0, perPage: 24, total: 1, hasMore: false }}
+      unknownInstallSkillIds={new Set()}
       isLoading={false}
+      loadingMore={false}
+      hasMore={false}
       hasError={false}
       query=""
       onQueryChange={() => {}}
-      onPageChange={() => {}}
+      onLoadMore={() => {}}
       onFork={() => {}}
       onSelect={() => {}}
       {...overrides}
@@ -175,6 +201,9 @@ function stubRegistryFetch(
   options: {
     detail?: boolean;
     list?: boolean;
+    entry?: RegistrySkill;
+    entryFails?: boolean;
+    ranking?: "trending" | "all-time";
   } = {},
 ) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -189,12 +218,21 @@ function stubRegistryFetch(
             total: options.list ? 1 : 0,
             hasMore: false,
           },
+          ranking: options.ranking ?? "trending",
         }),
         { status: 200 },
       );
     }
     if (url.startsWith("/api/v1/skills-registry/entry?")) {
-      return new Response(JSON.stringify(registrySkill), { status: 200 });
+      if (options.entryFails) return new Response(null, { status: 404 });
+      return new Response(JSON.stringify(options.entry ?? registrySkill), {
+        status: 200,
+      });
+    }
+    if (url === "/api/v1/skills-registry/entries") {
+      return Response.json({
+        entries: options.entryFails ? [] : [options.entry ?? registrySkill],
+      });
     }
     if (
       url.startsWith("/api/v1/skills-registry/detail?") &&
@@ -221,17 +259,28 @@ function renderRegistrySkillRoute() {
   const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
   return renderDom(
     <MemoryRouter
-      initialEntries={["/tools/skills/registry/owner%2Frepo%2Fuseful-skill"]}
+      initialEntries={[
+        "/extensions/skills/registry/owner%2Frepo%2Fuseful-skill",
+      ]}
     >
       <QueryClientWrapper>
         <Routes>
           <Route
-            path="/tools/skills/registry/:registrySkillId"
+            path="/extensions/skills/registry/:registrySkillId"
             element={<SkillsLibrary />}
           />
         </Routes>
       </QueryClientWrapper>
     </MemoryRouter>,
+  );
+}
+
+function NavigateButton({ to, label }: { to: string; label: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      {label}
+    </button>
   );
 }
 
@@ -258,15 +307,10 @@ describe("SkillsOverview", () => {
     expect(markup).toContain('aria-label="Filters: Provider: bb"');
     expect(markup).not.toContain("Provider: 1 selected");
     expect(markup).toContain("Sort");
-    expect(markup).toContain('role="tab"');
-    expect(markup).toContain("Library");
-    expect(markup).toContain("Browse");
+    expect(markup).not.toContain('role="tab"');
     expect(markup).toContain("BB Official");
     expect(markup).toContain("New bb skill");
     expect(markup).not.toContain('aria-label="Open zz-official-skill"');
-    expect(markup.indexOf("Library")).toBeLessThan(
-      markup.indexOf('placeholder="Search skills"'),
-    );
     expect(markup.indexOf("zz-official-skill")).toBeLessThan(
       markup.indexOf("aa-user-skill"),
     );
@@ -275,6 +319,7 @@ describe("SkillsOverview", () => {
   it("labels the Type filter and preserves independent source toggles", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "official-skill",
@@ -302,7 +347,6 @@ describe("SkillsOverview", () => {
       />,
     );
 
-    // Nothing selected is the default and means every type is shown.
     expect(screen.getByText("official-skill")).toBeTruthy();
     expect(screen.getByText("user-skill")).toBeTruthy();
     expect(screen.getByText("automations")).toBeTruthy();
@@ -314,7 +358,6 @@ describe("SkillsOverview", () => {
     fireEvent.blur(typeTrigger);
     fireEvent.pointerDown(typeTrigger);
     expect(screen.getByText("Type")).toBeTruthy();
-    // The explicit "All" row is gone; an empty selection carries that meaning.
     expect(screen.queryByRole("menuitemcheckbox", { name: "All" })).toBeNull();
     for (const name of ["BB Official", "Included in plugin", "User"]) {
       expect(
@@ -334,8 +377,6 @@ describe("SkillsOverview", () => {
       ).textContent,
     ).toBe("Included");
     expect(screen.queryByText("official-skill")).toBeNull();
-    // A user-authored skill has its own bucket, so it is narrowed out here
-    // rather than being silently unreachable through the filter.
     expect(screen.queryByText("user-skill")).toBeNull();
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "User" }));
     expect(await screen.findByText("user-skill")).toBeTruthy();
@@ -347,24 +388,20 @@ describe("SkillsOverview", () => {
     expect(screen.getByText("automations")).toBeTruthy();
   });
 
-  // The "user" bucket is a fallthrough — every scope that is not bb-builtin or
-  // plugin lands in it. Exercising only a bb-user fixture would leave that
-  // claim untested for the claude-*/codex-* scopes, which is exactly where the
-  // old code returned null and let skills bypass the Type filter entirely.
-  // This also covers AND-across-groups, which no other test does.
   it("puts every non-builtin, non-plugin scope in the User bucket", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={DEFAULT_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "claude-authored",
             provider: "claude-code",
-            scope: "claude-user",
+            scope: "provider-user",
           }),
           makeSkill({
             name: "codex-authored",
             provider: "codex",
-            scope: "codex-project",
+            scope: "provider-project",
           }),
           makeSkill({
             name: "official-skill",
@@ -382,18 +419,13 @@ describe("SkillsOverview", () => {
 
     const trigger = screen.getByRole("button", { name: /^Filters/ });
     fireEvent.pointerDown(trigger);
-    // Provider defaults to `bb`, which would hide both fixtures before the
-    // Type filter is reached — clear it so this test observes Type alone.
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "bb" }));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "User" }));
 
-    // Both provider-scoped skills reach the User bucket; the builtin does not.
     expect(await screen.findByText("claude-authored")).toBeTruthy();
     expect(screen.getByText("codex-authored")).toBeTruthy();
     expect(screen.queryByText("official-skill")).toBeNull();
 
-    // Groups combine as AND: narrowing Provider to Claude Code drops the
-    // codex-scoped skill while the User type selection still holds.
     fireEvent.click(
       screen.getByRole("menuitemcheckbox", { name: "Claude Code" }),
     );
@@ -401,7 +433,6 @@ describe("SkillsOverview", () => {
     expect(screen.queryByText("codex-authored")).toBeNull();
     expect(screen.queryByText("official-skill")).toBeNull();
 
-    // Clearing Type leaves the Provider selection filtering on its own.
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "User" }));
     expect(await screen.findByText("claude-authored")).toBeTruthy();
     expect(screen.queryByText("codex-authored")).toBeNull();
@@ -410,6 +441,7 @@ describe("SkillsOverview", () => {
   it("toggles BB Official independently from Included in plugin", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "official-skill",
@@ -437,18 +469,15 @@ describe("SkillsOverview", () => {
       screen.getByRole("menuitemcheckbox", { name: "Included in plugin" }),
     );
 
-    // One source selected narrows to that source alone.
     expect(await screen.findByText("automations")).toBeTruthy();
     expect(screen.queryByText("official-skill")).toBeNull();
 
-    // Adding the second source widens the selection rather than replacing it.
     fireEvent.click(
       screen.getByRole("menuitemcheckbox", { name: "BB Official" }),
     );
     expect(await screen.findByText("official-skill")).toBeTruthy();
     expect(screen.getByText("automations")).toBeTruthy();
 
-    // Clearing both returns to the unfiltered default.
     fireEvent.click(
       screen.getByRole("menuitemcheckbox", { name: "Included in plugin" }),
     );
@@ -457,7 +486,6 @@ describe("SkillsOverview", () => {
     );
     expect(await screen.findByText("official-skill")).toBeTruthy();
     expect(screen.getByText("automations")).toBeTruthy();
-    // The open menu hides the trigger from the a11y tree, so close it first.
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("button", { name: /^Filters/ })).toBeTruthy();
   });
@@ -465,6 +493,7 @@ describe("SkillsOverview", () => {
   it("uses filter-neutral copy when a Type selection removes every skill", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "official-skill",
@@ -495,6 +524,7 @@ describe("SkillsOverview", () => {
     const registrySkill = makeRegistrySkill({ installs: 123_456, stars: 654 });
     const markup = renderToStaticMarkup(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[]}
         isLoading={false}
         hasError={false}
@@ -503,12 +533,14 @@ describe("SkillsOverview", () => {
           <RegistrySkillsBrowsePage
             skills={[registrySkill]}
             pendingSkillIds={new Set()}
-            pagination={{ page: 0, perPage: 24, total: 1, hasMore: false }}
+            unknownInstallSkillIds={new Set()}
             isLoading={false}
+            loadingMore={false}
+            hasMore={false}
             hasError={false}
             query=""
             onQueryChange={() => {}}
-            onPageChange={() => {}}
+            onLoadMore={() => {}}
             onFork={() => {}}
             onSelect={() => {}}
           />
@@ -521,14 +553,33 @@ describe("SkillsOverview", () => {
     expect(markup).toContain("Useful skill");
   });
 
-  it("disables provider filters that have no matching skills", async () => {
+  it("names custom ACP agents from the provider roster", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={
+          new Map([
+            [
+              "acp-foo",
+              makeProviderInfo({ id: "acp-foo", displayName: "Foo Agent" }),
+            ],
+            [
+              "acp-bar",
+              makeProviderInfo({ id: "acp-bar", displayName: "Bar Agent" }),
+            ],
+          ])
+        }
         skills={[
           makeSkill({
-            name: "codex-skill",
-            provider: "codex",
-            scope: "codex-user",
+            name: "foo-skill",
+            description: null,
+            provider: "acp-foo",
+            scope: "provider-user",
+          }),
+          makeSkill({
+            name: "bar-skill",
+            description: null,
+            provider: "acp-bar",
+            scope: "provider-user",
           }),
         ]}
         isLoading={false}
@@ -542,11 +593,45 @@ describe("SkillsOverview", () => {
 
     await waitFor(() => {
       expect(
-        screen
-          .getByRole("menuitemcheckbox", { name: "Claude Code" })
-          .getAttribute("aria-disabled"),
-      ).toBe("true");
+        screen.getByRole("menuitemcheckbox", { name: "Foo Agent" }),
+      ).not.toBeNull();
     });
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Bar Agent" }),
+    ).not.toBeNull();
+    expect(
+      screen.queryByRole("menuitemcheckbox", { name: "ACP provider" }),
+    ).toBeNull();
+  });
+
+  it("lists a provider filter only for providers present in the skills", async () => {
+    renderDom(
+      <SkillsOverview
+        providerRoster={DEFAULT_PROVIDER_ROSTER}
+        skills={[
+          makeSkill({
+            name: "codex-skill",
+            provider: "codex",
+            scope: "provider-user",
+          }),
+        ]}
+        isLoading={false}
+        hasError={false}
+        onCreateSkill={() => {}}
+        onSelectSkill={() => {}}
+      />,
+    );
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^Filters/ }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("menuitemcheckbox", { name: "Codex" }),
+      ).not.toBeNull();
+    });
+    expect(
+      screen.queryByRole("menuitemcheckbox", { name: "Claude Code" }),
+    ).toBeNull();
     expect(
       screen
         .getByRole("menuitemcheckbox", { name: "Codex" })
@@ -555,7 +640,7 @@ describe("SkillsOverview", () => {
     expect(
       screen
         .getByRole("menuitemcheckbox", { name: "Codex" })
-        .querySelector("svg"),
+        .querySelector("[data-provider-logo]"),
     ).not.toBeNull();
     expect(
       screen
@@ -567,6 +652,7 @@ describe("SkillsOverview", () => {
   it("labels the Provider filter and prefixes its logo tooltip", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "bb-skill",
@@ -584,8 +670,6 @@ describe("SkillsOverview", () => {
 
     const providerTrigger = screen.getByRole("button", { name: /^Filters/ });
     fireEvent.focus(providerTrigger);
-    // Merging Provider into the grouped Filters menu replaced the trigger's
-    // logo tooltip with the group summary; the logos moved onto the rows.
     expect((await screen.findByRole("tooltip")).textContent?.trim()).toBe(
       "Provider: bb",
     );
@@ -601,11 +685,12 @@ describe("SkillsOverview", () => {
   it("keeps the default BB filter selected when only provider skills exist", async () => {
     renderDom(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           makeSkill({
             name: "codex-skill",
             provider: "codex",
-            scope: "codex-user",
+            scope: "provider-user",
           }),
         ]}
         isLoading={false}
@@ -642,6 +727,7 @@ describe("SkillsOverview", () => {
     ];
     const view = renderDom(
       <SkillsOverview
+        providerRoster={DEFAULT_PROVIDER_ROSTER}
         skills={initialSkills}
         isLoading={false}
         hasError={false}
@@ -667,6 +753,7 @@ describe("SkillsOverview", () => {
 
     view.rerender(
       <SkillsOverview
+        providerRoster={NO_PROVIDER_ROSTER}
         skills={[
           ...initialSkills,
           makeSkill({
@@ -705,6 +792,36 @@ describe("SkillsOverview", () => {
     expect(markup).not.toContain('aria-label="Delete provider-skill"');
   });
 
+  it("waits for hover intent before warming a row's detail queries", () => {
+    vi.useFakeTimers();
+    try {
+      const onPrefetchSkill = vi.fn();
+      renderDom(
+        <SkillsOverview
+          providerRoster={NO_PROVIDER_ROSTER}
+          skills={[makeSkill({ provider: null, scope: "bb-user" })]}
+          isLoading={false}
+          hasError={false}
+          onCreateSkill={() => {}}
+          onSelectSkill={() => {}}
+          onPrefetchSkill={onPrefetchSkill}
+        />,
+      );
+      const row = screen.getByRole("button", { name: "code-review" });
+      fireEvent.focus(row);
+      vi.advanceTimersByTime(100);
+      fireEvent.blur(row);
+      vi.advanceTimersByTime(1_000);
+      expect(onPrefetchSkill).not.toHaveBeenCalled();
+
+      fireEvent.focus(row);
+      vi.advanceTimersByTime(150);
+      expect(onPrefetchSkill).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows a loading skeleton", () => {
     const markup = render({ skills: [], isLoading: true });
     expect(markup).toContain('role="status"');
@@ -714,7 +831,6 @@ describe("SkillsOverview", () => {
 
   it("shows a recoverable error state with a retry", () => {
     const markup = render({ skills: [], hasError: true, onRetry: () => {} });
-    // Apostrophe is HTML-escaped in static markup, so match the stable fragment.
     expect(markup).toContain("load skills.");
     expect(markup).toContain("Retry");
     expect(markup).toContain('role="alert"');
@@ -751,8 +867,6 @@ describe("SkillsLibrary library detail routing", () => {
     const fetchMock = renderLibrarySkillRoute();
 
     const notFound = await screen.findByText("Skill not found.");
-    // Skill detail-route states use the same detail-width treatment as the
-    // plugin and automation routes rather than a list-shaped empty state.
     expect(notFound.closest("[data-resource-detail-state]")).not.toBeNull();
     expect(screen.queryByText("New bb skill")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -787,12 +901,17 @@ describe("SkillsLibrary registry detail lifecycle", () => {
     const fetchMock = stubRegistryFetch(registrySkill, { list: true });
     const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
     renderDom(
-      <MemoryRouter initialEntries={["/tools/skills"]}>
+      <MemoryRouter initialEntries={["/extensions/skills"]}>
         <QueryClientWrapper>
           <Routes>
-            <Route path="/tools/skills" element={<SkillsLibrary />} />
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
             <Route path="/" element={<LocationStateProbe />} />
           </Routes>
+          <NavigateButton
+            to="/extensions/skills?view=library"
+            label="go-library"
+          />
+          <NavigateButton to="/extensions/skills" label="go-browse" />
         </QueryClientWrapper>
       </MemoryRouter>,
     );
@@ -800,10 +919,7 @@ describe("SkillsLibrary registry detail lifecycle", () => {
     let forkButton = await screen.findByRole("button", {
       name: "Fork Useful skill into a new bb skill",
     });
-    const tabs = screen.getAllByRole("tab");
-    expect(tabs[0]).toBe(screen.getByRole("tab", { name: "Browse" }));
-    expect(tabs[1]).toBe(screen.getByRole("tab", { name: /Library/ }));
-    expect(tabs[0]?.className).toContain("bg-accent");
+    expect(screen.queryByRole("tab")).toBeNull();
     const registryListRequests = () =>
       fetchMock.mock.calls.filter(([input]) =>
         requestPath(input).startsWith("/api/v1/skills-registry?"),
@@ -814,8 +930,11 @@ describe("SkillsLibrary registry detail lifecycle", () => {
     focusManager.setFocused(true);
     await waitFor(() => expect(registryListRequests()).toHaveLength(1));
 
-    fireEvent.click(screen.getByRole("tab", { name: /Library/ }));
-    fireEvent.click(screen.getByRole("tab", { name: "Browse" }));
+    fireEvent.click(screen.getByText("go-library"));
+    expect(
+      await screen.findByRole("textbox", { name: "Search skills" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByText("go-browse"));
     forkButton = await screen.findByRole("button", {
       name: "Fork Useful skill into a new bb skill",
     });
@@ -837,6 +956,94 @@ describe("SkillsLibrary registry detail lifecycle", () => {
         ([input]) => requestPath(input) === "/api/v1/skills-registry/install",
       ),
     ).toBe(false);
+  });
+
+  it("shows the lifetime install count, not the trending window the list ranks by", async () => {
+    const trendingEntry = makeRegistrySkill({ installs: 42, summary: null });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    stubRegistryFetch(trendingEntry, {
+      list: true,
+      entry: makeRegistrySkill({ installs: 9_000 }),
+    });
+    const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
+    renderDom(
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
+        <QueryClientWrapper>
+          <Routes>
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
+          </Routes>
+        </QueryClientWrapper>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByLabelText("9.0K installs")).toBeTruthy();
+    expect(screen.queryByLabelText("42 installs")).toBeNull();
+  });
+
+  it("shows no install count rather than the window count when the entry lookup fails", async () => {
+    const trendingEntry = makeRegistrySkill({ installs: 42, summary: null });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    stubRegistryFetch(trendingEntry, { list: true, entryFails: true });
+    const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
+    renderDom(
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
+        <QueryClientWrapper>
+          <Routes>
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
+          </Routes>
+        </QueryClientWrapper>
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole("button", {
+        name: "View details for Useful skill",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("42 installs")).toBeNull();
+    expect(screen.queryByLabelText(/installs$/)).toBeNull();
+  });
+
+  it("keeps the enriched star count when the entry supplies the install total", async () => {
+    const listed = makeRegistrySkill({
+      installs: 42,
+      summary: null,
+      stars: null,
+    });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = requestPath(input);
+      if (url.startsWith("/api/v1/skills-registry?")) {
+        return Response.json({
+          skills: [listed],
+          pagination: { page: 0, perPage: 24, total: 1, hasMore: false },
+          ranking: "trending",
+        });
+      }
+      if (url === "/api/v1/skills-registry/entries") {
+        return Response.json({
+          entries: [makeRegistrySkill({ installs: 9_000 })],
+        });
+      }
+      if (url.startsWith("/api/v1/skills-registry/repository-stars?")) {
+        return Response.json({ stars: 654 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
+    renderDom(
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
+        <QueryClientWrapper>
+          <Routes>
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
+          </Routes>
+        </QueryClientWrapper>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByLabelText("9.0K installs")).toBeTruthy();
+    expect(await screen.findByLabelText("654 stars")).toBeTruthy();
   });
 
   it("reveals registry cards only after repository stars finish loading", async () => {
@@ -871,6 +1078,7 @@ describe("SkillsLibrary registry detail lifecycle", () => {
               total: 2,
               hasMore: false,
             },
+            ranking: "trending",
           }),
         );
       }
@@ -885,10 +1093,10 @@ describe("SkillsLibrary registry detail lifecycle", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
     renderDom(
-      <MemoryRouter initialEntries={["/tools/skills?view=browse"]}>
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
         <QueryClientWrapper>
           <Routes>
-            <Route path="/tools/skills" element={<SkillsLibrary />} />
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
           </Routes>
         </QueryClientWrapper>
       </MemoryRouter>,
@@ -919,7 +1127,7 @@ describe("SkillsLibrary registry detail lifecycle", () => {
     expect(await screen.findAllByLabelText("27.1K stars")).toHaveLength(2);
   });
 
-  it("reveals each registry card as soon as that card is complete", async () => {
+  it("resolves every card's entry through one batch request", async () => {
     const firstSkill = makeRegistrySkill({
       id: "owner/repo/first-skill",
       skillId: "first-skill",
@@ -932,15 +1140,10 @@ describe("SkillsLibrary registry detail lifecycle", () => {
       name: "Second skill",
       summary: null,
     });
-    const entryResolvers = new Map<string, (response: Response) => void>();
-    const entryResponses = new Map(
-      [firstSkill, secondSkill].map((skill) => [
-        skill.id,
-        new Promise<Response>((resolve) => {
-          entryResolvers.set(skill.id, resolve);
-        }),
-      ]),
-    );
+    let resolveEntries: ((response: Response) => void) | undefined;
+    const entriesResponse = new Promise<Response>((resolve) => {
+      resolveEntries = resolve;
+    });
     vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = requestPath(input);
@@ -954,25 +1157,22 @@ describe("SkillsLibrary registry detail lifecycle", () => {
               total: 2,
               hasMore: false,
             },
+            ranking: "trending",
           }),
         );
       }
-      const entryId = new URL(url, "http://localhost").searchParams.get("id");
-      if (url.startsWith("/api/v1/skills-registry/entry?") && entryId) {
-        return (
-          entryResponses.get(entryId) ??
-          Promise.resolve(new Response(null, { status: 404 }))
-        );
+      if (url === "/api/v1/skills-registry/entries") {
+        return entriesResponse;
       }
       return Promise.resolve(new Response(null, { status: 404 }));
     });
     vi.stubGlobal("fetch", fetchMock);
     const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
     renderDom(
-      <MemoryRouter initialEntries={["/tools/skills?view=browse"]}>
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
         <QueryClientWrapper>
           <Routes>
-            <Route path="/tools/skills" element={<SkillsLibrary />} />
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
           </Routes>
         </QueryClientWrapper>
       </MemoryRouter>,
@@ -980,36 +1180,33 @@ describe("SkillsLibrary registry detail lifecycle", () => {
 
     await waitFor(() => {
       expect(
-        fetchMock.mock.calls.filter(([input]) =>
-          requestPath(input).startsWith("/api/v1/skills-registry/entry?"),
+        fetchMock.mock.calls.filter(
+          ([input]) => requestPath(input) === "/api/v1/skills-registry/entries",
         ),
-      ).toHaveLength(2);
+      ).toHaveLength(1);
     });
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        requestPath(input).startsWith("/api/v1/skills-registry/entry?"),
+      ),
+    ).toHaveLength(0);
     expect(screen.queryByText("First skill")).toBeNull();
-    expect(screen.queryByText("Second skill")).toBeNull();
+    expect(
+      screen.getByRole("status", { name: "Loading Second skill" }),
+    ).toBeTruthy();
 
-    entryResolvers.get(firstSkill.id)?.(
+    resolveEntries?.(
       Response.json({
-        ...firstSkill,
-        summary: "First description",
+        entries: [
+          { ...firstSkill, summary: "First description" },
+          { ...secondSkill, summary: "Second description" },
+        ],
       }),
     );
 
     expect(await screen.findByText("First skill")).toBeTruthy();
     expect(screen.getByText("First description")).toBeTruthy();
-    expect(screen.queryByText("Second skill")).toBeNull();
-    expect(
-      screen.getByRole("status", { name: "Loading Second skill" }),
-    ).toBeTruthy();
-
-    entryResolvers.get(secondSkill.id)?.(
-      Response.json({
-        ...secondSkill,
-        summary: "Second description",
-      }),
-    );
-
-    expect(await screen.findByText("Second skill")).toBeTruthy();
+    expect(screen.getByText("Second skill")).toBeTruthy();
     expect(screen.getByText("Second description")).toBeTruthy();
   });
 });
@@ -1019,7 +1216,6 @@ describe("RegistrySkillsBrowsePage", () => {
     const onRetry = vi.fn();
     renderRegistryBrowse({
       skills: [],
-      pagination: { page: 0, perPage: 24, total: 0, hasMore: false },
       hasError: true,
       onRetry,
     });
@@ -1031,8 +1227,7 @@ describe("RegistrySkillsBrowsePage", () => {
     expect(onRetry).toHaveBeenCalledOnce();
   });
 
-  it("renders the authoritative page order, exposes social proof, and pages forward", () => {
-    const onPageChange = vi.fn();
+  it("renders the authoritative page order, exposes social proof, and loads more on scroll", () => {
     const alpha = makeRegistrySkill({
       id: "owner/repo/alpha",
       skillId: "alpha",
@@ -1049,10 +1244,9 @@ describe("RegistrySkillsBrowsePage", () => {
     });
     const onSelect = vi.fn();
     const onFork = vi.fn();
-    renderRegistryBrowse({
+    const { container } = renderRegistryBrowse({
       skills: [alpha, zulu],
-      pagination: { page: 0, perPage: 24, total: 48, hasMore: true },
-      onPageChange,
+      hasMore: true,
       onFork,
       onSelect,
     });
@@ -1060,19 +1254,9 @@ describe("RegistrySkillsBrowsePage", () => {
       screen.getByRole("button", { name: "View details for Alpha" }),
     );
     expect(onSelect).toHaveBeenCalledWith(alpha);
-    expect(screen.getByText("1–2 of 48")).toBeTruthy();
     expect(screen.getByRole("textbox", { name: "Search skills" })).toBeTruthy();
     expect(screen.getByLabelText("10 installs")).toBeTruthy();
-    expect(screen.getByLabelText("100 stars")).toBeTruthy();
-    for (const byline of screen.getAllByText("by owner/repo")) {
-      expect(byline.className).toContain("truncate");
-      expect(byline.parentElement?.className).toContain("items-center");
-      expect(byline.parentElement?.className).toContain("text-xs");
-    }
-    expect(
-      screen.getByLabelText("100 stars").parentElement?.parentElement
-        ?.className,
-    ).toContain("items-center");
+    expect(screen.getAllByText("by owner/repo").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
         name: "Fork Alpha into a new bb skill",
@@ -1092,8 +1276,164 @@ describe("RegistrySkillsBrowsePage", () => {
       alphaTitle.compareDocumentPosition(zuluTitle) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
-    expect(onPageChange).toHaveBeenCalledWith(1);
+    expect(
+      container.querySelector("[data-resource-infinite-sentinel]"),
+    ).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+  });
+
+  it("keeps the list's own count on the all-time ranking", async () => {
+    const listed = makeRegistrySkill({ installs: 42, summary: null });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    stubRegistryFetch(listed, {
+      list: true,
+      ranking: "all-time",
+      entry: makeRegistrySkill({ installs: 9_000 }),
+    });
+    const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
+    renderDom(
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
+        <QueryClientWrapper>
+          <Routes>
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
+          </Routes>
+        </QueryClientWrapper>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByLabelText("42 installs")).toBeTruthy();
+    expect(screen.queryByLabelText("9.0K installs")).toBeNull();
+  });
+});
+
+function stubIntersectionObserver() {
+  const callbacks: IntersectionObserverCallback[] = [];
+  class StubIntersectionObserver {
+    constructor(callback: IntersectionObserverCallback) {
+      callbacks.push(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("IntersectionObserver", StubIntersectionObserver);
+  return () => {
+    for (const callback of [...callbacks]) {
+      callback(
+        [{ isIntersecting: true }] as IntersectionObserverEntry[],
+        {} as IntersectionObserver,
+      );
+    }
+  };
+}
+
+describe("SkillsLibrary registry browse paging", () => {
+  function renderBrowse() {
+    const { wrapper: QueryClientWrapper } = createQueryClientTestHarness();
+    return renderDom(
+      <MemoryRouter initialEntries={["/extensions/skills?view=browse"]}>
+        <QueryClientWrapper>
+          <Routes>
+            <Route path="/extensions/skills" element={<SkillsLibrary />} />
+          </Routes>
+        </QueryClientWrapper>
+      </MemoryRouter>,
+    );
+  }
+
+  it("keeps loaded cards and offers an inline retry when a later page fails", async () => {
+    const alpha = makeRegistrySkill({
+      id: "owner/repo/alpha",
+      skillId: "alpha",
+      name: "Alpha",
+    });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = requestPath(input);
+      if (url.startsWith("/api/v1/skills-registry?")) {
+        const page = new URL(url, window.location.origin).searchParams.get(
+          "page",
+        );
+        if (page === "0") {
+          return Response.json({
+            skills: [alpha],
+            pagination: { page: 0, perPage: 24, total: 48, hasMore: true },
+            ranking: "trending",
+          });
+        }
+        return new Response(null, { status: 503 });
+      }
+      if (url === "/api/v1/skills-registry/entries") {
+        return Response.json({ entries: [alpha] });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const fireSentinel = stubIntersectionObserver();
+    renderBrowse();
+
+    expect(await screen.findByText("Alpha")).toBeTruthy();
+    fireSentinel();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Couldn't load more from skills.sh.");
+    expect(screen.getByText("Alpha")).toBeTruthy();
+
+    const pageTwoCalls = () =>
+      fetchMock.mock.calls.filter(([input]) =>
+        requestPath(input).includes("page=1"),
+      ).length;
+    expect(pageTwoCalls()).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(pageTwoCalls()).toBe(2));
+    expect(screen.getByText("Alpha")).toBeTruthy();
+  });
+
+  it("restarts accumulation instead of mixing rankings when the server falls back", async () => {
+    const alpha = makeRegistrySkill({
+      id: "owner/repo/alpha",
+      skillId: "alpha",
+      name: "Alpha",
+    });
+    const bravo = makeRegistrySkill({
+      id: "owner/repo/bravo",
+      skillId: "bravo",
+      name: "Bravo",
+    });
+    vi.spyOn(sdk.skills, "list").mockResolvedValue({ skills: [] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = requestPath(input);
+      if (url.startsWith("/api/v1/skills-registry?")) {
+        const page = new URL(url, window.location.origin).searchParams.get(
+          "page",
+        );
+        if (page === "0") {
+          return Response.json({
+            skills: [alpha],
+            pagination: { page: 0, perPage: 24, total: 48, hasMore: true },
+            ranking: "trending",
+          });
+        }
+        return Response.json({
+          skills: [bravo],
+          pagination: { page: 1, perPage: 24, total: 48, hasMore: false },
+          ranking: "all-time",
+        });
+      }
+      if (url === "/api/v1/skills-registry/entries") {
+        return Response.json({ entries: [alpha, bravo] });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const fireSentinel = stubIntersectionObserver();
+    renderBrowse();
+
+    expect(await screen.findByText("Alpha")).toBeTruthy();
+    fireSentinel();
+
+    expect(await screen.findByText("Bravo")).toBeTruthy();
+    expect(screen.queryByText("Alpha")).toBeNull();
   });
 });
 
@@ -1204,16 +1544,22 @@ describe("SkillDetailDialogView", () => {
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip.textContent).toContain("Included with");
     expect(tooltip.textContent).toContain(example.tooltipName);
+    const providerIcon = tooltip.querySelector(
+      `[data-provider-icon="${example.providerIcon}"]`,
+    );
+    expect(providerIcon).not.toBeNull();
     expect(
-      tooltip.querySelector(`[data-provider-icon="${example.providerIcon}"]`),
-    ).not.toBeNull();
+      ["flex", "size-3.5", "shrink-0", "items-center", "justify-center"].every(
+        (className) => providerIcon?.classList.contains(className),
+      ),
+    ).toBe(true);
   });
 
   it("labels externally discovered provider skills as imported", async () => {
     const skill = makeSkill({
       name: "code-review",
       provider: "claude-code",
-      scope: "claude-user",
+      scope: "provider-user",
       manageable: true,
     });
     renderSkillDetailDialog(skill, { canEdit: true, canDelete: true });
@@ -1265,9 +1611,6 @@ describe("SkillDetailDialogView", () => {
 
 describe("SkillDetailView registry states", () => {
   it("links to the source and omits social proof", () => {
-    // Fork is the sole registry acquisition action and lives on
-    // RegistrySkillDetailView, so this page renders no acquisition control at
-    // all — only the external source link and the skill body.
     renderDom(
       <SkillDetailView
         leading={<span>Skill</span>}

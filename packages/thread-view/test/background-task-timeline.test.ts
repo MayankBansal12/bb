@@ -36,9 +36,8 @@ function buildTimeline(
     contextWindowEvents: [],
     events,
     options: {
-      includeDebugRawEvents: false,
       includeNestedRows: options.includeNestedRows ?? true,
-      includeProviderUnhandledOperations: false,
+      includeDiagnosticOperations: false,
       isLatestPage: true,
       threadStatus: "idle",
       threadName: "",
@@ -117,12 +116,14 @@ function agentTaskItem(args: {
   taskStatus: ThreadEventBackgroundTaskItem["taskStatus"];
   status: ThreadEventBackgroundTaskItem["status"];
   id?: string;
+  familyId?: string;
   description?: string;
   parentToolCallId?: string;
 }): ThreadEventBackgroundTaskItem {
   return {
     type: "backgroundTask",
     id: args.id ?? "task:agent-1",
+    ...(args.familyId ? { familyId: args.familyId } : {}),
     taskType: "local_agent",
     description: args.description ?? "Map test coverage",
     status: args.status,
@@ -132,6 +133,62 @@ function agentTaskItem(args: {
       ? { parentToolCallId: args.parentToolCallId }
       : {}),
   };
+}
+
+function modelAgentToolCallStarted(seq: number): ThreadEventWithMeta {
+  return withMeta(
+    {
+      type: "item/started",
+      threadId: "thread-1",
+      providerThreadId: "provider-1",
+      scope: turnScope("turn-1"),
+      item: {
+        type: "toolCall",
+        id: "toolu-root-agent",
+        tool: "Agent",
+        arguments: {
+          description: "Inspect the mobile banner",
+          model: "haiku",
+          prompt: "Inspect the mobile banner",
+          subagent_type: "general-purpose",
+        },
+        status: "pending",
+      },
+    },
+    seq,
+  );
+}
+
+function agentTaskStarted(
+  item: ThreadEventBackgroundTaskItem,
+  seq: number,
+): ThreadEventWithMeta {
+  return withMeta(
+    {
+      type: "item/started",
+      threadId: "thread-1",
+      providerThreadId: "provider-1",
+      scope: turnScope("turn-1"),
+      item,
+    },
+    seq,
+  );
+}
+
+function agentTaskCompleted(
+  item: ThreadEventBackgroundTaskItem,
+  seq: number,
+): ThreadEventWithMeta {
+  return withMeta(
+    {
+      type: "item/backgroundTask/completed",
+      threadId: "thread-1",
+      providerThreadId: "provider-1",
+      scope: threadScope(),
+      item,
+    },
+    seq,
+  );
 }
 
 const RUNNING_SNAPSHOT: WorkflowProgressSnapshot = {
@@ -334,10 +391,6 @@ describe("background task timeline projection", () => {
       ),
     ]);
 
-    // The late thread-scoped completion (seq 6) must not stretch turn-1's
-    // source range past turn-2's rows: the server validates turn-summary
-    // expansion against that range and rejects ranges containing other
-    // turns' rows, which would permanently break expanding turn-1.
     const spawningTurnRow = rows.find(
       (row) => row.kind === "turn" && row.turnId === "turn-1",
     );
@@ -346,8 +399,6 @@ describe("background task timeline projection", () => {
       sourceSeqEnd: 3,
     });
 
-    // The workflow row itself stays anchored at its item/started event while
-    // still folding the late terminal payload.
     const workflowRows = findWorkflowRows(rows);
     expect(workflowRows).toHaveLength(1);
     expect(workflowRows[0]).toMatchObject({
@@ -501,8 +552,6 @@ describe("background task timeline projection", () => {
       { includeNestedRows: false, turnMessageDetail: "summary" },
     );
 
-    // A running shell command never hijacks the workflow banner, but it does
-    // drive the independent background-activity card.
     expect(timeline.activeWorkflows).toHaveLength(0);
     expect(timeline.activeBackgroundCommands).toHaveLength(1);
     expect(timeline.activeBackgroundCommands[0]).toMatchObject({
@@ -551,8 +600,6 @@ describe("background task timeline projection", () => {
       { includeNestedRows: false, turnMessageDetail: "summary" },
     );
 
-    // A thread can drive several workflows at once; the banner must surface all
-    // of them rather than collapsing to the most recently started one.
     expect(timeline.activeWorkflows.map((row) => row.workflowName)).toEqual([
       "rfn-visual-identity",
       "rfn-pass-a-balance",
@@ -613,8 +660,6 @@ describe("background task timeline projection", () => {
       { includeNestedRows: false, turnMessageDetail: "summary" },
     );
 
-    // The settled workflow hands off to its timeline row; the still-running
-    // sibling keeps its banner card.
     expect(timeline.activeWorkflows.map((row) => row.workflowName)).toEqual([
       "rfn-pass-a-balance",
     ]);
@@ -684,8 +729,6 @@ describe("background task timeline projection", () => {
       { includeNestedRows: false, turnMessageDetail: "summary" },
     );
 
-    // The workflow drives the workflow banner; non-workflow background tasks
-    // drive the background-activity card, ordered most recently started first.
     expect(timeline.activeWorkflows[0]).toMatchObject({
       taskType: "local_workflow",
     });
@@ -694,6 +737,214 @@ describe("background task timeline projection", () => {
       "task:cmd-late",
       "task:cmd-early",
     ]);
+  });
+
+  it("projects the spawning delegation model onto an active background agent", () => {
+    const timeline = buildTimeline(
+      [
+        turnStarted("turn-1", 1),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: {
+              type: "toolCall",
+              id: "toolu-root-agent",
+              tool: "Agent",
+              arguments: {
+                description: "Inspect the mobile banner",
+                model: "haiku",
+                prompt: "Inspect the mobile banner",
+                subagent_type: "general-purpose",
+              },
+              status: "pending",
+            },
+          },
+          2,
+        ),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: agentTaskItem({
+              status: "pending",
+              taskStatus: "running",
+              description: "Inspect the mobile banner",
+              parentToolCallId: "toolu-root-agent",
+            }),
+          },
+          3,
+        ),
+      ],
+      { includeNestedRows: false, turnMessageDetail: "summary" },
+    );
+
+    expect(timeline.activeBackgroundCommands).toMatchObject([
+      {
+        description: "Inspect the mobile banner",
+        model: null,
+        taskType: "local_agent",
+      },
+    ]);
+  });
+
+  it("carries the model into a restarted agent generation without a parent call", () => {
+    const timeline = buildTimeline(
+      [
+        turnStarted("turn-1", 1),
+        modelAgentToolCallStarted(2),
+        agentTaskStarted(
+          agentTaskItem({
+            status: "pending",
+            taskStatus: "running",
+            id: "task:agent-restart",
+            description: "Inspect the mobile banner",
+            parentToolCallId: "toolu-root-agent",
+          }),
+          3,
+        ),
+        agentTaskCompleted(
+          agentTaskItem({
+            status: "completed",
+            taskStatus: "completed",
+            id: "task:agent-restart",
+            description: "Inspect the mobile banner",
+            parentToolCallId: "toolu-root-agent",
+          }),
+          4,
+        ),
+        agentTaskStarted(
+          agentTaskItem({
+            status: "pending",
+            taskStatus: "running",
+            id: "task:agent-restart#2",
+            description: "Inspect the mobile banner",
+          }),
+          5,
+        ),
+      ],
+      { includeNestedRows: false, turnMessageDetail: "summary" },
+    );
+
+    expect(timeline.activeBackgroundCommands).toMatchObject([
+      {
+        itemId: "task:agent-restart#2",
+        model: null,
+        status: "pending",
+        taskType: "local_agent",
+      },
+    ]);
+  });
+
+  it("correlates restarted generations through the explicit familyId under assembler-minted item ids", () => {
+    const timeline = buildTimeline(
+      [
+        turnStarted("turn-1", 1),
+        modelAgentToolCallStarted(2),
+        agentTaskStarted(
+          agentTaskItem({
+            status: "pending",
+            taskStatus: "running",
+            id: "abc-i7",
+            familyId: "agent-restart",
+            description: "Inspect the mobile banner",
+            parentToolCallId: "toolu-root-agent",
+          }),
+          3,
+        ),
+        agentTaskCompleted(
+          agentTaskItem({
+            status: "completed",
+            taskStatus: "completed",
+            id: "abc-i7",
+            familyId: "agent-restart",
+            description: "Inspect the mobile banner",
+            parentToolCallId: "toolu-root-agent",
+          }),
+          4,
+        ),
+        agentTaskStarted(
+          agentTaskItem({
+            status: "pending",
+            taskStatus: "running",
+            id: "abc-i9",
+            familyId: "agent-restart",
+            description: "Inspect the mobile banner",
+          }),
+          5,
+        ),
+      ],
+      { includeNestedRows: false, turnMessageDetail: "summary" },
+    );
+
+    expect(timeline.activeBackgroundCommands).toMatchObject([
+      {
+        itemId: "abc-i9",
+        model: null,
+        status: "pending",
+        taskType: "local_agent",
+      },
+    ]);
+  });
+
+  it("preserves the model on a completed background-agent row", () => {
+    const timeline = buildTimeline([
+      turnStarted("turn-1", 1),
+      modelAgentToolCallStarted(2),
+      agentTaskStarted(
+        agentTaskItem({
+          status: "pending",
+          taskStatus: "running",
+          id: "task:agent-restart",
+          description: "Inspect the mobile banner",
+          parentToolCallId: "toolu-root-agent",
+        }),
+        3,
+      ),
+      agentTaskCompleted(
+        agentTaskItem({
+          status: "completed",
+          taskStatus: "completed",
+          id: "task:agent-restart",
+          description: "Inspect the mobile banner",
+          parentToolCallId: "toolu-root-agent",
+        }),
+        4,
+      ),
+      agentTaskStarted(
+        agentTaskItem({
+          status: "pending",
+          taskStatus: "running",
+          id: "task:agent-restart#2",
+          description: "Inspect the mobile banner",
+        }),
+        5,
+      ),
+      agentTaskCompleted(
+        agentTaskItem({
+          status: "completed",
+          taskStatus: "completed",
+          id: "task:agent-restart#2",
+          description: "Inspect the mobile banner",
+        }),
+        6,
+      ),
+    ]);
+
+    expect(
+      findWorkflowRows(timeline.rows).find(
+        (row) => row.itemId === "task:agent-restart#2",
+      ),
+    ).toMatchObject({
+      model: null,
+      status: "completed",
+      taskType: "local_agent",
+    });
+    expect(timeline.activeBackgroundCommands).toHaveLength(0);
   });
 
   it("excludes background tasks spawned inside a background agent from the parent active list", () => {
@@ -770,47 +1021,107 @@ describe("background task timeline projection", () => {
           5,
         ),
         turnCompleted("turn-1", 6),
-        turnStarted("turn-2", 7),
-        withMeta(
-          {
-            type: "item/backgroundTask/completed",
-            threadId: "thread-1",
-            providerThreadId: "provider-1",
-            scope: threadScope(),
-            item: bashTaskItem({
-              status: "completed",
-              taskStatus: "completed",
-              id: "task:nested-bash",
-              description: "Wait 10 seconds",
-              parentToolCallId: "toolu-nested-bash",
-              summary: "Wait 10 seconds",
-            }),
-          },
-          8,
-        ),
-        withMeta(
-          {
-            type: "item/completed",
-            threadId: "thread-1",
-            providerThreadId: "provider-1",
-            scope: turnScope("turn-2"),
-            item: {
-              type: "toolCall",
-              id: "toolu-nested-bash",
-              tool: "unknown",
-              status: "completed",
-              result: "(Bash completed with no output)",
-              parentToolCallId: "toolu-root-agent",
-            },
-          },
-          9,
-        ),
       ],
       { includeNestedRows: false, turnMessageDetail: "summary" },
     );
 
     expect(timeline.activeBackgroundCommands.map((row) => row.itemId)).toEqual([
       "task:root-agent",
+    ]);
+  });
+
+  it("surfaces a nested command after its owning background agent settles", () => {
+    const timeline = buildTimeline(
+      [
+        turnStarted("turn-1", 1),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: {
+              type: "toolCall",
+              id: "toolu-root-agent",
+              tool: "Agent",
+              status: "pending",
+            },
+          },
+          2,
+        ),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: agentTaskItem({
+              status: "pending",
+              taskStatus: "running",
+              id: "task:root-agent",
+              description: "Run the tests",
+              parentToolCallId: "toolu-root-agent",
+            }),
+          },
+          3,
+        ),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: {
+              type: "commandExecution",
+              id: "toolu-nested-wait",
+              command: "until tests-finish; do sleep 5; done",
+              cwd: "/tmp",
+              status: "pending",
+              approvalStatus: null,
+              parentToolCallId: "toolu-root-agent",
+            },
+          },
+          4,
+        ),
+        withMeta(
+          {
+            type: "item/started",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: turnScope("turn-1"),
+            item: bashTaskItem({
+              status: "pending",
+              taskStatus: "running",
+              id: "task:nested-wait",
+              description: "Wait for tests",
+              parentToolCallId: "toolu-nested-wait",
+            }),
+          },
+          5,
+        ),
+        withMeta(
+          {
+            type: "item/backgroundTask/completed",
+            threadId: "thread-1",
+            providerThreadId: "provider-1",
+            scope: threadScope(),
+            item: agentTaskItem({
+              status: "completed",
+              taskStatus: "completed",
+              id: "task:root-agent",
+              description: "Run the tests",
+              parentToolCallId: "toolu-root-agent",
+            }),
+          },
+          6,
+        ),
+        turnCompleted("turn-1", 7),
+      ],
+      { includeNestedRows: false, turnMessageDetail: "summary" },
+    );
+
+    expect(timeline.activeBackgroundCommands.map((row) => row.itemId)).toEqual([
+      "task:nested-wait",
     ]);
   });
 

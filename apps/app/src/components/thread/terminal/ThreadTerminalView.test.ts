@@ -3,17 +3,132 @@ import { Terminal } from "@xterm/xterm";
 import { describe, expect, it, vi } from "vitest";
 import {
   buildTerminalThemeFromCssColors,
+  captureTerminalContextMenuState,
   decodeTerminalOutputBytes,
   encodeTerminalInputChunks,
+  focusTerminalFromTouchRelease,
   forwardTerminalData,
   loadOptionalTerminalWebglAddon,
   loadTerminalWebglRenderer,
   shouldFocusTerminalAfterAsyncMount,
+  startTerminalTouchFocusGesture,
   TERMINAL_ALLOW_PROPOSED_API,
   TERMINAL_FONT_FAMILY,
   TERMINAL_UNICODE_VERSION,
   writeTerminalOutput,
+  updateTerminalTouchFocusGesture,
 } from "./ThreadTerminalView";
+import {
+  createTerminalOsc8LinkHandler,
+  requestTerminalLinkOpen,
+} from "./terminal-links";
+
+describe("terminal hyperlinks", () => {
+  it("preserves OSC-8 provenance through hover and primary activation", () => {
+    const onActivate = vi.fn();
+    const onHover = vi.fn();
+    const handler = createTerminalOsc8LinkHandler({
+      onActivate,
+      onHover,
+    });
+    const event = { button: 0 } as MouseEvent;
+    const range = {
+      start: { x: 1, y: 1 },
+      end: { x: 1, y: 1 },
+    };
+
+    handler.hover?.(event, "https://example.com/authorize", range);
+    handler.activate(event, "https://example.com/authorize", range);
+    handler.leave?.(event, "https://example.com/authorize", range);
+
+    expect(onActivate).toHaveBeenCalledWith({
+      source: "osc8",
+      uri: "https://example.com/authorize",
+    });
+    expect(onHover).toHaveBeenNthCalledWith(1, {
+      source: "osc8",
+      uri: "https://example.com/authorize",
+    });
+    expect(onHover).toHaveBeenNthCalledWith(2, null);
+  });
+
+  it("does not activate OSC-8 links from a secondary click", () => {
+    const onActivate = vi.fn();
+    const handler = createTerminalOsc8LinkHandler({
+      onActivate,
+      onHover: vi.fn(),
+    });
+    const range = {
+      start: { x: 1, y: 1 },
+      end: { x: 1, y: 1 },
+    };
+
+    handler.activate(
+      { button: 2 } as MouseEvent,
+      "https://example.com/right-click",
+      range,
+    );
+
+    expect(onActivate).not.toHaveBeenCalled();
+  });
+
+  it("confirms concealed targets and directly opens detected URLs", () => {
+    const openLink = vi.fn();
+    const requestConfirmation = vi.fn();
+
+    requestTerminalLinkOpen({
+      openLink,
+      requestConfirmation,
+      target: { source: "osc8", uri: "https://example.com/concealed" },
+    });
+    requestTerminalLinkOpen({
+      openLink,
+      requestConfirmation,
+      target: {
+        source: "detected-url",
+        uri: "https://example.com/visible",
+      },
+    });
+
+    expect(requestConfirmation).toHaveBeenCalledOnce();
+    expect(requestConfirmation).toHaveBeenCalledWith({
+      source: "osc8",
+      uri: "https://example.com/concealed",
+    });
+    expect(openLink).toHaveBeenCalledOnce();
+    expect(openLink).toHaveBeenCalledWith("https://example.com/visible");
+  });
+
+  it("preserves link actions while copying the exact xterm selection", () => {
+    const getSelection = vi.fn(() => "  wrapped terminal selection\n");
+    const link = {
+      source: "detected-url" as const,
+      uri: "https://example.com/visible",
+    };
+
+    expect(
+      captureTerminalContextMenuState({
+        link,
+        terminal: { getSelection },
+      }),
+    ).toEqual({
+      link,
+      selectionText: "  wrapped terminal selection\n",
+    });
+    expect(getSelection).toHaveBeenCalledOnce();
+  });
+});
+
+function startTouchFocusGesture() {
+  const gesture = startTerminalTouchFocusGesture(
+    [{ identifier: 1, x: 40, y: 80 }],
+    100,
+  );
+  if (gesture === null) {
+    throw new Error("Expected one touch to start a focus gesture");
+  }
+  return gesture;
+}
 
 describe("terminal async mount focus", () => {
   it("preserves focus that moved to the composer while xterm loaded", () => {
@@ -80,6 +195,65 @@ describe("terminal async mount focus", () => {
         isPanelOpen: false,
       }),
     ).toBe(false);
+  });
+});
+
+describe("terminal touch focus", () => {
+  it("focuses the terminal after a tap", () => {
+    const focus = vi.fn();
+
+    expect(
+      focusTerminalFromTouchRelease({
+        changedTouches: [{ identifier: 1, x: 43, y: 84 }],
+        focus,
+        gesture: startTouchFocusGesture(),
+        releasedAt: 200,
+        remainingTouchCount: 0,
+      }),
+    ).toBe(true);
+    expect(focus).toHaveBeenCalledOnce();
+  });
+
+  it("does not focus after a drag returns near its start", () => {
+    const focus = vi.fn();
+    const gesture = updateTerminalTouchFocusGesture(startTouchFocusGesture(), [
+      { identifier: 1, x: 40, y: 120 },
+    ]);
+
+    expect(
+      focusTerminalFromTouchRelease({
+        changedTouches: [{ identifier: 1, x: 40, y: 81 }],
+        focus,
+        gesture,
+        releasedAt: 200,
+        remainingTouchCount: 0,
+      }),
+    ).toBe(false);
+    expect(focus).not.toHaveBeenCalled();
+  });
+
+  it("does not focus after a long press", () => {
+    const focus = vi.fn();
+
+    expect(
+      focusTerminalFromTouchRelease({
+        changedTouches: [{ identifier: 1, x: 40, y: 80 }],
+        focus,
+        gesture: startTouchFocusGesture(),
+        releasedAt: 800,
+        remainingTouchCount: 0,
+      }),
+    ).toBe(false);
+    expect(focus).not.toHaveBeenCalled();
+  });
+
+  it("invalidates the gesture when another touch starts", () => {
+    expect(
+      updateTerminalTouchFocusGesture(startTouchFocusGesture(), [
+        { identifier: 1, x: 40, y: 80 },
+        { identifier: 2, x: 80, y: 80 },
+      ]),
+    ).toBeNull();
   });
 });
 

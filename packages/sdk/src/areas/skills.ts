@@ -1,5 +1,7 @@
 import {
   registrySkillDetailSchema,
+  registrySkillEntriesRequestSchema,
+  registrySkillEntriesResponseSchema,
   registrySkillInstallRequestSchema,
   registrySkillInstallResponseSchema,
   registryRepositoryStarsSchema,
@@ -9,6 +11,7 @@ import {
   type RegistryRepositoryStars,
   type RegistrySkill,
   type RegistrySkillDetail,
+  type RegistrySkillEntriesResponse,
   type RegistrySkillInstallResponse,
   type RegistrySkillsPage,
   type SkillContentResponse,
@@ -44,11 +47,6 @@ export interface SkillDeleteArgs extends SkillWorkspaceArgs {
   skillId: string;
 }
 
-/**
- * Registry calls proxy out to skills.sh and GitHub, and the browse grid fans
- * out one per card. Callers pass their query's AbortSignal so abandoning a
- * page cancels its requests instead of leaving them in flight.
- */
 export interface AbortableArgs {
   signal?: AbortSignal;
 }
@@ -63,6 +61,10 @@ export interface RegistrySkillIdArgs extends AbortableArgs {
   registrySkillId: string;
 }
 
+export interface RegistrySkillEntriesArgs extends AbortableArgs {
+  registrySkillIds: readonly string[];
+}
+
 export interface RegistrySkillSourceArgs extends AbortableArgs {
   source: string;
   skillId: string;
@@ -72,16 +74,15 @@ export interface RegistryRepositoryArgs extends AbortableArgs {
   source: string;
 }
 
-/**
- * Install is a mutation and deliberately takes no signal: its body is parsed
- * with a strict schema, so an extra key would throw at runtime.
- */
 export interface RegistrySkillInstallArgs {
   registrySkillId: string;
 }
 
 export interface SkillsRegistryArea {
   detail(args: RegistrySkillSourceArgs): Promise<RegistrySkillDetail>;
+  entries(
+    args: RegistrySkillEntriesArgs,
+  ): Promise<RegistrySkillEntriesResponse>;
   get(args: RegistrySkillIdArgs): Promise<RegistrySkill>;
   install(
     args: RegistrySkillInstallArgs,
@@ -128,6 +129,21 @@ export function createSkillsArea(args: CreateSdkAreaArgs): SkillsArea {
         `/api/v1/skills-registry/detail?${query.toString()}`,
         registrySkillDetailSchema,
         { signal: input.signal },
+      );
+    },
+    async entries(input) {
+      const body = registrySkillEntriesRequestSchema.parse({
+        ids: [...input.registrySkillIds],
+      });
+      return requestParsed(
+        "/api/v1/skills-registry/entries",
+        registrySkillEntriesResponseSchema,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: input.signal,
+        },
       );
     },
     async get(input) {

@@ -16,7 +16,7 @@ import {
 import { SidebarHistoryNavigationControls } from "@/components/sidebar/SidebarHistoryNavigationControls";
 import { PROJECT_LIST_ACTION_BUTTON_CLASS } from "@/components/sidebar/ProjectList";
 import { SIDEBAR_STANDARD_ROW_PADDING_CLASS } from "@/components/sidebar/sidebarRowClasses";
-import { CHROME_SECTION_LABEL_CLASS } from "@/components/ui/chromeStyleTokens";
+import { CHROME_SECTION_LABEL_CLASS } from "@bb/shared-ui/chrome-style-tokens";
 import {
   CHROME_ROW_CLASS,
   getBbDesktopInfo,
@@ -32,13 +32,11 @@ export function SectionSidebarIcon({ name }: { name: IconName }) {
 export function SectionSidebarRow({
   active,
   children,
-  current = "page",
   label,
   to,
 }: {
   active: boolean;
   children: ReactNode;
-  current?: "location" | "page";
   label: string;
   to: string;
 }) {
@@ -57,11 +55,74 @@ export function SectionSidebarRow({
       <Link
         to={to}
         onClick={closeOnMobile}
-        aria-current={active ? current : undefined}
+        aria-current={active ? "page" : undefined}
       >
         {children}
         <span className="min-w-0 flex-1 truncate text-left">{label}</span>
       </Link>
+    </Button>
+  );
+}
+
+export function SectionSidebarActionRow({
+  children,
+  label,
+  onClick,
+  testId,
+}: {
+  children: ReactNode;
+  label: string;
+  onClick: () => void;
+  testId?: string;
+}) {
+  const closeOnMobile = useCloseMobileSidebar();
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      data-testid={testId}
+      className={cn(PROJECT_LIST_ACTION_BUTTON_CLASS, "w-full")}
+      onClick={() => {
+        closeOnMobile();
+        onClick();
+      }}
+    >
+      {children}
+      <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+    </Button>
+  );
+}
+
+export function SectionSidebarDisclosureRow({
+  expanded,
+  label,
+  onToggle,
+}: {
+  expanded: boolean;
+  label: string;
+  onToggle: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant="ghost"
+      aria-expanded={expanded}
+      className={cn(
+        PROJECT_LIST_ACTION_BUTTON_CLASS,
+        "w-full text-subtle-foreground/75",
+      )}
+      onClick={onToggle}
+    >
+      <Icon
+        name="ChevronRight"
+        className={cn(
+          "size-3 shrink-0 transition-transform duration-150",
+          expanded && "rotate-90",
+        )}
+        aria-hidden="true"
+      />
+      <span className="min-w-0 flex-1 truncate text-left">{label}</span>
     </Button>
   );
 }
@@ -79,12 +140,12 @@ export function SectionSidebarLabel({ children }: { children: ReactNode }) {
   );
 }
 
-/** Shared shell for focused app sections such as Settings and Tools. */
 export function SectionSidebar({
   backLabel,
   backTo,
   children,
   isResizing,
+  mobileHosted = false,
   onResizeMouseDown,
   showTopReserve,
   testIdPrefix,
@@ -93,6 +154,7 @@ export function SectionSidebar({
   backTo: string;
   children: ReactNode;
   isResizing: boolean;
+  mobileHosted?: boolean;
   onResizeMouseDown: (event: ReactMouseEvent<HTMLDivElement>) => void;
   showTopReserve: boolean;
   testIdPrefix: string;
@@ -101,8 +163,8 @@ export function SectionSidebar({
   const [desktopInfo] = useState(getBbDesktopInfo);
   const usesDesktopChrome = shouldUseMacosDesktopChrome(desktopInfo);
 
-  return (
-    <Sidebar>
+  const body = (
+    <>
       {showTopReserve ? (
         <div
           data-testid={`${testIdPrefix}-sidebar-top-reserve-row`}
@@ -143,6 +205,19 @@ export function SectionSidebar({
         )}
         onMouseDown={onResizeMouseDown}
       />
-    </Sidebar>
+    </>
   );
+
+  if (mobileHosted) {
+    return (
+      <div
+        data-testid={`${testIdPrefix}-sidebar-body`}
+        className="flex min-h-0 flex-1 flex-col"
+      >
+        {body}
+      </div>
+    );
+  }
+
+  return <Sidebar>{body}</Sidebar>;
 }

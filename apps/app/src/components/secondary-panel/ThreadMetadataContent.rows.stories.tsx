@@ -44,10 +44,6 @@ function RowStage({ children }: { children: ReactNode }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Parent selector row.
-// ---------------------------------------------------------------------------
-
 export function ParentSelector() {
   return (
     <StoryCard>
@@ -56,6 +52,7 @@ export function ParentSelector() {
           <ParentSelectorRow
             thread={makeThread()}
             projectId={baseProps.projectId}
+            parentThreadProjectId={null}
             parentThreadDisplayName={null}
             parentThreads={parentThreads}
             canAssignToParent
@@ -74,6 +71,7 @@ export function ParentSelector() {
           <ParentSelectorRow
             thread={makeThread()}
             projectId={baseProps.projectId}
+            parentThreadProjectId={null}
             parentThreadDisplayName={null}
             parentThreads={[]}
             canAssignToParent={false}
@@ -92,6 +90,7 @@ export function ParentSelector() {
           <ParentSelectorRow
             thread={makeThread({ parentThreadId: "thr_codex_parent" })}
             projectId={baseProps.projectId}
+            parentThreadProjectId={null}
             parentThreadDisplayName="Codex Parent"
             parentThreads={parentThreads}
             canAssignToParent={false}
@@ -110,6 +109,7 @@ export function ParentSelector() {
           <ParentSelectorRow
             thread={makeThread()}
             projectId={baseProps.projectId}
+            parentThreadProjectId={null}
             parentThreadDisplayName={null}
             parentThreads={parentThreads}
             canAssignToParent
@@ -128,10 +128,6 @@ export function ParentSelector() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Environment — the "Environment" row.
-// ---------------------------------------------------------------------------
-
 export function Environment() {
   return (
     <StoryCard>
@@ -148,10 +144,7 @@ export function Environment() {
         <RowStage>
           <EnvironmentRow
             thread={makeThread()}
-            environment={makeEnvironment({
-              isWorktree: false,
-              workspaceProvisionType: "unmanaged",
-            })}
+            environment={makeEnvironment({})}
             environmentDisplayHost={localEnvironmentDisplayHost}
           />
         </RowStage>
@@ -160,10 +153,7 @@ export function Environment() {
         <RowStage>
           <EnvironmentRow
             thread={makeThread()}
-            environment={makeEnvironment({
-              isWorktree: false,
-              workspaceProvisionType: "unmanaged",
-            })}
+            environment={makeEnvironment({})}
             environmentDisplayHost={remoteEnvironmentDisplayHost}
           />
         </RowStage>
@@ -174,8 +164,6 @@ export function Environment() {
             thread={makeThread()}
             environment={makeEnvironment({
               status: "provisioning",
-              isWorktree: false,
-              workspaceProvisionType: "managed-worktree",
             })}
             environmentDisplayHost={localEnvironmentDisplayHost}
           />
@@ -184,10 +172,6 @@ export function Environment() {
     </StoryCard>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Directory row.
-// ---------------------------------------------------------------------------
 
 export function WorkspacePath() {
   return (
@@ -215,8 +199,6 @@ export function WorkspacePath() {
           <WorkspacePathRow
             environment={makeEnvironment({
               path: "/srv/repos/bb-linked-worktree",
-              managed: false,
-              workspaceProvisionType: "unmanaged",
             })}
           />
         </RowStage>
@@ -226,8 +208,6 @@ export function WorkspacePath() {
           <WorkspacePathRow
             environment={makeEnvironment({
               path: "/Users/michael/Projects/bb",
-              isWorktree: false,
-              workspaceProvisionType: "personal",
             })}
           />
         </RowStage>
@@ -236,25 +216,17 @@ export function WorkspacePath() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Branch + merge base.
-// ---------------------------------------------------------------------------
-
 export function Branch() {
   return (
     <StoryCard>
       <StoryRow label="feature branch">
         <RowStage>
-          <BranchRow
-            thread={makeThread()}
-            workspaceStatus={makeWorkspaceStatus()}
-          />
+          <BranchRow workspaceStatus={makeWorkspaceStatus()} />
         </RowStage>
       </StoryRow>
       <StoryRow label="long branch">
         <RowStage>
           <BranchRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus({
               checkout: {
                 kind: "branch",
@@ -274,7 +246,6 @@ export function Branch() {
       <StoryRow label="detached checkout">
         <RowStage>
           <BranchRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus({
               checkout: {
                 kind: "detached",
@@ -298,7 +269,6 @@ export function MergeBase() {
       <StoryRow label="feature branch">
         <RowStage>
           <MergeBaseRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus()}
             selectedMergeBaseBranch={undefined}
             mergeBaseBranchOptions={["main", "develop", "release/2026-04"]}
@@ -310,7 +280,6 @@ export function MergeBase() {
       <StoryRow label="loading candidates">
         <RowStage>
           <MergeBaseRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus()}
             selectedMergeBaseBranch={undefined}
             mergeBaseBranchOptions={undefined}
@@ -322,7 +291,6 @@ export function MergeBase() {
       <StoryRow label="picker open">
         <RowStage>
           <MergeBaseRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus()}
             selectedMergeBaseBranch={undefined}
             mergeBaseBranchOptions={["main", "develop", "release/2026-04"]}
@@ -335,11 +303,6 @@ export function MergeBase() {
     </StoryCard>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Pull request — PR state and check status are separate. "Open" does not mean
-// ready to merge; the checks/review/mergeability summary determines that.
-// ---------------------------------------------------------------------------
 
 export function PullRequest() {
   const readyPullRequest = makePullRequest();
@@ -605,10 +568,6 @@ export function PullRequest() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Git status — permutations of the "Git status" row.
-// ---------------------------------------------------------------------------
-
 export function GitStatus() {
   return (
     <StoryCard>
@@ -634,6 +593,7 @@ export function GitStatus() {
                 state: "dirty_uncommitted",
                 insertions: 47,
                 deletions: 21,
+                lineStatsComplete: true,
                 files: [
                   {
                     path: "apps/app/src/components/sidebar/ProjectRow.tsx",
@@ -676,6 +636,7 @@ export function GitStatus() {
                 commits: [],
                 insertions: 0,
                 deletions: 0,
+                lineStatsComplete: true,
                 files: [],
               },
             })}
@@ -699,6 +660,7 @@ export function GitStatus() {
                 commits: [],
                 insertions: 0,
                 deletions: 0,
+                lineStatsComplete: true,
                 files: [],
               },
             })}
@@ -722,6 +684,7 @@ export function GitStatus() {
                 commits: [],
                 insertions: 0,
                 deletions: 0,
+                lineStatsComplete: true,
                 files: [],
               },
             })}
@@ -741,6 +704,7 @@ export function GitStatus() {
                 state: "untracked",
                 insertions: 0,
                 deletions: 0,
+                lineStatsComplete: false,
                 files: [
                   {
                     path: "scratch.md",
@@ -794,10 +758,6 @@ export function GitStatus() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Archived + Changed files — small lifecycle/diff rows.
-// ---------------------------------------------------------------------------
-
 export function Archived() {
   return (
     <StoryCard>
@@ -809,11 +769,6 @@ export function Archived() {
     </StoryCard>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Commits ahead of the merge base. Hidden entirely when nothing is ahead;
-// truncates with "Show N more" when the list is long.
-// ---------------------------------------------------------------------------
 
 const aheadCommits = Array.from({ length: 7 }, (_, index) => ({
   sha: `${index}`.padEnd(40, "0"),
@@ -842,6 +797,7 @@ export function Commits() {
                 commits: aheadCommits,
                 insertions: 0,
                 deletions: 0,
+                lineStatsComplete: true,
                 files: [],
               },
             })}
@@ -867,13 +823,13 @@ export function ChangedFiles() {
       <StoryRow label="uncommitted">
         <RowStage>
           <ChangedFilesRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus({
               workingTree: {
                 hasUncommittedChanges: true,
                 state: "dirty_uncommitted",
                 insertions: 47,
                 deletions: 21,
+                lineStatsComplete: true,
                 files: [
                   {
                     path: "apps/app/src/components/sidebar/ProjectRow.tsx",
@@ -903,7 +859,6 @@ export function ChangedFiles() {
       <StoryRow label="committed, not merged">
         <RowStage>
           <ChangedFilesRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus({
               mergeBase: {
                 mergeBaseBranch: "main",
@@ -914,6 +869,7 @@ export function ChangedFiles() {
                 commits: [],
                 insertions: 110,
                 deletions: 24,
+                lineStatsComplete: true,
                 files: [
                   {
                     path: "apps/app/src/components/right-panel/ThreadMetadataContent.stories.tsx",
@@ -937,13 +893,13 @@ export function ChangedFiles() {
       <StoryRow label="uncommitted + committed">
         <RowStage>
           <ChangedFilesRow
-            thread={makeThread()}
             workspaceStatus={makeWorkspaceStatus({
               workingTree: {
                 hasUncommittedChanges: true,
                 state: "dirty_and_committed_unmerged",
                 insertions: 47,
                 deletions: 21,
+                lineStatsComplete: true,
                 files: [
                   {
                     path: "apps/app/src/components/sidebar/ProjectRow.tsx",
@@ -974,6 +930,7 @@ export function ChangedFiles() {
                 commits: [],
                 insertions: 110,
                 deletions: 24,
+                lineStatsComplete: true,
                 files: [
                   {
                     path: "apps/app/src/components/right-panel/ThreadMetadataContent.stories.tsx",

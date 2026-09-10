@@ -1,11 +1,14 @@
+import { type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
-  type CSSProperties,
-  type MouseEvent as ReactMouseEvent,
-  type Ref,
-  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
 } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAtom, useStore } from "jotai";
+import { flushSync } from "react-dom";
+import { atom, useAtom, useAtomValue, useStore } from "jotai";
 import { atomWithStorage } from "jotai/utils";
 import { Link, matchPath, useLocation, useNavigate } from "react-router-dom";
 import type { ProjectResponse } from "@bb/server-contract";
@@ -16,11 +19,16 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar.js";
-import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
+import {
+  ThreadTitleMentionResourcesProvider,
+  useSidebarThreadTitleMentionResources,
+} from "@/components/thread/ThreadTitleMentions";
 import { AppCommandShortcutHint } from "@/components/commands/AppCommandShortcutHint";
-import { ToolsHubExperimentProvider } from "@/components/tools/tools-experiment-context";
+import { CommandPalette } from "@/components/commands/CommandPalette";
+import { NotificationCenter } from "@/components/notifications/NotificationCenter";
 import {
   resolveAutomationBreadcrumbs,
+  resolveToolsAreaHeaderMeta,
   resolveToolsBreadcrumbs,
 } from "@/components/tools/tools-navigation";
 import { AppBreadcrumbs } from "./AppBreadcrumbs";
@@ -37,8 +45,12 @@ import {
 } from "@/hooks/queries/thread-queries";
 import { useRouteState } from "@/hooks/useRouteState";
 import { getThreadDisplayTitle } from "@/lib/thread-title";
-import { applyResizeCursor, clearResizeCursor } from "@/lib/resizeCursor";
 import { cn } from "@bb/shared-ui/lib/utils";
+import { APP_OVERLAY_LAYER } from "@/components/ui/app-overlay-layers";
+import {
+  getCompactSecondaryPanelPresentation,
+  subscribeCompactSecondaryPanelShelfShowing,
+} from "@/components/ui/secondary-panel-shelf-visibility";
 import { ProjectPathDialog } from "@/components/dialogs/ProjectPathDialog";
 import { ProjectActionsMenu } from "@/components/project/ProjectActionsMenu";
 import { ProjectActionsProvider } from "@/components/project/ProjectActionsProvider";
@@ -46,8 +58,13 @@ import {
   PluginPanelHeaderActions,
   PluginPanelHeaderCenter,
 } from "@/components/plugin/PluginPanelHeader";
+import { PluginAppOverlays } from "@/components/plugin/PluginAppOverlays";
 import { ThreadActionsProvider } from "@/components/thread/ThreadActionsProvider";
-import { usePluginSlots, type PluginNavPanelSlot } from "@/lib/plugin-slots";
+import {
+  usePluginNavPanelChrome,
+  type PluginNavPanelChrome,
+} from "@/lib/plugin-nav-panel-chrome";
+import type { PluginNavPanelSlot } from "@/lib/plugin-slots";
 import { createLocalStorageSyncStorage } from "@/lib/browser-storage";
 import {
   BROWSER_SIDEBAR_TRIGGER_INSET_CLASS,
@@ -61,9 +78,10 @@ import {
   shouldUseMacosDesktopChrome,
 } from "@/lib/bb-desktop";
 import { useDesktopWindowState } from "@/hooks/useDesktopWindowState";
+import { useServerDaemonLogsCommand } from "@/hooks/useServerDaemonLogsCommand";
 import {
   getLegacyProjectComposeRoutePath,
-  getProjectSettingsRoutePath,
+  getSettingsProjectRoutePath,
   getRootComposeRoutePath,
   getThreadRoutePath,
   isProjectlessProjectId,
@@ -90,10 +108,9 @@ import { wsManager } from "@/lib/ws";
 import { splitLayoutAtom } from "@/lib/split-layout/atoms";
 import { findPaneByThread } from "@/lib/split-layout";
 import { applyThreadOpenToLayout } from "@/views/thread-detail/splitThreadNavigation";
-import { useThreadSplitsEnabled } from "@/hooks/useThreadSplitsEnabled";
-import { useSplitWorkspaceActive } from "@/hooks/useSplitWorkspaceActive";
 import { useAppSettingsRouteMemory } from "@/hooks/useAppSettingsRouteMemory";
-import { useSystemConfig } from "@/hooks/queries/system-queries";
+import { useSetRootComposeProjectId } from "@/lib/root-compose-selection";
+import { BackToAppCommandHandler } from "./BackToAppCommandHandler";
 
 const SIDEBAR_WIDTH_KEY = "bb.sidebar.width";
 const SIDEBAR_OPEN_KEY = "bb.sidebar.open";
@@ -124,12 +141,8 @@ const sidebarWidthAtom = atomWithStorage<number>(
   sidebarWidthStorage,
   { getOnInit: true },
 );
+const sidebarLiveWidthAtom = atom<number | null>(null);
 
-// Held in jotai (rather than as `useState` inside AppLayout) so that toggling
-// the sidebar does not re-render AppLayout — only the small bridge below
-// subscribes. AppLayout's `children` reference stays stable across toggles,
-// so React's element-reference bailout skips re-rendering the entire route
-// subtree (ThreadDetailView, the timeline, etc.).
 const sidebarOpenStorage = createLocalStorageSyncStorage<boolean>({
   parse: (storedValue, initialValue) => {
     if (storedValue === "true") return true;
@@ -146,26 +159,16 @@ const sidebarOpenAtom = atomWithStorage<boolean>(
 );
 
 interface SidebarStateBridgeProps {
-  className?: string;
-  providerRef: Ref<HTMLDivElement>;
-  style: CSSProperties;
   children: ReactNode;
 }
 
 type SidebarResizeMouseEvent = ReactMouseEvent<HTMLDivElement>;
 type SidebarOpenChangeHandler = (open: boolean) => void;
 
-type SidebarProviderStyle = CSSProperties & {
-  "--sidebar-width": string;
-};
-
-function SidebarStateBridge({
-  className,
-  providerRef,
-  style,
-  children,
-}: SidebarStateBridgeProps) {
+function SidebarStateBridge({ children }: SidebarStateBridgeProps) {
   const [open, setOpen] = useAtom(sidebarOpenAtom);
+  const sidebarWidth = useAtomValue(sidebarWidthAtom);
+  const sidebarLiveWidth = useAtomValue(sidebarLiveWidthAtom);
   const handleOpenChange = useCallback<SidebarOpenChangeHandler>(
     (nextOpen) => {
       setOpen(nextOpen);
@@ -179,9 +182,7 @@ function SidebarStateBridge({
   });
   return (
     <SidebarProvider
-      ref={providerRef}
-      style={style}
-      className={className}
+      width={`${sidebarLiveWidth ?? sidebarWidth}px`}
       data-testid="app-layout-root"
       open={open}
       onOpenChange={handleOpenChange}
@@ -193,8 +194,6 @@ function SidebarStateBridge({
 
 function resetSidebarResizeDocumentState(): void {
   document.body.classList.remove("sidebar-resizing");
-  clearResizeCursor();
-  document.body.style.userSelect = "";
 }
 
 interface SidebarTriggerOverlayProps {
@@ -202,26 +201,20 @@ interface SidebarTriggerOverlayProps {
   usesDesktopChrome: boolean;
 }
 
-/**
- * Sidebar toggle pinned at the app's top-left, rendered once at the layout root
- * — outside the sliding sidebar panel and the content inset — so it holds a
- * constant position while the sidebar animates in/out behind it, instead of
- * riding whichever container would otherwise host it. The collapsed page header
- * reserves its footprint as animated padding (see AppPageHeader), so toggling
- * slides the header content smoothly past it rather than snapping around a
- * toggle that mounts/unmounts in the header.
- *
- * Desktop chrome keeps the strip a window-drag region; only the button itself
- * is no-drag, so the title strip above and below the (shorter) button stays
- * draggable rather than becoming an oversized dead zone. When macOS traffic
- * lights are visible it offsets past them; in fullscreen, where the lights are
- * hidden, it uses the same small top-left inset as browser chrome.
- */
 function SidebarTriggerOverlay({
   reserveMacosTrafficLights,
   usesDesktopChrome,
 }: SidebarTriggerOverlayProps) {
+  const isCompactViewport = useIsCompactViewport();
+  const compactSecondaryPanelPresentation = useSyncExternalStore(
+    subscribeCompactSecondaryPanelShelfShowing,
+    getCompactSecondaryPanelPresentation,
+    () => "closed",
+  );
   const shortcut = useAppCommandShortcut("sidebar.toggle");
+  if (isCompactViewport && compactSecondaryPanelPresentation !== "closed") {
+    return null;
+  }
   const triggerProps = {
     "aria-label": shortcut
       ? `Toggle sidebar (${shortcut.label})`
@@ -232,8 +225,9 @@ function SidebarTriggerOverlay({
     return (
       <div
         data-testid="app-desktop-sidebar-trigger"
+        style={{ zIndex: APP_OVERLAY_LAYER.sidebarTrigger }}
         className={cn(
-          "fixed top-0 z-50",
+          "fixed top-0",
           CHROME_ROW_CLASS,
           reserveMacosTrafficLights
             ? MACOS_TRAFFIC_LIGHT_RESERVE_OFFSET_CLASS
@@ -242,9 +236,7 @@ function SidebarTriggerOverlay({
           MACOS_WINDOW_DRAG_CLASS,
         )}
       >
-        {/* The overlay's CHROME_ROW_CLASS box-centers the trigger on the shared
-            traffic-light axis, matching the sidebar arrows and page-title
-            header in desktop chrome. */}
+        {}
         <SidebarTrigger
           className={MACOS_CHROME_CONTROL_NO_DRAG_CLASS}
           {...triggerProps}
@@ -262,8 +254,9 @@ function SidebarTriggerOverlay({
   return (
     <div
       data-testid="app-sidebar-trigger-overlay"
+      style={{ zIndex: APP_OVERLAY_LAYER.sidebarTrigger }}
       className={cn(
-        "fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-50",
+        "fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)]",
         CHROME_ROW_CLASS,
         BROWSER_SIDEBAR_TRIGGER_INSET_CLASS,
       )}
@@ -277,18 +270,14 @@ function SidebarTriggerOverlay({
   );
 }
 
-const routeTitles: Record<string, { title: string; subtitle?: string }> = {
+const routeTitles: Record<string, { title: string }> = {
   "/": { title: "bb" },
   "/settings": { title: "Settings" },
   "/automations": { title: "Automations" },
   "/skills": { title: "Skills" },
 };
 
-function resolveRouteTitle(
-  pathname: string,
-): { title: string; subtitle?: string } | undefined {
-  // The global settings page owns /settings/:section. Legacy plugin settings
-  // links still match briefly before AppRoutes redirects them to Tools.
+function resolveRouteTitle(pathname: string): { title: string } | undefined {
   if (matchPath(`${SETTINGS_ROUTE_PATH}/*`, pathname)) {
     return routeTitles[SETTINGS_ROUTE_PATH];
   }
@@ -296,24 +285,15 @@ function resolveRouteTitle(
 }
 
 interface AppHeaderProps {
-  /**
-   * True for routes that should use quiet chrome. This suppresses the center
-   * title; project-scoped quiet routes also get project actions on the right.
-   */
   usesProjectChromeStyle: boolean;
   usesDesktopChrome: boolean;
-  isSettingsView: boolean;
   projectId?: string;
   project?: ProjectResponse;
-  /** Registered navPanel when this is a plugin panel route (design §5.2):
-   * the shared header shows plugin icon + title, plus the registration's
-   * `headerContent` as the actions. */
   pluginPanel?: PluginNavPanelSlot;
-  /** The panel route's splat remainder ("" at the panel root). */
+  pluginPanelChrome?: PluginNavPanelChrome;
   pluginPanelSubPath?: string;
   meta: {
     title: string;
-    subtitle?: string;
     breadcrumbs?: Array<{ label: string; to?: string }>;
   };
 }
@@ -321,10 +301,10 @@ interface AppHeaderProps {
 function AppHeader({
   usesProjectChromeStyle,
   usesDesktopChrome,
-  isSettingsView,
   projectId,
   project,
   pluginPanel,
+  pluginPanelChrome,
   pluginPanelSubPath,
   meta,
 }: AppHeaderProps) {
@@ -332,10 +312,7 @@ function AppHeader({
   const headerTitle =
     headerBreadcrumbs || usesProjectChromeStyle ? undefined : meta.title;
 
-  const hasCenterContent =
-    Boolean(headerBreadcrumbs) ||
-    Boolean(headerTitle) ||
-    Boolean(meta.subtitle);
+  const hasCenterContent = Boolean(headerBreadcrumbs) || Boolean(headerTitle);
 
   const center = headerBreadcrumbs ? (
     <div className="min-w-0 flex-1">
@@ -344,17 +321,12 @@ function AppHeader({
         usesDesktopChrome={usesDesktopChrome}
       />
     </div>
-  ) : pluginPanel ? (
-    <PluginPanelHeaderCenter panel={pluginPanel} />
+  ) : pluginPanelChrome ? (
+    <PluginPanelHeaderCenter chrome={pluginPanelChrome} />
   ) : hasCenterContent ? (
     <div className="min-w-0 flex-1">
       {headerTitle ? (
         <p className="truncate text-sm font-semibold">{headerTitle}</p>
-      ) : null}
-      {meta.subtitle ? (
-        <p className="truncate text-xs text-muted-foreground">
-          {meta.subtitle}
-        </p>
       ) : null}
     </div>
   ) : null;
@@ -369,16 +341,13 @@ function AppHeader({
     !isProjectlessProjectId(projectId) ? (
     <>
       <Link
-        to={getProjectSettingsRoutePath(projectId)}
+        to={getSettingsProjectRoutePath(projectId)}
         className={cn(
           HEADER_ICON_BUTTON_CLASS,
           "inline-flex items-center justify-center transition-colors",
-          isSettingsView
-            ? "bg-state-active text-foreground"
-            : "text-muted-foreground hover:bg-state-hover hover:text-foreground",
+          "text-muted-foreground hover:bg-state-hover hover:text-foreground",
         )}
         aria-label="Project settings"
-        aria-current={isSettingsView ? "page" : undefined}
       >
         <Icon name="Settings" />
       </Link>
@@ -401,22 +370,20 @@ interface AppLayoutProps {
 export function AppLayout({ children }: AppLayoutProps) {
   const quickCreateProject = useQuickCreateProjectController();
   const isCompactViewport = useIsCompactViewport();
-  const threadSplitsEnabled = useThreadSplitsEnabled();
-  const splitWorkspaceActive = useSplitWorkspaceActive();
   const store = useStore();
   const contentShellRef = useRef<HTMLDivElement>(null);
-  const providerRef = useRef<HTMLDivElement>(null);
   const restoreIOSViewportOnKeyboardDismissal = useMemo(
     () => shouldRestoreIOSViewportOnKeyboardDismissal(navigator),
     [],
   );
   useMobileVisualViewportHeight(
     contentShellRef,
-    providerRef,
     isCompactViewport,
     restoreIOSViewportOnKeyboardDismissal,
   );
   const location = useLocation();
+  const { projectId, threadId, isThreadView, isArchivedView, isRootView } =
+    useRouteState();
   const [resourceRouteLabel, setResourceRouteLabel] = useAtom(
     resourceRouteLabelAtom,
   );
@@ -453,6 +420,7 @@ export function AppLayout({ children }: AppLayoutProps) {
     toolsBackRoutePath,
     toolsRoutePath,
   } = useAppSettingsRouteMemory();
+  const setRootComposeProjectId = useSetRootComposeProjectId();
   useEffect(
     () =>
       wsManager.onThreadOpen((signal) => {
@@ -460,10 +428,6 @@ export function AppLayout({ children }: AppLayoutProps) {
           projectId: signal.projectId,
           threadId: signal.threadId,
         });
-        if (!threadSplitsEnabled) {
-          void navigate(route);
-          return;
-        }
         const current = store.get(splitLayoutAtom);
         const alreadyOpen =
           current !== null &&
@@ -479,9 +443,12 @@ export function AppLayout({ children }: AppLayoutProps) {
         }
         void navigate(route, alreadyOpen ? { replace: true } : undefined);
       }),
-    [isCompactViewport, navigate, store, threadSplitsEnabled],
+    [isCompactViewport, navigate, store],
   );
   useAppCommandHandler("thread.new", () => {
+    if (projectId !== undefined) {
+      setRootComposeProjectId(projectId);
+    }
     void navigate(getRootComposeRoutePath(), {
       state: { focusPrompt: true },
     });
@@ -491,43 +458,37 @@ export function AppLayout({ children }: AppLayoutProps) {
     void navigate(settingsRoutePath);
     return true;
   });
-  // Native server rail "+" tile.
   useAppCommandHandler("settings.openServers", () => {
     void navigate(`${SETTINGS_ROUTE_PATH}/servers`);
     return true;
   });
-  const {
-    projectId,
-    threadId,
-    isThreadView,
-    isArchivedView,
-    isSettingsView,
-    isRootView,
-  } = useRouteState();
+  useServerDaemonLogsCommand();
   const archivedSectionId = isArchivedView
     ? new URLSearchParams(location.search).get("sectionId")
     : null;
-  // Plugin panel routes ride the shared header (design §5.2): icon + panel
-  // title in the center, the registration's headerContent as the actions.
-  const { navPanels } = usePluginSlots();
-  // Global settings routes swap the app sidebar for the settings sidebar.
+  const navPanelChrome = usePluginNavPanelChrome();
   const isGlobalSettingsView =
     matchPath(`${SETTINGS_ROUTE_PATH}/*`, location.pathname) !== null;
-  const systemConfigQuery = useSystemConfig();
-  const toolsHubEnabled = systemConfigQuery.data?.experiments.toolsHub === true;
-  const isGlobalToolsView =
-    toolsHubEnabled && isToolsRoutePath(location.pathname);
+  const isGlobalToolsView = isToolsRoutePath(location.pathname);
+  const backToAppRoutePath = isGlobalSettingsView
+    ? appRoutePath
+    : isGlobalToolsView
+      ? toolsBackRoutePath
+      : null;
   const pluginPanelMatch = matchPath(
     PLUGIN_PANEL_ROUTE_PATH,
     location.pathname,
   );
-  const pluginPanel = pluginPanelMatch
-    ? navPanels.find(
+  const pluginPanelEntry = pluginPanelMatch
+    ? navPanelChrome.find(
         (candidate) =>
-          candidate.pluginId === pluginPanelMatch.params.pluginId &&
-          candidate.path === pluginPanelMatch.params.panelPath,
+          candidate.chrome.pluginId === pluginPanelMatch.params.pluginId &&
+          candidate.chrome.path === pluginPanelMatch.params.panelPath,
       )
     : undefined;
+  const pluginPanel = pluginPanelEntry?.panel ?? undefined;
+  const pluginPanelChrome = pluginPanelEntry?.chrome;
+  const pluginPanelSubPath = pluginPanelMatch?.params["*"] ?? "";
   const sidebarNavigationQuery = useSidebarNavigation();
   const projects = useMemo(
     () => sidebarNavigationQuery.data?.projects.map(stripProjectThreads),
@@ -543,47 +504,21 @@ export function AppLayout({ children }: AppLayoutProps) {
       ...sidebarNavigation.personalProject.threads,
     ];
   }, [sidebarNavigationQuery.data]);
-  const titleMentionResources = useMemo(() => {
-    const sectionNamesById = new Map<string, string>();
-    const projectNamesById = new Map<string, string>();
-    const threadById = new Map(
-      sidebarThreads.map((entry) => [entry.id, entry]),
-    );
-    const navigation = sidebarNavigationQuery.data;
-    if (navigation) {
-      for (const section of navigation.sections) {
-        sectionNamesById.set(section.id, section.name);
-      }
-      for (const projectEntry of navigation.projects) {
-        projectNamesById.set(projectEntry.id, projectEntry.name);
-      }
-      projectNamesById.set(
-        navigation.personalProject.id,
-        navigation.personalProject.name,
-      );
-    }
-    return { sectionNamesById, projectNamesById, threadById };
-  }, [sidebarNavigationQuery.data, sidebarThreads]);
+  const titleMentionResources = useSidebarThreadTitleMentionResources(
+    sidebarNavigationQuery.data,
+  );
   const threadDetailBootstrapQuery = useThreadDetailBootstrap(threadId ?? "", {
     enabled: isThreadView && Boolean(threadId),
     timelinePrefetch: isThreadView && Boolean(threadId),
   });
   const hasThreadDetailBootstrapSettled =
     threadDetailBootstrapQuery.isSuccess || threadDetailBootstrapQuery.isError;
-  const [sidebarWidth, setSidebarWidth] = useAtom(sidebarWidthAtom);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const startXRef = useRef(0);
   const startWidthRef = useRef(0);
-  const liveWidthRef = useRef(sidebarWidth);
+  const liveWidthRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
-  // Plugin panel routes hand their header to the split workspace, which draws a
-  // pane header per pane. When the workspace is inactive it draws none, so the
-  // shared header must come back — it reserves the sidebar trigger footprint,
-  // and without it the trigger overlays the panel body.
-  const showHeader =
-    !isThreadView &&
-    !isRootView &&
-    !(splitWorkspaceActive && pluginPanelMatch !== null);
+  const showHeader = !isThreadView && !isRootView && pluginPanelMatch === null;
   const [desktopInfo] = useState(getBbDesktopInfo);
   const desktopWindowState = useDesktopWindowState();
   const usesDesktopChrome = shouldUseMacosDesktopChrome(desktopInfo);
@@ -591,10 +526,6 @@ export function AppLayout({ children }: AppLayoutProps) {
     desktopInfo,
     windowState: desktopWindowState,
   });
-  const sidebarProviderStyle: SidebarProviderStyle = {
-    "--sidebar-width": `${sidebarWidth}px`,
-  };
-
   const project = projectId
     ? projects?.find((candidate) => candidate.id === projectId)
     : undefined;
@@ -619,73 +550,54 @@ export function AppLayout({ children }: AppLayoutProps) {
     : threadId
       ? `Thread ${threadId.slice(0, 8)}`
       : "Thread";
-  // Gated with the rest of the Tools surface: ROOT_ROUTE_ALIASES maps /skills
-  // into Tools crumbs, so a gate-off user following an old link would otherwise
-  // see Tools chrome for the whole config fetch before ToolsExperimentGate
-  // redirects them away.
-  const toolsBreadcrumbs = toolsHubEnabled
-    ? resolveToolsBreadcrumbs(
-        location.pathname,
-        location.search,
-        resourceRouteLabel,
-      )
-    : null;
+  const toolsBreadcrumbs = resolveToolsBreadcrumbs(
+    location.pathname,
+    location.search,
+    resourceRouteLabel,
+  );
   const automationBreadcrumbs = resolveAutomationBreadcrumbs(
     location.pathname,
     resourceRouteLabel,
   );
-  const routeBreadcrumbs = toolsBreadcrumbs ?? automationBreadcrumbs;
-  const meta = isThreadView
-    ? {
-        title: thread ? getThreadDisplayTitle(thread) : "Thread",
-        subtitle: undefined,
-      }
-    : routeBreadcrumbs
-      ? {
-          title: "",
-          subtitle: undefined,
-          breadcrumbs: routeBreadcrumbs,
-        }
-      : isArchivedView && projectId
-        ? isProjectlessProjectId(projectId)
-          ? {
-              title: "",
-              subtitle: undefined,
-              breadcrumbs: [
-                { label: "Threads", to: getRootComposeRoutePath() },
-                ...(archivedSectionName
-                  ? [{ label: archivedSectionName }]
-                  : []),
-                { label: "Archived" },
-              ],
-            }
-          : {
-              title: "",
-              subtitle: undefined,
-              breadcrumbs: [
-                {
-                  label: projectLabel ?? projectId,
-                  to: getLegacyProjectComposeRoutePath(projectId),
-                },
-                { label: "Archived" },
-              ],
-            }
-        : isSettingsView && projectId
-          ? {
-              title: "",
-              subtitle: undefined,
-              breadcrumbs: [
-                {
-                  label: projectLabel ?? projectId,
-                  to: getLegacyProjectComposeRoutePath(projectId),
-                },
-                { label: "Settings" },
-              ],
-            }
+  const documentTitleBreadcrumbs = toolsBreadcrumbs ?? automationBreadcrumbs;
+  const toolsAreaHeaderMeta = resolveToolsAreaHeaderMeta(
+    location.pathname,
+    resourceRouteLabel,
+    location.search,
+  );
+  const meta =
+    toolsAreaHeaderMeta?.kind === "extensions-title"
+      ? { title: toolsAreaHeaderMeta.title }
+      : toolsAreaHeaderMeta?.kind === "breadcrumbs"
+        ? {
+            title: "",
+            breadcrumbs: toolsAreaHeaderMeta.breadcrumbs,
+          }
+        : isArchivedView && projectId
+          ? isProjectlessProjectId(projectId)
+            ? {
+                title: "",
+                breadcrumbs: [
+                  { label: "Threads", to: getRootComposeRoutePath() },
+                  ...(archivedSectionName
+                    ? [{ label: archivedSectionName }]
+                    : []),
+                  { label: "Archived" },
+                ],
+              }
+            : {
+                title: "",
+                breadcrumbs: [
+                  {
+                    label: projectLabel ?? projectId,
+                    to: getLegacyProjectComposeRoutePath(projectId),
+                  },
+                  { label: "Archived" },
+                ],
+              }
           : projectId
             ? {
                 title: projectLabel ?? projectId,
-                subtitle: undefined,
               }
             : (resolveRouteTitle(location.pathname) ?? { title: "" });
 
@@ -696,9 +608,9 @@ export function AppLayout({ children }: AppLayoutProps) {
     if (pluginPanel) {
       return pluginPanel.title;
     }
-    if (routeBreadcrumbs) {
-      const sectionLabel = routeBreadcrumbs[0]?.label ?? "BB";
-      const pageLabel = routeBreadcrumbs.at(-1)?.label ?? sectionLabel;
+    if (documentTitleBreadcrumbs) {
+      const sectionLabel = documentTitleBreadcrumbs[0]?.label ?? "BB";
+      const pageLabel = documentTitleBreadcrumbs.at(-1)?.label ?? sectionLabel;
       return pageLabel === sectionLabel
         ? sectionLabel
         : `${pageLabel} · ${sectionLabel}`;
@@ -711,20 +623,12 @@ export function AppLayout({ children }: AppLayoutProps) {
       }
       return `${projectLabel ?? projectId} · Archived`;
     }
-    if (isSettingsView && projectId) {
-      return `${projectLabel ?? projectId} · Settings`;
-    }
     if (projectId) {
       return projectLabel ?? projectId;
     }
     const routeTitle = resolveRouteTitle(location.pathname)?.title;
     return routeTitle && routeTitle.length > 0 ? routeTitle : "BB";
   })();
-  // The sidebar list omits archived threads and side chats, so it can't answer
-  // whether the currently-viewed thread is blocked on input. Read the current
-  // thread's pending interactions directly (the thread view already warms this
-  // cache) so an in-view thread waiting on the user always lights the favicon,
-  // mirroring how the in-view unread signal covers every thread kind.
   const currentThreadPendingInteractionsQuery = useThreadPendingInteractions(
     threadId ?? "",
     { enabled: isThreadView && Boolean(threadId) },
@@ -748,12 +652,11 @@ export function AppLayout({ children }: AppLayoutProps) {
       event.preventDefault();
       setIsSidebarResizing(true);
       startXRef.current = event.clientX;
-      startWidthRef.current = liveWidthRef.current;
+      startWidthRef.current = store.get(sidebarWidthAtom);
+      liveWidthRef.current = startWidthRef.current;
       document.body.classList.add("sidebar-resizing");
-      applyResizeCursor("horizontal");
-      document.body.style.userSelect = "none";
     },
-    [],
+    [store],
   );
 
   const finishSidebarResize = useCallback(() => {
@@ -761,25 +664,23 @@ export function AppLayout({ children }: AppLayoutProps) {
       window.cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
-    providerRef.current?.style.setProperty(
-      "--sidebar-width",
-      `${liveWidthRef.current}px`,
-    );
+    flushSync(() => {
+      store.set(sidebarWidthAtom, liveWidthRef.current);
+      store.set(sidebarLiveWidthAtom, null);
+    });
     dispatchBrowserViewBoundsSync();
-    setSidebarWidth(liveWidthRef.current);
     setIsSidebarResizing(false);
     resetSidebarResizeDocumentState();
-  }, [setSidebarWidth]);
+  }, [store]);
 
   useEffect(() => {
     if (!isSidebarResizing) return;
 
     const applyLiveWidth = () => {
       animationFrameRef.current = null;
-      providerRef.current?.style.setProperty(
-        "--sidebar-width",
-        `${liveWidthRef.current}px`,
-      );
+      flushSync(() => {
+        store.set(sidebarLiveWidthAtom, liveWidthRef.current);
+      });
       dispatchBrowserViewBoundsSync();
     };
 
@@ -811,13 +712,10 @@ export function AppLayout({ children }: AppLayoutProps) {
         window.cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
+      store.set(sidebarLiveWidthAtom, null);
       resetSidebarResizeDocumentState();
     };
-  }, [finishSidebarResize, isSidebarResizing]);
-
-  useEffect(() => {
-    liveWidthRef.current = sidebarWidth;
-  }, [sidebarWidth]);
+  }, [finishSidebarResize, isSidebarResizing, store]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -825,73 +723,78 @@ export function AppLayout({ children }: AppLayoutProps) {
   }, [documentTitle]);
 
   return (
-    <ToolsHubExperimentProvider enabled={toolsHubEnabled}>
-      <ProjectActionsProvider>
-        <ThreadTitleMentionResourcesProvider {...titleMentionResources}>
-          <ThreadActionsProvider>
-            <IframeDragGuardOverlay active={isSidebarResizing} />
-            <SidebarStateBridge
-              providerRef={providerRef}
-              style={sidebarProviderStyle}
-            >
-              <AppLayoutSidebar
-                mode={
-                  isGlobalSettingsView
-                    ? "settings"
-                    : isGlobalToolsView
-                      ? "tools"
-                      : "app"
-                }
-                onResizeMouseDown={handleResizeMouseDown}
-                isResizing={isSidebarResizing}
-                appRoutePath={appRoutePath}
-                settingsRoutePath={settingsRoutePath}
-                toolsBackRoutePath={toolsBackRoutePath}
-                toolsRoutePath={toolsHubEnabled ? toolsRoutePath : undefined}
-              />
-              <SidebarInset>
-                <div
-                  ref={contentShellRef}
-                  data-testid="app-layout-content-shell"
-                  className="relative flex h-full min-h-0 min-w-0 w-full flex-col pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]"
-                >
-                  {showHeader ? (
-                    <AppHeader
-                      usesDesktopChrome={usesDesktopChrome}
-                      usesProjectChromeStyle={
-                        isRootView || isArchivedView || isSettingsView
-                      }
-                      isSettingsView={isSettingsView}
-                      projectId={projectId}
-                      project={project}
-                      pluginPanel={pluginPanel}
-                      pluginPanelSubPath={pluginPanelMatch?.params["*"] ?? ""}
-                      meta={meta}
-                    />
-                  ) : null}
-                  <main className="flex min-h-0 flex-1 flex-col p-4 md:p-5">
-                    {children}
-                  </main>
-                </div>
-              </SidebarInset>
-              <SidebarTriggerOverlay
-                reserveMacosTrafficLights={reserveMacosTrafficLights}
-                usesDesktopChrome={usesDesktopChrome}
-              />
-            </SidebarStateBridge>
-            <ProjectPathDialog
-              target={quickCreateProject.projectPathDialog.target}
-              pending={quickCreateProject.isCreating}
-              platform={quickCreateProject.platform}
-              hostId={quickCreateProject.hostId}
-              hostName={quickCreateProject.hostName}
-              hosts={quickCreateProject.hosts}
-              onOpenChange={quickCreateProject.projectPathDialog.onOpenChange}
-              onSubmit={quickCreateProject.submitProjectPath}
+    <ProjectActionsProvider>
+      <ThreadTitleMentionResourcesProvider {...titleMentionResources}>
+        <ThreadActionsProvider>
+          <SidebarStateBridge>
+            {backToAppRoutePath !== null && !isSidebarResizing ? (
+              <BackToAppCommandHandler routePath={backToAppRoutePath} />
+            ) : null}
+            <AppLayoutSidebar
+              mode={
+                isGlobalSettingsView
+                  ? "settings"
+                  : isGlobalToolsView
+                    ? "tools"
+                    : "app"
+              }
+              onResizeMouseDown={handleResizeMouseDown}
+              isResizing={isSidebarResizing}
+              appRoutePath={appRoutePath}
+              settingsRoutePath={settingsRoutePath}
+              toolsBackRoutePath={toolsBackRoutePath}
+              toolsRoutePath={toolsRoutePath}
             />
-          </ThreadActionsProvider>
-        </ThreadTitleMentionResourcesProvider>
-      </ProjectActionsProvider>
-    </ToolsHubExperimentProvider>
+            <SidebarInset>
+              <div
+                ref={contentShellRef}
+                data-testid="app-layout-content-shell"
+                className="relative flex h-full min-h-0 min-w-0 w-full flex-col pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[var(--bb-safe-area-bottom,env(safe-area-inset-bottom))] pl-[env(safe-area-inset-left)]"
+              >
+                {showHeader ? (
+                  <AppHeader
+                    usesDesktopChrome={usesDesktopChrome}
+                    usesProjectChromeStyle={isRootView || isArchivedView}
+                    projectId={projectId}
+                    project={project}
+                    pluginPanel={pluginPanel}
+                    pluginPanelChrome={pluginPanelChrome}
+                    pluginPanelSubPath={pluginPanelSubPath}
+                    meta={meta}
+                  />
+                ) : null}
+                <main className="flex min-h-0 flex-1 flex-col p-4 md:p-5">
+                  {children}
+                </main>
+              </div>
+            </SidebarInset>
+            <SidebarTriggerOverlay
+              reserveMacosTrafficLights={reserveMacosTrafficLights}
+              usesDesktopChrome={usesDesktopChrome}
+            />
+          </SidebarStateBridge>
+          <PluginAppOverlays />
+          <IframeDragGuardOverlay
+            active={isSidebarResizing}
+            cursor="col-resize"
+          />
+          <CommandPalette
+            threadId={threadId ?? null}
+            projectId={projectId ?? null}
+          />
+          <NotificationCenter />
+          <ProjectPathDialog
+            target={quickCreateProject.projectPathDialog.target}
+            pending={quickCreateProject.isCreating}
+            platform={quickCreateProject.platform}
+            hostId={quickCreateProject.hostId}
+            hostName={quickCreateProject.hostName}
+            hosts={quickCreateProject.hosts}
+            onOpenChange={quickCreateProject.projectPathDialog.onOpenChange}
+            onSubmit={quickCreateProject.submitProjectPath}
+          />
+        </ThreadActionsProvider>
+      </ThreadTitleMentionResourcesProvider>
+    </ProjectActionsProvider>
   );
 }

@@ -1,33 +1,24 @@
-import type { TerminalSession } from "@bb/server-contract";
 import { describe, expect, it } from "vitest";
 import {
   isVisibleTerminalSession,
+  pickActiveTerminalId,
   shouldAutoCloseCleanTerminalSession,
   shouldAutoCloseCleanTerminalSessionsForPanel,
   shouldCloseDisconnectedTerminalSession,
 } from "./useThreadTerminalController";
-
-function terminalSession(overrides: Partial<TerminalSession>): TerminalSession {
-  return {
-    id: "term_1",
-    threadId: "thr_1",
-    environmentId: "env_1",
-    hostId: "host_1",
-    title: "Terminal",
-    initialCwd: "/workspace",
-    cols: 100,
-    rows: 30,
-    status: "running",
-    exitCode: null,
-    closeReason: null,
-    createdAt: 1,
-    updatedAt: 1,
-    lastUserInputAt: null,
-    ...overrides,
-  };
-}
+import { makeTerminalSession as terminalSession } from "@/test/fixtures/terminal-sessions";
 
 describe("terminal visibility", () => {
+  it("does not replace an exact plugin tab with a sibling session", () => {
+    const sibling = terminalSession({ id: "term_sibling" });
+
+    expect(
+      pickActiveTerminalId([sibling], "term_missing", "term_missing"),
+    ).toBeNull();
+    expect(
+      pickActiveTerminalId([sibling], "term_sibling", "term_sibling"),
+    ).toBe("term_sibling");
+  });
   it("shows disconnected sessions only while retaining a mounted terminal view", () => {
     const disconnected = terminalSession({
       id: "term_disconnected",

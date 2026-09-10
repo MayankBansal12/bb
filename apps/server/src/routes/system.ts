@@ -1,6 +1,3 @@
-import { readFile } from "node:fs/promises";
-import { extname, resolve } from "node:path";
-import { formatCustomAcpAgentProviderId } from "@bb/config/bb-app-managed-config";
 import {
   getAppSettings,
   getAppKeybindingOverrides,
@@ -15,8 +12,10 @@ import {
 } from "@bb/db";
 import {
   applyAppKeybindingOverrides,
+  appSettingsSchema,
   customThemeNameSchema,
   isBuiltInThemeId,
+  PERSONAL_PROJECT_ID,
   resolveCodeTheme,
   type AppKeybindingOverrides,
   type AppTheme,
@@ -27,6 +26,11 @@ import {
   type PublicApiSchema,
 } from "@bb/server-contract";
 import type { Hono } from "hono";
+import { pluginImageResponse } from "./plugin-image-response.js";
+import {
+  getEnvironmentProvider,
+  listEnvironmentProviders,
+} from "../services/plugins/plugin-environment-provider-registry.js";
 import type { ServerAppDeps, ServerRuntimeConfig } from "../types.js";
 import type { PluginService } from "../services/plugins/plugin-service.js";
 import { ApiError } from "../errors.js";
@@ -38,11 +42,7 @@ import {
   listSystemProviderInfos,
   resolveSystemExecutionOptions,
 } from "../services/system/execution-options.js";
-import {
-  getOnboardingAgentOverview,
-  getOnboardingRepos,
-  recordOnboardingEvent,
-} from "../services/system/onboarding.js";
+import { getProviderStates } from "../services/system/provider-states.js";
 import { getProviderUsageLimits } from "../services/system/usage-limits.js";
 import {
   listCustomThemeNames,
@@ -51,7 +51,6 @@ import {
   resolveCustomThemeCssPath,
   resolveThemeRootPath,
 } from "../services/system/custom-themes.js";
-import { schedulePrimaryHostCaffeinateReconciliation } from "../services/system/app-settings.js";
 import {
   installGlobalCliSkills,
   listInstallableMachineIds,
@@ -59,12 +58,16 @@ import {
 } from "../services/skills/global-skill-install.js";
 import { DEFAULT_APP_KEYBINDINGS } from "../services/system/app-keybindings.js";
 import { resolvePrimaryHostId } from "../services/hosts/primary-host.js";
+import {
+  environmentProviderMatchesContext,
+  environmentProviderAcceptsEmptyInputs,
+} from "../services/environments/provider-availability.js";
+import { requirePublicProject } from "../services/lib/entity-lookup.js";
 
-const CUSTOM_ACP_LOGO_CONTENT_TYPES = {
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".webp": "image/webp",
-} as const;
+const LEADING_ENVIRONMENT_PROVIDER_IDS: readonly string[] = [
+  "project-checkout",
+  "git-worktree",
+];
 
 interface SystemConfigRequest {
   url: string;
@@ -159,8 +162,14 @@ export function registerSystemRoutes(
   async function buildSystemConfigResponse(serverUrl: string) {
     const keybindingOverrides = readAppKeybindingOverrides();
     const primaryHostId = resolvePrimaryHostId(deps);
+    const localHelperPorts = [
+      ...new Set([
+        deps.config.hostDaemonPort,
+        ...deps.hub.listDaemonLocalApiPorts(),
+      ]),
+    ];
     return {
-      generalSettings: getAppSettings(deps.db),
+      generalSettings: compatibleGeneralSettings(),
       keybindings: applyAppKeybindingOverrides(
         DEFAULT_APP_KEYBINDINGS,
         keybindingOverrides,
@@ -176,6 +185,7 @@ export function registerSystemRoutes(
       pluginThemes: pluginService.listThemes(),
       featureFlags: deps.config.featureFlags,
       hostDaemonPort: deps.config.hostDaemonPort,
+      localHelperPorts,
       serverUrl,
       primaryHostId,
       primaryHostPlatform:
@@ -183,6 +193,17 @@ export function registerSystemRoutes(
           ? null
           : deps.hub.getDaemonPlatformForHost(primaryHostId),
       voiceTranscriptionEnabled: resolveVoiceTranscriptionEnabled(deps),
+      aiServices: {
+        inference: deps.config.inferenceModel,
+        inferenceFallback: deps.config.inferenceFallbackModel,
+        transcription: deps.config.transcriptionModel,
+        services: deps.aiServices.list().map((service) => ({
+          id: service.id,
+          displayName: service.displayName,
+          kinds: [...service.kinds],
+          pluginId: service.pluginId,
+        })),
+      },
       dataDir: deps.config.dataDir,
     };
   }
@@ -192,13 +213,35 @@ export function registerSystemRoutes(
     return context.json(await buildSystemConfigResponse(serverUrl));
   });
 
+  function compatibleGeneralSettings() {
+    const settings = getAppSettings(deps.db);
+    return {
+      ...settings,
+      showUnhandledProviderEvents: settings.showDiagnosticEvents,
+    };
+  }
+
   put(routes.generalSettings, (context, payload) => {
-    setAppSettings(deps.db, payload);
+    const { showUnhandledProviderEvents, ...settings } = payload;
+    const current = getAppSettings(deps.db);
+    const diagnosticValue =
+      "showDiagnosticEvents" in settings
+        ? settings.showDiagnosticEvents
+        : undefined;
+    setAppSettings(
+      deps.db,
+      appSettingsSchema.parse({
+        ...settings,
+        showDiagnosticEvents:
+          diagnosticValue === undefined ||
+          (showUnhandledProviderEvents !== undefined &&
+            diagnosticValue === current.showDiagnosticEvents)
+            ? showUnhandledProviderEvents
+            : diagnosticValue,
+      }),
+    );
     deps.hub.notifySystem(["config-changed"]);
-    schedulePrimaryHostCaffeinateReconciliation(deps, {
-      reason: "settings-updated",
-    });
-    return context.json(getAppSettings(deps.db));
+    return context.json(compatibleGeneralSettings());
   });
 
   put(routes.keyboardSettings, (context, payload) => {
@@ -208,38 +251,44 @@ export function registerSystemRoutes(
   });
 
   put(routes.experiments, (context, payload) => {
-    setExperiments(deps.db, payload);
-    // The same kind a config reload broadcasts: every window re-reads
-    // /system/config and re-gates its experiment-flagged surfaces.
+    setExperiments(deps.db, { ...getExperiments(deps.db), ...payload });
     deps.hub.notifySystem(["config-changed"]);
     return context.json(getExperiments(deps.db));
   });
 
-  put(routes.appearance, async (context, payload) => {
-    const { themeId } = payload;
-    const pluginCss = await pluginService.readThemeCss(themeId);
-    if (!isBuiltInThemeId(themeId) && pluginCss === null) {
-      if (!customThemeNameSchema.safeParse(themeId).success) {
-        throw new ApiError(
-          400,
-          "invalid_request",
-          `Invalid theme id '${themeId}'.`,
-        );
-      }
-      if (readCustomThemeCss(themeRoot, themeId) === null) {
-        throw new ApiError(
-          404,
-          "theme_not_found",
-          `Custom theme '${themeId}' not found. Create ${resolveCustomThemeCssPath(themeRoot, themeId)} first.`,
-        );
-      }
+  async function requireKnownTheme(themeId: string): Promise<void> {
+    if (isBuiltInThemeId(themeId)) return;
+    if ((await pluginService.readThemeCss(themeId)) !== null) return;
+    if (!customThemeNameSchema.safeParse(themeId).success) {
+      throw new ApiError(
+        400,
+        "invalid_request",
+        `Invalid theme id '${themeId}'.`,
+      );
     }
-    const { faviconColor } = payload;
+    if (readCustomThemeCss(themeRoot, themeId) === null) {
+      throw new ApiError(
+        404,
+        "theme_not_found",
+        `Custom theme '${themeId}' not found. Create ${resolveCustomThemeCssPath(themeRoot, themeId)} first.`,
+      );
+    }
+  }
+
+  put(routes.appearance, async (context, payload) => {
+    const { themeId, faviconColor } = payload;
+    await requireKnownTheme(themeId);
     setStoredAppearance(deps.db, { themeId, faviconColor });
-    // Broadcast like experiments: every window re-reads /system/config and
-    // re-applies the active palette.
     deps.hub.notifySystem(["config-changed"]);
     return context.json(await resolveSelectedTheme(themeId, faviconColor));
+  });
+
+  get(routes.resolveTheme, async (context) => {
+    const themeId = context.req.param("id");
+    await requireKnownTheme(themeId);
+    return context.json(
+      await resolveSelectedTheme(themeId, getStoredFaviconColor(deps.db)),
+    );
   });
 
   get(routes.themes, async (context) =>
@@ -279,65 +328,99 @@ export function registerSystemRoutes(
     context.json(await installGlobalCliSkills(deps, { hostIds: body.hostIds })),
   );
 
+  get(routes.environmentProviders, async (context, query) => {
+    const project =
+      query.projectId === undefined
+        ? null
+        : requirePublicProject(deps.db, query.projectId);
+    return context.json({
+      providers: (
+        await Promise.all(
+          listEnvironmentProviders()
+            .filter(
+              (record) =>
+                project === null ||
+                record.provider.requires.projectless ===
+                  (project.id === PERSONAL_PROJECT_ID),
+            )
+            .sort((left, right) => {
+              const leftIndex = LEADING_ENVIRONMENT_PROVIDER_IDS.indexOf(
+                left.provider.id,
+              );
+              const rightIndex = LEADING_ENVIRONMENT_PROVIDER_IDS.indexOf(
+                right.provider.id,
+              );
+              if (leftIndex !== -1 || rightIndex !== -1) {
+                if (leftIndex === -1) return 1;
+                if (rightIndex === -1) return -1;
+                return leftIndex - rightIndex;
+              }
+              return (
+                left.provider.displayName.localeCompare(
+                  right.provider.displayName,
+                ) || left.provider.id.localeCompare(right.provider.id)
+              );
+            })
+            .map(async (record) => {
+              if (
+                query.projectId !== undefined &&
+                !environmentProviderMatchesContext(deps, record, {
+                  projectId: query.projectId,
+                  ...(query.hostId === undefined
+                    ? {}
+                    : { hostId: query.hostId }),
+                })
+              ) {
+                return null;
+              }
+              return {
+                id: record.provider.id,
+                displayName: record.provider.displayName,
+                icon: record.provider.icon,
+                logoUrl:
+                  record.icon === undefined
+                    ? null
+                    : `/api/v1/system/providers/${encodeURIComponent(`environment:${record.provider.id}`)}/logo?h=${record.icon.hash}`,
+                pluginId: record.pluginId,
+                requires: record.provider.requires,
+                inputs: record.provider.inputsJsonSchema,
+                acceptsEmptyInputs:
+                  await environmentProviderAcceptsEmptyInputs(record),
+                availability: null,
+              };
+            }),
+        )
+      ).filter((provider) => provider !== null),
+    });
+  });
+
   get(routes.providers, async (context, query) =>
     context.json(await listSystemProviderInfos(deps, query)),
   );
 
   get(routes.providerLogo, async (context) => {
     const providerId = context.req.param("id");
-    const agent = deps.config.customAcpAgents.find(
-      (candidate) =>
-        formatCustomAcpAgentProviderId(candidate.id) === providerId,
+    const registration = providerId.startsWith("environment:")
+      ? getEnvironmentProvider(providerId.slice("environment:".length))
+      : deps.providerRegistry.get(providerId);
+    if (registration?.icon !== undefined) {
+      return pluginImageResponse(
+        context,
+        registration.icon,
+        context.req.query("h") === registration.icon.hash
+          ? "public, max-age=31536000, immutable"
+          : "no-store",
+      );
+    }
+    throw new ApiError(
+      404,
+      "provider_logo_not_found",
+      `Provider '${providerId}' has no logo.`,
     );
-    if (agent?.logo === undefined) {
-      throw new ApiError(
-        404,
-        "provider_logo_not_found",
-        `Provider '${providerId}' has no configured logo.`,
-      );
-    }
-
-    const extension = extname(agent.logo).toLowerCase();
-    const contentType =
-      CUSTOM_ACP_LOGO_CONTENT_TYPES[
-        extension as keyof typeof CUSTOM_ACP_LOGO_CONTENT_TYPES
-      ];
-    if (contentType === undefined) {
-      throw new ApiError(
-        415,
-        "unsupported_provider_logo",
-        `Provider '${providerId}' has an unsupported logo format.`,
-      );
-    }
-
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(resolve(deps.config.dataDir, agent.logo));
-    } catch {
-      throw new ApiError(
-        404,
-        "provider_logo_not_found",
-        `Provider '${providerId}' logo file was not found.`,
-      );
-    }
-    return context.body(new Uint8Array(bytes), 200, {
-      "cache-control": "no-store",
-      "content-type": contentType,
-      "x-content-type-options": "nosniff",
-    });
   });
 
-  post(routes.onboardingEvent, async (context, body) => {
-    recordOnboardingEvent(deps, body);
-    return context.json({ ok: true } as const);
-  });
-
-  get(routes.onboardingAgents, async (context, query) =>
-    context.json(await getOnboardingAgentOverview(deps, query)),
-  );
-
-  get(routes.onboardingRepos, async (context, query) =>
-    context.json(await getOnboardingRepos(deps, query)),
+  get(routes.providerStates, async (context, query) =>
+    context.json(await getProviderStates(deps, query)),
   );
 
   get(routes.usageLimits, async (context, query) =>

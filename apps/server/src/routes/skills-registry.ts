@@ -1,5 +1,9 @@
 import type { Hono } from "hono";
-import { registrySkillInstallRequestSchema } from "@bb/server-contract";
+import {
+  registrySkillEntriesRequestSchema,
+  registrySkillInstallRequestSchema,
+  type RegistrySkill,
+} from "@bb/server-contract";
 import { ApiError } from "../errors.js";
 import {
   githubRepoForSource,
@@ -21,11 +25,6 @@ import { installServerRegistrySkill } from "../services/skills/registry-skill-in
 import type { AppDeps } from "../types.js";
 
 export function registerSkillsRegistryRoutes(app: Hono, deps: AppDeps): void {
-  /**
-   * skills.sh is a third-party dependency: a timeout or a shape change there
-   * is an upstream outage, not a bug in this server. Map it to 503 so clients
-   * can retry, and log it once rather than surfacing an opaque 500.
-   */
   async function proxyUpstream<T>(run: () => Promise<T>): Promise<T> {
     try {
       return await run();
@@ -66,6 +65,28 @@ export function registerSkillsRegistryRoutes(app: Hono, deps: AppDeps): void {
     return context.json(
       await proxyUpstream(() => resolveRegistrySkillById(id)),
     );
+  });
+
+  app.post("/skills-registry/entries", async (context) => {
+    const body = registrySkillEntriesRequestSchema.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!body.success) {
+      throw new ApiError(400, "invalid_request", "Expected registry skill ids");
+    }
+    const ids = [...new Set(body.data.ids)];
+    const entries = (
+      await Promise.all(
+        ids.map(async (id): Promise<RegistrySkill | null> => {
+          try {
+            return await resolveRegistrySkillById(id);
+          } catch {
+            return null;
+          }
+        }),
+      )
+    ).filter((entry): entry is RegistrySkill => entry !== null);
+    return context.json({ entries });
   });
 
   app.get("/skills-registry/repository-stars", async (context) => {

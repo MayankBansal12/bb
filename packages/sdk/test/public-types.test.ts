@@ -30,6 +30,7 @@ import type {
 } from "@bb/sdk";
 import type {
   BbSdk as BrowserBbSdk,
+  BrowserBbSdk as BrowserRuntimeBbSdk,
   BbRealtimeConnectionEvent as BrowserRealtimeConnection,
   EnvironmentStatusResult as BrowserEnvironmentStatus,
   FileReadResult as BrowserFileRead,
@@ -109,6 +110,7 @@ import type {
   ThreadSectionListResult as NodeThreadSectionList,
   ThreadSpawnResult as NodeThreadSpawn,
 } from "@bb/sdk/node";
+import type { createBrowserBbSdk } from "@bb/sdk/browser";
 
 interface RootSurface {
   environmentStatus: RootEnvironmentStatus;
@@ -219,6 +221,7 @@ interface NodeSurface {
 }
 
 type ExpectedBbSdkKey =
+  | "experimental_desktopBrowsers"
   | "environments"
   | "files"
   | "guide"
@@ -240,6 +243,9 @@ type ExpectedRealtimeKey = "subscribe";
 type ExpectedEnvironmentsKey =
   | "archiveThreads"
   | "commit"
+  | "delete"
+  | "list"
+  | "listProviders"
   | "diff"
   | "diffBranches"
   | "diffFile"
@@ -251,7 +257,6 @@ type ExpectedEnvironmentsKey =
   | "mergePullRequest"
   | "paths"
   | "pullRequest"
-  | "squashMerge"
   | "status"
   | "update";
 
@@ -293,12 +298,15 @@ type ExpectedPluginsKey =
   | "install"
   | "list"
   | "listUpdateResults"
+  | "marketplaces"
   | "reload"
   | "remove"
   | "token"
   | "updateSettings";
 
-type ExpectedPluginCatalogKey = "install" | "search" | "status";
+type ExpectedPluginCatalogKey = "install" | "installPlan" | "search" | "status";
+
+type ExpectedPluginMarketplacesKey = "add" | "list" | "refresh" | "remove";
 
 type ExpectedProjectsKey =
   | "attachments"
@@ -314,6 +322,7 @@ type ExpectedProjectsKey =
   | "paths"
   | "promptHistory"
   | "reorder"
+  | "sidebarBootstrap"
   | "sources"
   | "update";
 
@@ -332,16 +341,17 @@ type ExpectedSystemKey =
   | "installCliSkills"
   | "reloadConfig"
   | "transcribeVoice"
+  | "uiPreferences"
   | "updateExperiments"
   | "updateGeneralSettings"
   | "updateKeyboardSettings"
-  | "onboardingAgents"
-  | "onboardingEvent"
-  | "onboardingRepos"
+  | "providerStates"
   | "usageLimits"
   | "version";
 
-type ExpectedThemeKey = "catalog" | "get" | "set";
+type ExpectedSystemUiPreferencesKey = "list" | "reset" | "set";
+
+type ExpectedThemeKey = "catalog" | "get" | "resolve" | "set";
 
 type ExpectedThreadSectionsKey = "create" | "delete" | "list" | "update";
 
@@ -350,10 +360,11 @@ type ExpectedThreadsKey =
   | "archiveAll"
   | "cancelPlan"
   | "childSummary"
+  | "clearContext"
   | "clearGoal"
   | "compact"
-  | "continueAfterRateLimit"
   | "conversationOutline"
+  | "count"
   | "defaultExecutionOptions"
   | "delete"
   | "editMessage"
@@ -362,6 +373,7 @@ type ExpectedThreadsKey =
   | "get"
   | "interactions"
   | "list"
+  | "listRunning"
   | "markRead"
   | "markUnread"
   | "open"
@@ -369,15 +381,17 @@ type ExpectedThreadsKey =
   | "paneAction"
   | "pin"
   | "promptHistory"
+  | "queue"
   | "queuedMessages"
-  | "rateLimitRecovery"
   | "reorderPinned"
   | "resolveMentions"
+  | "retry"
   | "search"
   | "send"
   | "spawn"
   | "stop"
   | "storageFiles"
+  | "storageLocation"
   | "storagePaths"
   | "tabs"
   | "timeline"
@@ -388,6 +402,12 @@ type ExpectedThreadsKey =
   | "wait";
 
 type ExpectedThreadEventsKey = "list" | "wait";
+/**
+ * The cross-thread queue area answers exactly one question — what is queued
+ * right now — so it has exactly one method. A row's own operations (send-now,
+ * edit, reorder, delete) live on `queuedMessages`.
+ */
+type ExpectedThreadQueueKey = "list";
 type ExpectedThreadInteractionsKey =
   | "cancel"
   | "get"
@@ -426,6 +446,15 @@ describe("SDK public type entrypoints", () => {
     expectTypeOf<BrowserBbSdk>().toEqualTypeOf<RootBbSdk>();
     expectTypeOf<CoreBbSdk>().toEqualTypeOf<RootBbSdk>();
     expectTypeOf<NodeBbSdk>().toEqualTypeOf<RootBbSdk>();
+  });
+
+  it("keeps the local guide area off the browser SDK instance", () => {
+    expectTypeOf<keyof BrowserRuntimeBbSdk>().toEqualTypeOf<
+      Exclude<ExpectedBbSdkKey, "guide">
+    >();
+    expectTypeOf<
+      ReturnType<typeof createBrowserBbSdk>
+    >().toEqualTypeOf<BrowserRuntimeBbSdk>();
   });
 
   it("exports only the public permission presets", () => {
@@ -495,6 +524,9 @@ describe("SDK public type entrypoints", () => {
       keyof RootBbSdk["plugins"]["catalog"]
     >().toEqualTypeOf<ExpectedPluginCatalogKey>();
     expectTypeOf<
+      keyof RootBbSdk["plugins"]["marketplaces"]
+    >().toEqualTypeOf<ExpectedPluginMarketplacesKey>();
+    expectTypeOf<
       keyof RootBbSdk["projects"]
     >().toEqualTypeOf<ExpectedProjectsKey>();
     expectTypeOf<
@@ -513,6 +545,9 @@ describe("SDK public type entrypoints", () => {
       keyof RootBbSdk["system"]
     >().toEqualTypeOf<ExpectedSystemKey>();
     expectTypeOf<
+      keyof RootBbSdk["system"]["uiPreferences"]
+    >().toEqualTypeOf<ExpectedSystemUiPreferencesKey>();
+    expectTypeOf<
       keyof RootBbSdk["terminals"]
     >().toEqualTypeOf<ExpectedTerminalsKey>();
     expectTypeOf<keyof RootBbSdk["theme"]>().toEqualTypeOf<ExpectedThemeKey>();
@@ -525,6 +560,9 @@ describe("SDK public type entrypoints", () => {
     expectTypeOf<
       keyof RootBbSdk["threads"]["events"]
     >().toEqualTypeOf<ExpectedThreadEventsKey>();
+    expectTypeOf<
+      keyof RootBbSdk["threads"]["queue"]
+    >().toEqualTypeOf<ExpectedThreadQueueKey>();
     expectTypeOf<
       keyof RootBbSdk["threads"]["interactions"]
     >().toEqualTypeOf<ExpectedThreadInteractionsKey>();

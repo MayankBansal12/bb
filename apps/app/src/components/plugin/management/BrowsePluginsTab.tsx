@@ -1,264 +1,542 @@
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useDebounceValue } from "usehooks-ts";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Button } from "@bb/shared-ui/button";
+import { PLUGIN_CATALOG_CATEGORIES, pluginCatalogCategory } from "@bb/domain";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@bb/shared-ui/dropdown-menu";
+import { Icon } from "@bb/shared-ui/icon";
+import { cn } from "@bb/shared-ui/lib/utils";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   ResourceBrowseCard,
   ResourceBrowseGrid,
   ResourceCollectionViewport,
   ResourceInstallControl,
+  ResourceInstalledControl,
   ResourceListState,
-  ResourceMultiSelectMenu,
+  ResourceShelfSeeAllAction,
   ResourceSortMenu,
+  ResourceSourceShelf,
   ResourceToolbar,
 } from "@bb/shared-ui/resource-list";
-import {
-  ConfirmDeleteDialog,
-  ConfirmDeleteDialogContent,
-} from "@/components/dialogs/ConfirmDeleteDialog";
-import { appToast } from "@/components/ui/app-toast";
-import { pluginIconName } from "@/components/plugin/PluginIcon";
-import {
-  invalidatePluginCatalogSearch,
-  invalidatePluginList,
-} from "@/hooks/cache-owners/plugin-cache-owner";
+import { BrowseArchetypeCards } from "@/components/plugin/browse-hero/BrowseArchetypeCards";
+import { BrowseHeroCarousel } from "@/components/plugin/browse-hero/BrowseHeroCarousel";
+import { nextComposerRequestNonce } from "@/components/plugin/browse-hero/browse-hero-archetypes";
+import { TOOLS_PAGE_BAND_CLASSES } from "@/components/tools/tools-navigation";
 import {
   usePluginCatalogSearch,
   type PluginCatalogSearchEntry,
 } from "@/hooks/queries/plugin-catalog-queries";
-import { removePlugin } from "@/hooks/queries/plugin-settings-queries";
 import type { AddPluginInitial } from "./AddPluginDialog";
-import { PlaceholderBadge } from "./plugin-ui";
+import { PluginAuthorAvatar } from "./PluginAuthorAvatar";
+import { PluginAuthorLink } from "./PluginAuthorLink";
+import { pluginAuthorGithub } from "./plugin-marketplace-author";
+import {
+  PluginBrowseCategoryFilter,
+  pluginBrowseSort,
+  pluginBrowseSortDirection,
+  pluginBrowseSortOptions,
+  type PluginBrowseCategoryOption,
+} from "./PluginBrowseControls";
+import {
+  UNCATEGORIZED_PLUGIN_CATEGORY_ID,
+  pluginBrowseShelves,
+  pluginCategoryFilterId,
+  sortPluginEntries,
+  type PluginBrowseShelf,
+} from "./plugin-browse-discovery";
+import {
+  CatalogEntryIconChip,
+  formatPluginInstallCount,
+  PluginCategoryLabel,
+  pluginCatalogCategoryMutedAccentStyle,
+} from "./plugin-ui";
 
-/** Browse BB's official plugins, bundled with the app. */
+const SHELF_ENTRY_LIMIT = 6;
+
 export function BrowsePluginsTab({
   onInstall,
   onOpenPlugin,
+  onInstallFromSource,
 }: {
   onInstall: (initial: AddPluginInitial) => void;
-  onOpenPlugin: (pluginId: string) => void;
+  onOpenPlugin: (pluginId: string, trigger: HTMLButtonElement) => void;
+  onInstallFromSource: () => void;
 }) {
-  const [query, setQuery] = useState("");
-  // Empty means unfiltered, matching the Type filters on Installed and Skills.
-  const [categories, setCategories] = useState<string[]>([]);
-  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
-  const [debouncedQuery] = useDebounceValue(query.trim(), 300);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const query = searchParams.get("query") ?? "";
+  const creationViewActive = searchParams.get("view") === "create";
+  const selectedCategories = searchParams.getAll("category");
+  const requestedSort = pluginBrowseSort(searchParams.get("sort"));
+  const sortDirection =
+    pluginBrowseSortDirection(searchParams.get("direction")) ?? "desc";
+  const [heroRequest, setHeroRequest] = useState<{
+    nonce: number;
+    seed?: string;
+    close?: boolean;
+  } | null>(() =>
+    creationViewActive ? { nonce: nextComposerRequestNonce() } : null,
+  );
+  const [requestedCreationView, setRequestedCreationView] =
+    useState(creationViewActive);
+  const [composing, setComposing] = useState(false);
+  const [expandedShelves, setExpandedShelves] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const debouncedQuery = useDebouncedValue(query.trim(), 300);
   const searchQuery = usePluginCatalogSearch(debouncedQuery, { enabled: true });
-  const entries = searchQuery.data ?? [];
-  const availableCategories: string[] = [];
-  for (const entry of entries) {
-    if (!availableCategories.includes(entry.category)) {
-      availableCategories.push(entry.category);
-    }
-  }
-  for (const selected of categories) {
-    if (!availableCategories.includes(selected)) {
-      availableCategories.push(selected);
-    }
-  }
-  const categoryOptions = availableCategories.map((name) => ({
-    id: name,
-    label: name,
-  }));
-  const visibleEntries = (
-    categories.length === 0
-      ? entries
-      : entries.filter((entry) => categories.includes(entry.category))
-  )
-    .slice()
-    .sort((left, right) => {
-      const result = left.displayName.localeCompare(right.displayName);
-      if (result !== 0) return sortDirection === "asc" ? result : -result;
-      return left.entryId.localeCompare(right.entryId);
+  const catalog = searchQuery.data ?? { entries: [], collections: [] };
+  const entries = useMemo(
+    () => catalog.entries.filter((entry) => entry.compatible),
+    [catalog.entries],
+  );
+  const installsKnown = entries.some((entry) => entry.installs !== null);
+  const sort =
+    requestedSort === "most-installed" && !installsKnown ? null : requestedSort;
+  const categoryOptions = useMemo(
+    () => pluginCategoryFilterOptions(entries, selectedCategories),
+    [entries, selectedCategories],
+  );
+  const filteredEntries = useMemo(() => {
+    if (selectedCategories.length === 0) return entries;
+    const selected = new Set(selectedCategories);
+    return entries.filter((entry) =>
+      selected.has(pluginCategoryFilterId(entry)),
+    );
+  }, [entries, selectedCategories]);
+  const shelves = useMemo(
+    () =>
+      pluginBrowseShelves({
+        entries: filteredEntries,
+        collections: catalog.collections,
+      }),
+    [catalog.collections, filteredEntries],
+  );
+  const flatEntries = useMemo(
+    () =>
+      sort === null
+        ? []
+        : sortPluginEntries(filteredEntries, sort, sortDirection),
+    [filteredEntries, sort, sortDirection],
+  );
+
+  const changeSearchParams = (
+    change: (next: URLSearchParams) => void,
+    replace = true,
+  ) => {
+    const next = new URLSearchParams(searchParams);
+    change(next);
+    setSearchParams(next, { replace });
+  };
+  const openComposer = (seed?: string) =>
+    setHeroRequest({
+      nonce: nextComposerRequestNonce(),
+      ...(seed === undefined ? {} : { seed }),
     });
+  if (requestedCreationView !== creationViewActive) {
+    setRequestedCreationView(creationViewActive);
+    setHeroRequest({
+      nonce: nextComposerRequestNonce(),
+      ...(creationViewActive ? {} : { close: true }),
+    });
+  }
+  useEffect(() => {
+    if (heroRequest === null) return;
+    const viewport = document.getElementById("plugins-browse-results");
+    viewport?.scrollTo?.({
+      top: 0,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }, [heroRequest]);
 
   return (
-    <ResourceCollectionViewport
-      scrollId="plugins-browse-results"
-      contentClassName="space-y-4"
-      toolbar={
-        <ResourceToolbar
-          searchValue={query}
-          searchPlaceholder="Search plugins"
-          onSearchChange={setQuery}
-          controls={
-            <>
-              {categoryOptions.length > 0 ? (
-                <ResourceMultiSelectMenu
-                  label="Category"
-                  icon="SlidersHorizontal"
-                  compact
-                  selectedValues={categories}
-                  options={categoryOptions}
-                  onChange={setCategories}
-                />
-              ) : null}
-              <ResourceSortMenu
-                value="alpha"
-                direction={sortDirection}
-                compact
-                options={[{ id: "alpha", label: "Plugin name" }]}
-                onChange={() =>
-                  setSortDirection((current) =>
-                    current === "asc" ? "desc" : "asc",
-                  )
+    <ResourceCollectionViewport scrollId="plugins-browse-results">
+      <div className={cn("space-y-7 pb-8", TOOLS_PAGE_BAND_CLASSES)}>
+        <div className="flex items-center justify-end gap-3">
+          <div className="flex items-stretch">
+            <Button
+              className="rounded-r-none"
+              onClick={() => {
+                if (creationViewActive) return;
+                changeSearchParams((next) => next.set("view", "create"), false);
+              }}
+            >
+              <Icon name="MessageSquarePlus" className="size-3.5" />
+              Create a plugin
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="Create a plugin options"
+                  className="rounded-l-none border-l border-l-primary-foreground/20 px-1.5"
+                >
+                  <Icon name="ChevronDown" className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-max min-w-40">
+                <DropdownMenuItem onSelect={onInstallFromSource}>
+                  <Icon name="Download" className="size-4" />
+                  Install from source
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        <BrowseHeroCarousel
+          openRequest={heroRequest}
+          onComposingChange={setComposing}
+        />
+
+        {composing ? (
+          <BrowseArchetypeCards onCreate={openComposer} />
+        ) : (
+          <section className="space-y-6">
+            <div className="mx-auto w-full max-w-3xl">
+              <ResourceToolbar
+                searchValue={query}
+                searchPlaceholder="Search plugins"
+                onSearchChange={(value) =>
+                  changeSearchParams((next) => {
+                    if (value === "") next.delete("query");
+                    else next.set("query", value);
+                  })
+                }
+                controls={
+                  <>
+                    <PluginBrowseCategoryFilter
+                      selectionMode="multiple"
+                      value={selectedCategories}
+                      options={categoryOptions}
+                      onChange={(values) =>
+                        changeSearchParams((next) => {
+                          next.delete("category");
+                          for (const value of values) {
+                            next.append("category", value);
+                          }
+                        })
+                      }
+                    />
+                    <ResourceSortMenu
+                      value={sort}
+                      direction={sortDirection}
+                      compact
+                      placeholderLabel="Featured"
+                      options={pluginBrowseSortOptions(installsKnown)}
+                      onChange={(value) =>
+                        changeSearchParams((next) => {
+                          if (value === sort) {
+                            next.set(
+                              "direction",
+                              sortDirection === "asc" ? "desc" : "asc",
+                            );
+                          } else {
+                            next.set("sort", value);
+                            next.set("direction", "desc");
+                          }
+                        })
+                      }
+                      onClear={() =>
+                        changeSearchParams((next) => {
+                          next.delete("sort");
+                          next.delete("direction");
+                        })
+                      }
+                    />
+                  </>
                 }
               />
-            </>
-          }
-        />
-      }
-    >
-      {searchQuery.isError && entries.length > 0 ? (
-        <p className="text-xs text-warning-text" role="status">
-          Showing cached catalog results because the latest search failed.
-        </p>
-      ) : null}
+            </div>
 
-      {searchQuery.isPending ? (
-        <ResourceListState state="loading" message="Loading plugins" />
-      ) : entries.length === 0 ? (
-        <ResourceListState
-          state={searchQuery.isError ? "error" : "empty"}
-          message={
-            searchQuery.isError
-              ? "BB's official plugins are unavailable."
-              : "No plugins match this search."
-          }
-          onRetry={
-            searchQuery.isError
-              ? () => {
-                  void searchQuery.refetch();
+            {searchQuery.isError && entries.length > 0 ? (
+              <p className="text-xs text-warning-text" role="status">
+                The latest search failed. The page shows saved catalog results.
+              </p>
+            ) : null}
+            {searchQuery.isPending ? (
+              <ResourceListState state="loading" message="Loading plugins" />
+            ) : entries.length === 0 ? (
+              <ResourceListState
+                state={searchQuery.isError ? "error" : "empty"}
+                message={
+                  searchQuery.isError
+                    ? "The plugin catalog is not available."
+                    : "No plugins match this search."
                 }
-              : undefined
-          }
-        />
-      ) : (
-        <div className="space-y-3">
-          {visibleEntries.length === 0 ? (
-            <ResourceListState
-              state="empty"
-              message="No plugins match these filters."
-            />
-          ) : (
-            <ResourceBrowseGrid className="grid-cols-[repeat(auto-fill,minmax(min(100%,18rem),1fr))] gap-2">
-              {visibleEntries.map((entry) => (
-                <BrowseCard
-                  key={entry.entryId}
-                  entry={entry}
-                  installedPluginId={entry.installed ? entry.pluginId : null}
-                  onInstall={onInstall}
-                  onOpenPlugin={onOpenPlugin}
-                />
-              ))}
-            </ResourceBrowseGrid>
-          )}
-        </div>
-      )}
+                onRetry={
+                  searchQuery.isError
+                    ? () => {
+                        void searchQuery.refetch();
+                      }
+                    : undefined
+                }
+              />
+            ) : filteredEntries.length === 0 ? (
+              <ResourceListState
+                state="empty"
+                message="No plugins match these category filters."
+              />
+            ) : sort === null ? (
+              <div className="space-y-8" data-testid="plugin-browse-shelves">
+                {shelves.map((shelf) => (
+                  <BrowseShelf
+                    key={shelf.key}
+                    shelf={shelf}
+                    expanded={expandedShelves.has(shelf.key)}
+                    onExpand={() =>
+                      setExpandedShelves((current) =>
+                        new Set(current).add(shelf.key),
+                      )
+                    }
+                    onInstall={onInstall}
+                    onOpenPlugin={onOpenPlugin}
+                  />
+                ))}
+              </div>
+            ) : (
+              <PluginCatalogGrid
+                entries={flatEntries}
+                showCategory
+                onInstall={onInstall}
+                onOpenPlugin={onOpenPlugin}
+              />
+            )}
+          </section>
+        )}
+      </div>
     </ResourceCollectionViewport>
   );
 }
 
-function BrowseCard({
+export function pluginCategoryFilterOptions(
+  entries: readonly PluginCatalogSearchEntry[],
+  selected: readonly string[],
+): PluginBrowseCategoryOption[] {
+  const labels = new Map<string, string>();
+  const counts = new Map<string, number>();
+  const unknownIds: string[] = [];
+  for (const entry of entries) {
+    const id = pluginCategoryFilterId(entry);
+    if (!labels.has(id)) {
+      labels.set(
+        id,
+        id === UNCATEGORIZED_PLUGIN_CATEGORY_ID
+          ? "Uncategorized"
+          : (entry.category ?? id),
+      );
+      if (
+        id !== UNCATEGORIZED_PLUGIN_CATEGORY_ID &&
+        pluginCatalogCategory(id) === undefined
+      ) {
+        unknownIds.push(id);
+      }
+    }
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  for (const id of selected) {
+    if (labels.has(id)) continue;
+    const category = pluginCatalogCategory(id);
+    labels.set(
+      id,
+      id === UNCATEGORIZED_PLUGIN_CATEGORY_ID
+        ? "Uncategorized"
+        : (category?.displayName ?? id),
+    );
+    if (id !== UNCATEGORIZED_PLUGIN_CATEGORY_ID && category === undefined) {
+      unknownIds.push(id);
+    }
+  }
+  const orderedIds = [
+    ...PLUGIN_CATALOG_CATEGORIES.map((category) => category.id).filter((id) =>
+      labels.has(id),
+    ),
+    ...unknownIds,
+    ...(labels.has(UNCATEGORIZED_PLUGIN_CATEGORY_ID)
+      ? [UNCATEGORIZED_PLUGIN_CATEGORY_ID]
+      : []),
+  ];
+  return orderedIds.map((id) => ({
+    id,
+    label: labels.get(id) ?? id,
+    count: counts.get(id) ?? 0,
+  }));
+}
+
+function BrowseShelf({
+  shelf,
+  expanded,
+  onExpand,
+  onInstall,
+  onOpenPlugin,
+}: {
+  shelf: PluginBrowseShelf;
+  expanded: boolean;
+  onExpand: () => void;
+  onInstall: (initial: AddPluginInitial) => void;
+  onOpenPlugin: (pluginId: string, trigger: HTMLButtonElement) => void;
+}) {
+  const visible = expanded
+    ? shelf.entries
+    : shelf.entries.slice(0, SHELF_ENTRY_LIMIT);
+  return (
+    <ResourceSourceShelf
+      label={shelf.label}
+      description={shelf.description}
+      contentMode="panel"
+      contentSurface="plain"
+      leading={
+        <span
+          className="size-2 rounded-full"
+          style={pluginCatalogCategoryMutedAccentStyle(shelf.categoryId)}
+          aria-hidden
+        />
+      }
+      browseAction={
+        visible.length < shelf.entries.length ? (
+          <ResourceShelfSeeAllAction type="button" onClick={onExpand} />
+        ) : undefined
+      }
+    >
+      <div data-plugin-shelf>
+        <div data-plugin-shelf-grid className="grid gap-2">
+          {visible.map((entry) => (
+            <PluginCatalogCard
+              key={`${entry.marketplace}/${entry.entryId}`}
+              entry={entry}
+              showCategory={false}
+              onInstall={onInstall}
+              onOpenPlugin={onOpenPlugin}
+            />
+          ))}
+        </div>
+      </div>
+    </ResourceSourceShelf>
+  );
+}
+
+export function PluginCatalogGrid({
+  entries,
+  showCategory,
+  onInstall,
+  onOpenPlugin,
+}: {
+  entries: readonly PluginCatalogSearchEntry[];
+  showCategory: boolean;
+  onInstall: (initial: AddPluginInitial) => void;
+  onOpenPlugin: (pluginId: string, trigger: HTMLButtonElement) => void;
+}) {
+  return (
+    <ResourceBrowseGrid className="mx-auto w-full max-w-3xl grid-cols-[repeat(auto-fill,minmax(min(100%,18rem),1fr))] gap-2">
+      {entries.map((entry) => (
+        <PluginCatalogCard
+          key={`${entry.marketplace}/${entry.entryId}`}
+          entry={entry}
+          showCategory={showCategory}
+          onInstall={onInstall}
+          onOpenPlugin={onOpenPlugin}
+        />
+      ))}
+    </ResourceBrowseGrid>
+  );
+}
+
+function PluginCatalogCard({
   entry,
-  installedPluginId,
+  showCategory,
   onInstall,
   onOpenPlugin,
 }: {
   entry: PluginCatalogSearchEntry;
-  installedPluginId: string | null;
+  showCategory: boolean;
   onInstall: (initial: AddPluginInitial) => void;
-  onOpenPlugin: (pluginId: string) => void;
+  onOpenPlugin: (pluginId: string, trigger: HTMLButtonElement) => void;
 }) {
-  const queryClient = useQueryClient();
-  const [confirmingUninstall, setConfirmingUninstall] = useState(false);
-  const uninstall = useMutation({
-    mutationFn: () => {
-      if (installedPluginId === null) {
-        throw new Error("Installed plugin id is unavailable");
-      }
-      return removePlugin(fetch, installedPluginId);
-    },
-    onSuccess: () => {
-      setConfirmingUninstall(false);
-      invalidatePluginList({ queryClient });
-      invalidatePluginCatalogSearch({ queryClient });
-      appToast.success(`${entry.displayName} uninstalled`);
-    },
-    onError: (error) => {
-      appToast.error(`Uninstalling ${entry.displayName} failed`, {
-        description: error instanceof Error ? error.message : String(error),
-      });
-    },
-  });
-
-  const leading = (
-    <PlaceholderBadge
-      className="size-6"
-      iconName={pluginIconName(entry.icon)}
-    />
-  );
-  const description =
-    entry.description.length > 0 ? entry.description : undefined;
-  const descriptionArea = (
-    <span className="block min-h-[2lh]">{description}</span>
-  );
-  const byline =
-    !entry.compatible && entry.incompatibleReason !== null ? (
-      <span className="text-warning-text">{entry.incompatibleReason}</span>
-    ) : undefined;
-  const headerAction =
-    installedPluginId !== null ? (
-      <ResourceInstallControl
-        accessibleLabel={`Uninstall ${entry.displayName}`}
-        pending={uninstall.isPending}
-        presentation="icon"
-        tooltip={`Uninstall ${entry.displayName}`}
-        className="border-transparent bg-transparent text-[color:color-mix(in_oklab,var(--success)_72%,var(--ink))] shadow-none hover:border-transparent hover:bg-transparent hover:text-[color:color-mix(in_oklab,var(--success)_72%,var(--ink))] focus-visible:border-transparent focus-visible:bg-transparent focus-visible:text-[color:color-mix(in_oklab,var(--success)_72%,var(--ink))]"
-        onAction={() => setConfirmingUninstall(true)}
-      />
-    ) : (
-      <ResourceInstallControl
-        accessibleLabel={`Install ${entry.displayName}`}
-        disabled={!entry.compatible}
-        presentation="icon"
-        tooltip={`Install ${entry.displayName}`}
-        onAction={() =>
-          onInstall({
-            entryId: entry.entryId,
-            displayName: entry.displayName,
-            icon: entry.icon,
-          })
-        }
-      />
-    );
-
+  const count =
+    entry.installs === null
+      ? undefined
+      : {
+          display: formatPluginInstallCount(entry.installs),
+          accessibleLabel: `${entry.installs.toLocaleString()} ${entry.installs === 1 ? "install" : "installs"}`,
+        };
+  const authorName = entry.author?.name ?? entry.publisherLabel;
   return (
-    <>
-      <ResourceBrowseCard
-        className="min-h-20 gap-x-2 gap-y-1.5 p-2.5"
-        leading={leading}
-        title={entry.displayName}
-        description={descriptionArea}
-        byline={byline}
-        headerAction={headerAction}
-        openLabel={`Open ${entry.displayName} details`}
-        onOpen={() => onOpenPlugin(entry.pluginId)}
-      />
-      <ConfirmDeleteDialog
-        open={confirmingUninstall}
-        onOpenChange={(open) => {
-          if (!uninstall.isPending) setConfirmingUninstall(open);
-        }}
-      >
-        <ConfirmDeleteDialogContent
-          title={`Uninstall ${entry.displayName}?`}
-          description="The plugin will be removed from this BB host. Plugin data may be retained for a future reinstall."
-          confirmLabel={uninstall.isPending ? "Uninstalling…" : "Uninstall"}
-          pending={uninstall.isPending}
-          onConfirm={() => uninstall.mutate()}
-          onCancel={() => setConfirmingUninstall(false)}
-        />
-      </ConfirmDeleteDialog>
-    </>
+    <ResourceBrowseCard
+      className="min-h-28 gap-x-2 gap-y-1.5 p-3"
+      leading={<CatalogEntryIconChip entry={entry} />}
+      leadingClassName="size-10"
+      title={entry.displayName}
+      description={entry.description || undefined}
+      byline={
+        <span className="flex items-center gap-1.5">
+          <PluginAuthorAvatar
+            name={authorName}
+            github={pluginAuthorGithub(entry.author)}
+            size="detail"
+          />
+          <span className="truncate">
+            By{" "}
+            {entry.author === null ? (
+              authorName
+            ) : (
+              <PluginAuthorLink
+                entry={entry}
+                className="pointer-events-auto relative z-10 rounded-sm underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                {authorName}
+              </PluginAuthorLink>
+            )}
+          </span>
+        </span>
+      }
+      footerMeta={
+        showCategory && entry.category !== undefined ? (
+          <PluginCategoryLabel
+            categoryId={entry.categoryId}
+            label={entry.category}
+          />
+        ) : undefined
+      }
+      headerAction={
+        entry.installed ? (
+          <ResourceInstalledControl
+            accessibleLabel="Installed"
+            presentation="compact"
+            count={count}
+          />
+        ) : (
+          <ResourceInstallControl
+            accessibleLabel={`Install ${entry.displayName}${
+              count === undefined ? "" : ` — ${count.accessibleLabel}`
+            }`}
+            disabled={!entry.compatible}
+            presentation="compact"
+            tooltip={`Install ${entry.displayName}`}
+            count={count}
+            className="border-border/80 bg-background text-foreground shadow-none hover:bg-state-hover"
+            onAction={() =>
+              onInstall({
+                entryId: entry.entryId,
+                marketplace: entry.marketplace,
+                pluginId: entry.pluginId,
+                publisherLabel: entry.publisherLabel,
+                displayName: entry.displayName,
+                icon: entry.icon,
+                iconUrl: entry.iconUrl,
+                iconTinted: entry.iconTinted,
+                source: entry.source,
+              })
+            }
+          />
+        )
+      }
+      openLabel={`Open ${entry.displayName} details`}
+      onOpen={(trigger) => onOpenPlugin(entry.pluginId, trigger)}
+    />
   );
 }

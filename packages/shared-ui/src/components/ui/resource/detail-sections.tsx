@@ -10,6 +10,8 @@ export type ResourceDetailSectionKind =
   | "activity";
 
 export interface ResourceDetailSectionProps {
+  id?: string;
+  className?: string;
   label: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
@@ -17,12 +19,18 @@ export interface ResourceDetailSectionProps {
 
 export function ResourceDetailSection({
   kind = "definition",
+  id,
+  className,
   label,
   actions,
   children,
 }: ResourceDetailSectionProps & { kind?: ResourceDetailSectionKind }) {
   return (
-    <section className="space-y-3" data-resource-detail-section={kind}>
+    <section
+      id={id}
+      className={cn("space-y-3", className)}
+      data-resource-detail-section={kind}
+    >
       <div className="flex min-h-6 items-center justify-between gap-3">
         <h2 className="text-sm font-medium text-foreground">{label}</h2>
         {actions ? (
@@ -34,46 +42,31 @@ export function ResourceDetailSection({
   );
 }
 
-/**
- * One open hierarchy for a resource's semantic detail sections.
- *
- * The page is the panel. Quiet rules and shared padding separate its sections
- * without turning every section into a card. Individual content can still use
- * a recessed surface when its shape benefits from one, such as source code,
- * settings, or an error.
- */
-
 function section(kind: ResourceDetailSectionKind) {
   function ResourceKindSection(props: ResourceDetailSectionProps) {
     return <ResourceDetailSection {...props} kind={kind} />;
   }
-  // Without this every semantic section reports as "ResourceKindSection" in
-  // DevTools, component stacks, and error-boundary output.
   ResourceKindSection.displayName = `Resource${kind[0]!.toUpperCase()}${kind.slice(1)}Section`;
   return ResourceKindSection;
 }
 
 export const ResourceDetailOverviewSection = section("overview");
 
-/** The editable or inspectable primary content that defines a resource. */
 export const ResourceDefinitionSection = section("definition");
 
-/** Behavior-changing fields and settings. */
 export const ResourceDetailConfigurationSection = section("configuration");
 
-/** Version, delivery source, compatibility, and update policy. */
 export const ResourceDetailReleaseSection = section("release");
 
-/** Child resources and capabilities contributed by the resource. */
 export const ResourceDetailIncludesSection = section("includes");
 
-/** Current state and historical events produced by a resource. */
 export const ResourceActivitySection = section("activity");
 
 export function ResourceDetailPage({
   title,
   titleMeta,
   leading,
+  leadingClassName,
   lifecycleControl,
   overflowMenu,
   actions,
@@ -83,16 +76,14 @@ export function ResourceDetailPage({
   children,
 }: {
   title: ReactNode;
-  /** Passive provenance or ownership shown inline with the resource name. */
   titleMeta?: ReactNode;
   leading?: ReactNode;
+  leadingClassName?: string;
   lifecycleControl?: ReactNode;
   overflowMenu?: ReactNode;
-  /** Focused page actions, such as Create, Cancel, or Save. */
   actions?: ReactNode;
   metadata?: ReactNode;
   description?: ReactNode;
-  /** Width of the centered detail column. */
   maxWidthClassName?: string;
   children: ReactNode;
 }) {
@@ -102,7 +93,12 @@ export function ResourceDetailPage({
         <div className="min-w-0 flex-1 space-y-2">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             {leading ? (
-              <span className="flex size-4 shrink-0 items-center justify-center">
+              <span
+                className={cn(
+                  "flex size-4 shrink-0 items-center justify-center",
+                  leadingClassName,
+                )}
+              >
                 {leading}
               </span>
             ) : null}
@@ -116,9 +112,6 @@ export function ResourceDetailPage({
             ) : null}
           </div>
           {metadata ? (
-            // One tone below muted: the metadata row under a resource title is
-            // rank-4 information on every detail page, and at muted it competed
-            // with the section content below it.
             <div className="text-xs text-subtle-foreground">{metadata}</div>
           ) : null}
           {description ? (

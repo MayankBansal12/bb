@@ -1,17 +1,29 @@
 import type {
   InstalledPlugin,
   PluginApplyUpdateResult as SdkPluginApplyUpdateResult,
+  PluginCatalogAuthor,
+  PluginCatalogCollection,
+  PluginCatalogCollectionMembership,
+  PluginCatalogResolvedSource,
   PluginCatalogSearchResult as SdkPluginCatalogSearchResult,
+  PluginMarketplace,
+  PluginMarketplaceRefreshResult,
   PluginSourceDetail as SdkPluginSourceDetail,
   PluginUpdateCheckEntry,
 } from "@bb/server-contract";
-import { useQuery, type QueryKey } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { createPluginsClient } from "./plugin-client";
 import { toEpochMs } from "./plugin-settings-queries";
+import {
+  pluginCatalogInstallPlanQueryKey,
+  pluginCatalogSearchQueryKey,
+  pluginMarketplacesQueryKey,
+  pluginSourceQueryKey,
+} from "./query-keys";
 
 type FetchLike = typeof fetch;
 
-export interface PluginSourceDetail {
+interface PluginSourceDetail {
   requested: string;
   resolved: string;
   integrity: string | null;
@@ -41,8 +53,7 @@ function toPluginSourceDetail(
   };
 }
 
-/** Null when the plugin is unknown or the server predates the route. */
-export async function fetchPluginSource(
+async function fetchPluginSource(
   fetchImpl: FetchLike,
   pluginId: string,
 ): Promise<PluginSourceDetail | null> {
@@ -53,14 +64,6 @@ export async function fetchPluginSource(
   } catch {
     return null;
   }
-}
-
-export function pluginSourceQueryKey(pluginId: string): QueryKey {
-  return ["plugin-source", pluginId];
-}
-
-export function allPluginSourceQueryKeyPrefix(): QueryKey {
-  return ["plugin-source"];
 }
 
 export function usePluginSource(
@@ -84,17 +87,73 @@ export async function installPlugin(
 
 export async function installCatalogPlugin(
   fetchImpl: FetchLike,
-  args: { entryId: string },
+  args: {
+    entryId: string;
+    marketplace?: string;
+    confirmedSource?: PluginCatalogResolvedSource;
+  },
 ): Promise<InstalledPlugin> {
   return createPluginsClient(fetchImpl).catalog.install(args);
 }
 
-export interface PluginResolvedVersion {
+export function useCatalogInstallPlan(
+  args: { entryId: string; marketplace?: string } | null,
+) {
+  const request = args ?? { entryId: "" };
+  return useQuery({
+    queryKey: pluginCatalogInstallPlanQueryKey(request),
+    queryFn: () => createPluginsClient(fetch).catalog.installPlan(request),
+    enabled: args !== null,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+  });
+}
+
+async function listPluginMarketplaces(
+  fetchImpl: FetchLike,
+): Promise<PluginMarketplace[]> {
+  return createPluginsClient(fetchImpl).marketplaces.list();
+}
+
+export async function addPluginMarketplace(
+  fetchImpl: FetchLike,
+  source: string,
+): Promise<PluginMarketplace> {
+  return createPluginsClient(fetchImpl).marketplaces.add({ source });
+}
+
+export async function removePluginMarketplace(
+  fetchImpl: FetchLike,
+  name: string,
+): Promise<{ convertedPluginIds: string[] }> {
+  return createPluginsClient(fetchImpl).marketplaces.remove({ name });
+}
+
+export async function refreshPluginMarketplaces(
+  fetchImpl: FetchLike,
+  name?: string,
+): Promise<PluginMarketplaceRefreshResult[]> {
+  return createPluginsClient(fetchImpl).marketplaces.refresh(
+    name === undefined ? {} : { name },
+  );
+}
+
+export function usePluginMarketplaces(options: { enabled: boolean }) {
+  return useQuery({
+    queryKey: pluginMarketplacesQueryKey(),
+    queryFn: () => listPluginMarketplaces(fetch),
+    enabled: options.enabled,
+    staleTime: 30_000,
+  });
+}
+
+interface PluginResolvedVersion {
   version: string;
   display: string;
 }
 
-export type PluginUpdatesOutcome = PluginUpdateCheckEntry["outcome"];
+type PluginUpdatesOutcome = PluginUpdateCheckEntry["outcome"];
 
 export interface PluginUpdatesEntry {
   id: string;
@@ -156,9 +215,24 @@ export interface PluginCatalogSearchEntry {
   displayName: string;
   description: string;
   icon: string | null;
-  category: string;
+  iconUrl: string | null;
+  iconTinted: boolean;
+  categoryId?: string;
+  category?: string;
+  screenshots: string[];
+  overview?: string;
+  collections: PluginCatalogCollectionMembership[];
+  publishedAt?: string;
   source: string;
+  repositoryUrl: string | null;
+  marketplace: string;
+  marketplaceDisplayName: string;
+  publisherKey: string;
+  publisherLabel: string;
+  official: boolean;
+  author: PluginCatalogAuthor | null;
   installed: boolean;
+  installs: number | null;
   compatible: boolean;
   incompatibleReason: string | null;
 }
@@ -172,30 +246,49 @@ function toPluginCatalogSearchEntry(
     displayName: data.displayName,
     description: data.description,
     icon: data.icon,
-    category: data.category,
+    iconUrl: data.iconUrl,
+    iconTinted: data.iconTinted,
+    ...(data.categoryId === undefined ? {} : { categoryId: data.categoryId }),
+    ...(data.category === undefined ? {} : { category: data.category }),
+    screenshots: data.screenshots,
+    ...(data.overview === undefined ? {} : { overview: data.overview }),
+    collections: data.collections,
+    ...(data.publishedAt === undefined
+      ? {}
+      : { publishedAt: data.publishedAt }),
     source: data.source,
+    repositoryUrl: data.repositoryUrl,
+    marketplace: data.marketplace,
+    marketplaceDisplayName: data.marketplaceDisplayName,
+    publisherKey: data.publisherKey,
+    publisherLabel: data.publisherLabel,
+    official: data.official,
+    author: data.author,
     installed: data.installed,
+    installs: data.installs,
     compatible: data.compatible,
     incompatibleReason: data.incompatibleReason ?? null,
   };
 }
 
+export interface PluginCatalogSearchData {
+  entries: PluginCatalogSearchEntry[];
+  collections: PluginCatalogCollection[];
+}
+
 export async function searchPluginCatalog(
   fetchImpl: FetchLike,
   query: string,
-): Promise<PluginCatalogSearchEntry[]> {
-  const results = await createPluginsClient(fetchImpl).catalog.search({
+): Promise<PluginCatalogSearchData> {
+  const { results, collections } = await createPluginsClient(
+    fetchImpl,
+  ).catalog.search({
     query,
   });
-  return results.map(toPluginCatalogSearchEntry);
-}
-
-export function pluginCatalogSearchQueryKey(query: string): QueryKey {
-  return ["plugin-catalog-search", query];
-}
-
-export function allPluginCatalogSearchQueryKeyPrefix(): QueryKey {
-  return ["plugin-catalog-search"];
+  return {
+    entries: results.map(toPluginCatalogSearchEntry),
+    collections,
+  };
 }
 
 const PLUGIN_CATALOG_STALE_TIME_MS = 30 * 60_000;

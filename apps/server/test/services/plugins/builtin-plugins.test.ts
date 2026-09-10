@@ -5,6 +5,7 @@ import {
   readFile,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,8 +20,10 @@ import {
 } from "@bb/db";
 import { PLUGIN_SDK_MAJOR, PLUGIN_SDK_VERSION } from "@bb/domain";
 import type { Logger } from "@bb/logger";
+import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
 import {
   createPluginService,
+  dispatchPluginSourceWatchChange,
   type PluginService,
 } from "../../../src/services/plugins/plugin-service.js";
 import { readPluginManifest } from "../../../src/services/plugins/manifest.js";
@@ -32,6 +35,7 @@ import {
 } from "../../../src/services/plugins/builtin-registry.js";
 import { copyBuiltinPlugins } from "../../../scripts/copy-builtin-plugins.js";
 import { testLogger } from "../../helpers/test-app.js";
+import { createNoopTelemetryService } from "../../../src/services/system/telemetry.js";
 
 const logger = testLogger as unknown as Logger;
 const testDir = dirname(fileURLToPath(import.meta.url));
@@ -57,12 +61,10 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
   sourceModuleDir: string;
 }> {
   const sourceModuleDir = join(workDir, "source-module");
-  // copyBuiltinPlugins packages EVERY declared builtin, so the synthetic
-  // source tree must carry one packaged plugin per BUILTIN_PLUGIN_NAMES
-  // entry — a name added to the registry is covered here automatically.
   for (const name of BUILTIN_PLUGIN_NAMES) {
     const sourceRoot = join(sourceModuleDir, "builtin-plugins", name);
     const usesPluginOwnedIcon = name === "automations";
+    const usesDeclaredIcons = name === "provider-acp";
     await mkdir(join(sourceRoot, "dist"), { recursive: true });
     await mkdir(join(sourceRoot, "skills", name), { recursive: true });
     await mkdir(join(sourceRoot, "src"), { recursive: true });
@@ -76,9 +78,14 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
           bb: {
             name,
             description: `${name} builtin plugin fixture.`,
-            branding: usesPluginOwnedIcon
-              ? { icon: "./assets/icon.svg" }
-              : { icon: "Zap" },
+            branding: {
+              ...(usesPluginOwnedIcon
+                ? { icon: "./assets/icon.svg" }
+                : { icon: "Zap" }),
+              ...(usesDeclaredIcons
+                ? { experimental_icons: { cursor: "./icons/cursor.svg" } }
+                : {}),
+            },
             server: "./src/server.ts",
             app: "./app.tsx",
             skills: ["skills"],
@@ -99,6 +106,10 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
     if (usesPluginOwnedIcon) {
       await mkdir(join(sourceRoot, "assets"), { recursive: true });
       await writeFile(join(sourceRoot, "assets", "icon.svg"), "<svg/>\n");
+    }
+    if (usesDeclaredIcons) {
+      await mkdir(join(sourceRoot, "icons"), { recursive: true });
+      await writeFile(join(sourceRoot, "icons", "cursor.svg"), "<svg/>\n");
     }
     await writeFile(
       join(sourceRoot, "dist", "server.js"),
@@ -145,6 +156,8 @@ function createService(args: {
   watchBuiltinPluginSources?: boolean;
 }): PluginService {
   return createPluginService({
+    aiServices: createAiServiceRegistry(),
+    telemetry: createNoopTelemetryService(),
     db: args.db,
     hub: {
       getDaemonSessionIdForHost: () => null,
@@ -176,6 +189,14 @@ describe("builtin plugin reconciliation", () => {
   let workDir: string;
   let service: PluginService | undefined;
 
+  it("reloads when the source watcher omits the changed filename", () => {
+    const changes: string[] = [];
+
+    dispatchPluginSourceWatchChange((path) => changes.push(path), null);
+
+    expect(changes).toEqual(["."]);
+  });
+
   beforeEach(async () => {
     delete globals.__builtinFixtureLoads;
     delete globals.__packagedBuiltinLoads;
@@ -187,7 +208,14 @@ describe("builtin plugin reconciliation", () => {
 
   it("keeps official plugins bundled but out of the auto-install builtins", () => {
     const optionalNames = OFFICIAL_PLUGINS.map((plugin) => plugin.name);
-    expect(optionalNames).toEqual(["github", "docs", "memory", "tasks"]);
+    expect(optionalNames).toEqual([
+      "browser-automation",
+      "github",
+      "docs",
+      "memory",
+      "tasks",
+      "theme-preview",
+    ]);
     for (const name of optionalNames) {
       expect(BUILTIN_PLUGINS.map((plugin) => plugin.name)).not.toContain(name);
     }
@@ -196,15 +224,33 @@ describe("builtin plugin reconciliation", () => {
 
   it("gives every builtin plugin a deliberate settings icon", async () => {
     const expectedIcons = new Map([
+      ["bb-guide", "Explore"],
+      ["account-pool", "Layers"],
       ["ask-user-question", "MessageQuestion"],
       ["automations", "Clock"],
+      ["concurrency-limit", "Limitation"],
       ["connect", "Smartphone"],
       ["custom-instructions", "EditFile"],
+      ["plugin-api-tester", "Beaker"],
       ["inline-vis", "AppWindow"],
+      ["keep-awake", "Coffee"],
+      ["monaco-editor", "Code"],
+      ["pdf-preview", "FileText"],
+      ["environment-project-checkout", "Laptop"],
+      ["environment-personal-workspace", "Folder"],
+      ["provider-acp", "./icons/acp.svg"],
+      ["plugin-api-docs", "./icons/ai-generative.svg"],
+      ["provider-claude-code", "./icons/claude-code.svg"],
+      ["provider-codex", "./icons/codex.svg"],
+      ["provider-pi", "./icons/pi.svg"],
       ["provider-retry", "ArrowReloadHorizontal"],
+      ["provider-usage", "ChartColumn"],
+      ["push-notifications", "BellDot"],
+      ["scheduled-send", "Calendar"],
       ["secrets", "Lock"],
       ["side-chat", "SideChat"],
       ["workflows", "Workflow"],
+      ["environment-git-worktree", "FolderGit"],
     ]);
 
     expect(BUILTIN_PLUGINS).toHaveLength(expectedIcons.size);
@@ -336,6 +382,32 @@ describe("builtin plugin reconciliation", () => {
     ).toEqual(once);
   });
 
+  it("keeps an offline legacy git ref unclassified", async () => {
+    const missingRepo = join(workDir, "missing-remote");
+    db.$client
+      .prepare(
+        `INSERT INTO plugins
+         (id, source, root_dir, version, enabled, installed_at, updated_at)
+         VALUES (?, ?, ?, '1.0.0', 0, 10, 20)`,
+      )
+      .run(
+        "legacy-offline-tag",
+        `git:${missingRepo}@v1.0.0`,
+        join(workDir, "missing-plugin-root"),
+      );
+
+    service = createService({ db, dataDir: join(workDir, "data") });
+    await service.start();
+
+    expect(
+      getInstalledPluginRegistration(db, "legacy-offline-tag"),
+    ).toMatchObject({
+      normalizationVersion: 1,
+      sourceGitRequestedRef: "v1.0.0",
+      sourceGitRefKind: null,
+    });
+  });
+
   it("installs a default-disabled builtin without loading it", async () => {
     service = createService({
       db,
@@ -373,6 +445,69 @@ describe("builtin plugin reconciliation", () => {
     ]);
   });
 
+  it("preserves an installed builtin's choice when its default changes", async () => {
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      defaultEnabled: false,
+    });
+    await service.start();
+    await service.stop();
+
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      defaultEnabled: true,
+    });
+    await service.start();
+
+    expect(service.list()).toMatchObject([
+      { id: "builtin-fixture", enabled: false, status: "disabled" },
+    ]);
+    expect(loadCount()).toBe(0);
+  });
+
+  it("ships Plugin API Tester disabled on a fresh database", () => {
+    const pluginApiTester = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "plugin-api-tester",
+    );
+
+    expect(pluginApiTester?.defaultEnabled).toBe(false);
+  });
+
+  it("ships the File Editor (monaco-editor) disabled on a fresh database", () => {
+    const monacoEditor = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "monaco-editor",
+    );
+
+    expect(monacoEditor?.defaultEnabled).toBe(false);
+  });
+
+  it("ships the Plugin Guide disabled on a fresh database", async () => {
+    const pluginGuide = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "plugin-api-docs",
+    );
+    expect(pluginGuide?.defaultEnabled).toBe(false);
+
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      builtinName: "plugin-api-docs",
+      defaultEnabled: pluginGuide?.defaultEnabled,
+      rootDir: resolveBuiltinPluginRootPath("plugin-api-docs"),
+    });
+    await service.start();
+
+    expect(service.list()).toMatchObject([
+      {
+        id: "plugin-api-docs",
+        source: "builtin:plugin-api-docs",
+        enabled: false,
+        status: "disabled",
+      },
+    ]);
+  });
+
   it("ships Workflows disabled on a fresh database", async () => {
     const workflows = BUILTIN_PLUGINS.find(
       (builtin) => builtin.name === "workflows",
@@ -398,11 +533,52 @@ describe("builtin plugin reconciliation", () => {
     ]);
   });
 
-  it("ships Provider retry disabled on a fresh database", async () => {
+  it("ships Provider usage disabled on a fresh database", async () => {
+    const providerUsage = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "provider-usage",
+    );
+    expect(providerUsage?.defaultEnabled).toBe(false);
+
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      builtinName: "provider-usage",
+      defaultEnabled: providerUsage?.defaultEnabled,
+      rootDir: resolveBuiltinPluginRootPath("provider-usage"),
+    });
+    await service.start();
+
+    expect(service.list()).toMatchObject([
+      {
+        id: "provider-usage",
+        source: "builtin:provider-usage",
+        enabled: false,
+        status: "disabled",
+      },
+    ]);
+  });
+
+  it("ships Concurrency limit enabled on a fresh database", () => {
+    const limiter = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "concurrency-limit",
+    );
+    expect(limiter).toBeDefined();
+    expect(limiter?.defaultEnabled).toBe(true);
+  });
+
+  it("ships Send later enabled on a fresh database", () => {
+    const scheduledSend = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "scheduled-send",
+    );
+    expect(scheduledSend).toBeDefined();
+    expect(scheduledSend?.defaultEnabled).toBe(true);
+  });
+
+  it("ships Provider retry enabled on a fresh database", async () => {
     const providerRetry = BUILTIN_PLUGINS.find(
       (builtin) => builtin.name === "provider-retry",
     );
-    expect(providerRetry?.defaultEnabled).toBe(false);
+    expect(providerRetry?.defaultEnabled).toBe(true);
 
     service = createService({
       db,
@@ -417,10 +593,17 @@ describe("builtin plugin reconciliation", () => {
       {
         id: "provider-retry",
         source: "builtin:provider-retry",
-        enabled: false,
-        status: "disabled",
+        enabled: true,
+        status: "running",
       },
     ]);
+  });
+
+  it("ships Push notifications enabled on a fresh database", () => {
+    const pushPlugin = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "push-notifications",
+    );
+    expect(pushPlugin?.defaultEnabled).toBe(true);
   });
 
   it("loads the builtin connect plugin like other builtins", async () => {
@@ -566,8 +749,6 @@ describe("builtin plugin reconciliation", () => {
       join(mutableRoot, "server.ts"),
       'export default function plugin() { globalThis.__hotBuiltinServerVersion = "before"; }\n',
     );
-    // A source-layout builtin may retain artifacts from a production build.
-    // Dev reloads must still execute the edited source entry.
     await writeFile(
       join(mutableRoot, "dist", "server.js"),
       'export default function plugin() { globalThis.__hotBuiltinServerVersion = "stale-dist"; }\n',
@@ -601,6 +782,71 @@ describe("builtin plugin reconciliation", () => {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
     }
     expect(globals.__hotBuiltinServerVersion).toBe("after");
+  }, 30_000);
+
+  it("rebuilds a source-layout builtin app changed while the server was stopped", async () => {
+    const mutableRoot = join(workDir, "bb-plugin-stale-app-builtin");
+    await mkdir(mutableRoot, { recursive: true });
+    await writeFile(
+      join(mutableRoot, "package.json"),
+      JSON.stringify({
+        name: "bb-plugin-stale-app-builtin",
+        version: "0.1.0",
+        type: "module",
+        bb: {
+          name: "Stale app builtin",
+          description: "Stale app builtin plugin fixture.",
+          branding: { icon: "Zap" },
+          server: "./server.ts",
+          app: "./app.tsx",
+        },
+      }),
+    );
+    await writeFile(
+      join(mutableRoot, "server.ts"),
+      "export default function plugin() {}\n",
+    );
+    await writeFile(
+      join(mutableRoot, "app.tsx"),
+      'import { label } from "./label.js";\nexport default function App() { return <div>{label}</div>; }\n',
+    );
+    const labelPath = join(mutableRoot, "label.ts");
+    await writeFile(labelPath, 'export const label = "before";\n');
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      builtinName: "stale-app",
+      rootDir: mutableRoot,
+      watchBuiltinPluginSources: true,
+    });
+    await service.start();
+    const beforeHash = service.list()[0]?.app.bundle?.hash;
+    expect(beforeHash).toBeTruthy();
+    await expect(
+      readFile(join(mutableRoot, "dist", "app.js"), "utf8"),
+    ).resolves.toContain("before");
+    await service.stop();
+
+    await writeFile(labelPath, 'export const label = "after";\n');
+    const oldArtifactTime = new Date(1_000);
+    await utimes(
+      join(mutableRoot, "dist", "app.js"),
+      oldArtifactTime,
+      oldArtifactTime,
+    );
+    service = createService({
+      db,
+      dataDir: join(workDir, "data"),
+      builtinName: "stale-app",
+      rootDir: mutableRoot,
+      watchBuiltinPluginSources: true,
+    });
+    await service.start();
+
+    expect(service.list()[0]?.app.bundle?.hash).not.toBe(beforeHash);
+    await expect(
+      readFile(join(mutableRoot, "dist", "app.js"), "utf8"),
+    ).resolves.toContain("after");
   }, 30_000);
 
   it("surfaces builtin app build failures in status until the next successful build", async () => {
@@ -681,9 +927,9 @@ describe("builtin plugin reconciliation", () => {
   it("rejects unknown builtin install sources clearly", async () => {
     service = createService({ db, dataDir: join(workDir, "data") });
 
-    await expect(service.install("builtin:missing")).rejects.toThrow(
-      'unknown builtin plugin "missing"',
-    );
+    await expect(
+      service.install("builtin:missing", { kind: "root" }),
+    ).rejects.toThrow('unknown builtin plugin "missing"');
   });
 
   it("installs and loads a packaged builtin whose source files are omitted", async () => {
@@ -785,12 +1031,12 @@ describe("builtin plugin reconciliation", () => {
       rootDir: copiedRoot,
     });
 
-    await expect(service.install("builtin:automations")).resolves.toMatchObject(
-      {
-        id: "automations",
-        status: "running",
-      },
-    );
+    await expect(
+      service.install("builtin:automations", { kind: "root" }),
+    ).resolves.toMatchObject({
+      id: "automations",
+      status: "running",
+    });
     await expect(
       readFile(join(copiedRoot, "dist", "app.css"), "utf8"),
     ).resolves.toBe("/* built */\n");
@@ -843,11 +1089,18 @@ describe("builtin plugin packaging", () => {
     ).resolves.toBeTruthy();
     await expect(stat(join(copiedRoot, "skills"))).resolves.toBeTruthy();
     await expect(
+      readFile(join(targetRoot, "marketplace.json"), "utf8"),
+    ).resolves.toContain('"name": "bb-official"');
+    await expect(
       readFile(join(copiedRoot, "assets", "icon.svg"), "utf8"),
     ).resolves.toBe("<svg/>\n");
     await expect(stat(join(copiedRoot, "src"))).rejects.toThrow();
     await expect(stat(join(copiedRoot, "app.tsx"))).rejects.toThrow();
     await expect(stat(join(copiedRoot, "node_modules"))).rejects.toThrow();
+
+    await expect(
+      readFile(join(targetRoot, "provider-acp", "icons", "cursor.svg"), "utf8"),
+    ).resolves.toBe("<svg/>\n");
 
     const connectRoot = join(targetRoot, "connect");
     await expect(stat(join(connectRoot, "package.json"))).resolves.toBeTruthy();

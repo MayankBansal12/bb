@@ -10,6 +10,7 @@ import {
   allProjectPathsQueryKeyPrefix,
   allSystemExecutionOptionsQueryKeyPrefix,
   allSystemProvidersQueryKeyPrefix,
+  allSystemThemesQueryKeyPrefix,
   allTerminalsQueryKeyPrefix,
   allThreadConversationOutlineQueryKeyPrefix,
   allThreadDetailBootstrapQueryKeyPrefix,
@@ -19,6 +20,7 @@ import {
   allThreadQueryKeyPrefix,
   allThreadStorageFilePreviewQueryKeyPrefix,
   allThreadStorageFilesQueryKeyPrefix,
+  allThreadStorageLocationsQueryKeyPrefix,
   allThreadStoragePathsQueryKeyPrefix,
   allThreadTimelineQueryKeyPrefix,
   allThreadTimelineTurnSummaryDetailsQueryKeyPrefix,
@@ -33,6 +35,7 @@ import {
 } from "../queries/query-keys";
 import { allThreadDefaultExecutionOptionsQueryKeyPrefix } from "../queries/thread-default-execution-options-query";
 import type { QueryClientArg } from "../cache-effect-types";
+import { clearCachedModelCatalogs } from "@/lib/model-catalog-cache";
 import { bumpAllDiffPatchEvictionGenerations } from "./environment-diff-patch-cache-owner";
 import { invalidateSystemVersion } from "./system-version-cache-owner";
 import {
@@ -44,25 +47,24 @@ interface SystemExecutionOptionsInvalidationArgs extends QueryClientArg {
   hostId: string;
 }
 
+interface ServerReconnectInvalidationArgs extends QueryClientArg {
+  disconnectedAt: number;
+}
+
 export function invalidateRealtimeQueriesAfterServerReconnect({
+  disconnectedAt,
   queryClient,
-}: QueryClientArg): void {
-  invalidateQueryKeys({
-    queryClient,
-    queryKeys: getServerReconnectInvalidationQueryKeys(),
-  });
-  // A reconnect is how the app learns the server restarted, which is exactly
-  // what a bb self-update does — so re-check the version rather than keep
-  // advertising the update the user just applied.
+}: ServerReconnectInvalidationArgs): void {
+  for (const queryKey of getServerReconnectInvalidationQueryKeys()) {
+    void queryClient.invalidateQueries(
+      {
+        queryKey,
+        predicate: (query) => query.state.dataUpdatedAt < disconnectedAt,
+      },
+      { cancelRefetch: false },
+    );
+  }
   invalidateSystemVersion({ queryClient });
-  // The per-file diff patch cache is observer-less: invalidation only marks it
-  // stale and never refetches or evicts, so a reconnect must remove it. The
-  // diff TOC refetch (invalidated above) then drives the panel to re-request
-  // and repopulate the visible patches.
-  //
-  // Bump every environment's eviction generation synchronously so a patch fetch
-  // that was in flight across the reconnect drops its now-stale write instead
-  // of re-seeding the just-cleared cache.
   bumpAllDiffPatchEvictionGenerations();
   queryClient.removeQueries({
     queryKey: allEnvironmentDiffPatchQueryKeyPrefix(),
@@ -79,21 +81,9 @@ export function refetchErroredRealtimeQueriesOnInitialConnect({
 }
 
 interface InitialConnectInvalidationArgs extends QueryClientArg {
-  /** Timestamp at which the realtime subscriptions became active. */
   connectedAt: number;
 }
 
-/**
- * A query that resolved before the realtime subscriptions were active may have
- * missed change events published in between, and nothing later corrects it:
- * the initial-connect path never fires again and staleTime defers mount/focus
- * refetches. On desktop cold start this window is real — the host daemon opens
- * its session a few hundred ms after the server starts listening, so the first
- * hosts/providers fetches capture "disconnected" and the `host-connected`
- * broadcast lands before the app's subscription registers. Invalidate any
- * realtime query whose data predates the subscription watermark; queries that
- * resolve after it observe post-subscribe server state and stay untouched.
- */
 export function invalidateRealtimeQueriesFetchedBeforeInitialConnect({
   connectedAt,
   queryClient,
@@ -108,15 +98,21 @@ export function invalidateRealtimeQueriesFetchedBeforeInitialConnect({
   }
 }
 
-/**
- * Refresh `/system/config` after an experiments write: the server broadcast
- * covers other windows, this gives the writing window an immediate re-gate.
- */
 export function invalidateSystemConfig({ queryClient }: QueryClientArg): void {
-  queryClient.invalidateQueries({ queryKey: systemConfigQueryKey() });
+  invalidateQueryKeys({
+    queryClient,
+    queryKeys: [systemConfigQueryKey(), allSystemThemesQueryKeyPrefix()],
+  });
 }
 
-/** Refresh provider/model catalogs after a provider CLI install or update. */
+export function invalidateSystemProviders({
+  queryClient,
+}: QueryClientArg): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: allSystemProvidersQueryKeyPrefix(),
+  });
+}
+
 export function invalidateSystemExecutionOptions({
   hostId,
   queryClient,
@@ -128,7 +124,6 @@ export function invalidateSystemExecutionOptions({
   });
 }
 
-/** Refresh settings and timeline projections after a General settings write. */
 export function invalidateGeneralSettingsDependencies({
   queryClient,
 }: QueryClientArg): void {
@@ -139,6 +134,15 @@ export function invalidateGeneralSettingsDependencies({
       allThreadTimelineQueryKeyPrefix(),
       allThreadTimelineTurnSummaryDetailsQueryKeyPrefix(),
     ],
+  });
+}
+
+export function resetModelCatalogsAfterStreamerModeChange({
+  queryClient,
+}: QueryClientArg): Promise<void> {
+  clearCachedModelCatalogs();
+  return queryClient.resetQueries({
+    queryKey: allSystemExecutionOptionsQueryKeyPrefix(),
   });
 }
 
@@ -161,6 +165,7 @@ function getServerReconnectInvalidationQueryKeys(): QueryKey[] {
     allThreadPendingInteractionsQueryKeyPrefix(),
     allThreadDefaultExecutionOptionsQueryKeyPrefix(),
     allThreadStorageFilesQueryKeyPrefix(),
+    allThreadStorageLocationsQueryKeyPrefix(),
     allThreadStoragePathsQueryKeyPrefix(),
     allThreadStorageFilePreviewQueryKeyPrefix(),
     allThreadHostFilePreviewQueryKeyPrefix(),
@@ -168,10 +173,6 @@ function getServerReconnectInvalidationQueryKeys(): QueryKey[] {
     allEnvironmentQueryKeyPrefix(),
     allEnvironmentWorkStatusQueryKeyPrefix(),
     allEnvironmentMergeBaseBranchesQueryKeyPrefix(),
-    // The diff TOC has a real observer, so it refetches on invalidate. The
-    // per-file patch cache is observer-less and is evicted separately in
-    // invalidateRealtimeQueriesAfterServerReconnect (invalidation is a no-op for
-    // it), so it is intentionally absent from this list.
     allEnvironmentDiffFilesQueryKeyPrefix(),
     allEnvironmentFilePreviewQueryKeyPrefix(),
     hostPathExistenceQueryKeyPrefix(),

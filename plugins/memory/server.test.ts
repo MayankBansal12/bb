@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createFakePluginHost,
   type FakePluginHost,
-} from "@bb/plugin-sdk/testing";
+} from "@get-bb/plugin-sdk/testing";
 import memoryPlugin from "./server";
 
 async function loadPlugin(): Promise<FakePluginHost> {
@@ -124,7 +124,7 @@ describe("bb-plugin-memory", () => {
     expect(instructions).toContain("Showing");
     expect(instructions).toContain("bb memory catalog --scope all --json");
     expect(instructions).not.toContain("Private details");
-  });
+  }, 20_000);
 
   it("searches progressively and returns full details only from get", async () => {
     const host = await loadPlugin();

@@ -14,12 +14,14 @@ export interface ResourceCollectionMode<Mode extends string> {
   accessibleLabel?: string;
 }
 
-/**
- * A resource collection with multiple projections of the same domain.
- *
- * Modes are views, not new resources: the active view owns the body and its
- * contextual actions while collection identity and description stay stable.
- */
+type ResourceCollectionModeProps<Mode extends string> =
+  | { modes?: undefined; activeMode?: undefined; onModeChange?: undefined }
+  | {
+      modes: readonly ResourceCollectionMode<Mode>[];
+      activeMode: Mode;
+      onModeChange: (mode: Mode) => void;
+    };
+
 export function ResourceCollectionPage<Mode extends string>({
   id,
   description,
@@ -29,86 +31,106 @@ export function ResourceCollectionPage<Mode extends string>({
   actions,
   children,
   className,
+  bandClassName,
 }: {
   id: string;
   description: ReactNode;
-  modes: readonly ResourceCollectionMode<Mode>[];
-  activeMode: Mode;
-  onModeChange: (mode: Mode) => void;
   actions?: ReactNode;
   children: ReactNode;
   className?: string;
-}) {
-  const activeTabId = `${id}-${activeMode}-tab`;
-  const activePanelId = `${id}-${activeMode}-panel`;
+  bandClassName?: string;
+} & ResourceCollectionModeProps<Mode>) {
+  const modeList = modes ?? [];
+  const hasModes = modeList.length > 0;
+  const changeMode = onModeChange ?? (() => {});
+  const activeTabId = hasModes ? `${id}-${activeMode}-tab` : undefined;
+  const activePanelId = hasModes ? `${id}-${activeMode}-panel` : undefined;
   return (
-    <div className={cn("flex h-full min-h-0 flex-col gap-4", className)}>
-      {/* Every band in the collection carries the same pr-1 scrollbar gutter as
-          the results below, so description, tabs, toolbar, and rows all share
-          one content width. */}
-      <div className="pr-1">
-        <ResourceTabDescription>{description}</ResourceTabDescription>
-      </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 pr-1">
-        <div className="flex items-center gap-1" role="tablist">
-          {modes.map((mode) => {
-            const active = mode.id === activeMode;
-            const modeIndex = modes.indexOf(mode);
-            return (
-              <button
-                key={mode.id}
-                id={`${id}-${mode.id}-tab`}
-                type="button"
-                role="tab"
-                aria-label={mode.accessibleLabel}
-                aria-selected={active}
-                aria-controls={`${id}-${mode.id}-panel`}
-                tabIndex={active ? 0 : -1}
-                className={cn(
-                  "inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium",
-                  active
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-                onClick={() => onModeChange(mode.id)}
-                onKeyDown={(event) => {
-                  let nextIndex: number | null = null;
-                  if (event.key === "ArrowRight") {
-                    nextIndex = (modeIndex + 1) % modes.length;
-                  } else if (event.key === "ArrowLeft") {
-                    nextIndex = (modeIndex - 1 + modes.length) % modes.length;
-                  } else if (event.key === "Home") {
-                    nextIndex = 0;
-                  } else if (event.key === "End") {
-                    nextIndex = modes.length - 1;
-                  }
-                  if (nextIndex === null) return;
-                  event.preventDefault();
-                  const nextMode = modes[nextIndex];
-                  if (nextMode === undefined) return;
-                  onModeChange(nextMode.id);
-                  document.getElementById(`${id}-${nextMode.id}-tab`)?.focus();
-                }}
-              >
-                {mode.label}
-                {mode.count !== undefined ? (
-                  <span className="text-2xs text-subtle-foreground">
-                    {mode.count}
-                  </span>
-                ) : null}
-              </button>
-            );
-          })}
+    <div className={cn("flex h-full min-h-0 flex-col gap-5", className)}>
+      {}
+      <div className="pr-3">
+        <div className={bandClassName}>
+          <ResourceTabDescription>{description}</ResourceTabDescription>
         </div>
-        {actions ? (
-          <div className="flex shrink-0 items-center gap-1.5">{actions}</div>
-        ) : null}
       </div>
+      {hasModes || actions !== undefined ? (
+        <div className="pr-3">
+          <div
+            className={cn(
+              "flex flex-wrap items-center justify-between gap-2",
+              bandClassName,
+            )}
+          >
+            <div
+              className="flex items-center gap-1"
+              role={hasModes ? "tablist" : undefined}
+            >
+              {modeList.map((mode) => {
+                const active = mode.id === activeMode;
+                const modeIndex = modeList.indexOf(mode);
+                return (
+                  <button
+                    key={mode.id}
+                    id={`${id}-${mode.id}-tab`}
+                    type="button"
+                    role="tab"
+                    aria-label={mode.accessibleLabel}
+                    aria-selected={active}
+                    aria-controls={`${id}-${mode.id}-panel`}
+                    tabIndex={active ? 0 : -1}
+                    className={cn(
+                      "inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium",
+                      active
+                        ? "bg-accent text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                    onClick={() => changeMode(mode.id)}
+                    onKeyDown={(event) => {
+                      let nextIndex: number | null = null;
+                      if (event.key === "ArrowRight") {
+                        nextIndex = (modeIndex + 1) % modeList.length;
+                      } else if (event.key === "ArrowLeft") {
+                        nextIndex =
+                          (modeIndex - 1 + (modes?.length ?? 1)) %
+                          (modes?.length ?? 1);
+                      } else if (event.key === "Home") {
+                        nextIndex = 0;
+                      } else if (event.key === "End") {
+                        nextIndex = modeList.length - 1;
+                      }
+                      if (nextIndex === null) return;
+                      event.preventDefault();
+                      const nextMode = modeList[nextIndex];
+                      if (nextMode === undefined) return;
+                      changeMode(nextMode.id);
+                      document
+                        .getElementById(`${id}-${nextMode.id}-tab`)
+                        ?.focus();
+                    }}
+                  >
+                    {mode.label}
+                    {mode.count !== undefined ? (
+                      <span className="text-2xs text-subtle-foreground">
+                        {mode.count}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
+            {actions ? (
+              <div className="flex shrink-0 items-center gap-1.5">
+                {actions}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       <div
         id={activePanelId}
-        role="tabpanel"
+        role={hasModes ? "tabpanel" : undefined}
         aria-labelledby={activeTabId}
-        tabIndex={0}
+        tabIndex={hasModes ? 0 : undefined}
         className="min-h-0 flex-1 focus-visible:outline-none"
       >
         {children}
@@ -117,11 +139,6 @@ export function ResourceCollectionPage<Mode extends string>({
   );
 }
 
-/**
- * One bounded collection body shared by Installed and Browse projections.
- * The toolbar and pagination remain stable while this component owns the
- * collection's only scrollable region.
- */
 export function ResourceCollectionViewport({
   toolbar,
   children,
@@ -130,6 +147,7 @@ export function ResourceCollectionViewport({
   viewportRef,
   className,
   contentClassName,
+  bandClassName,
 }: {
   toolbar?: ReactNode;
   children: ReactNode;
@@ -138,15 +156,19 @@ export function ResourceCollectionViewport({
   viewportRef?: Ref<HTMLDivElement>;
   className?: string;
   contentClassName?: string;
+  bandClassName?: string;
 }) {
   return (
     <div
-      className={cn("flex h-full min-h-0 flex-col gap-3", className)}
+      className={cn("flex h-full min-h-0 flex-col gap-5", className)}
       data-resource-collection-viewport
     >
-      {/* pr-1 matches the scroll viewport's scrollbar gutter below, so the
-          toolbar, results, and footer all end on the same content edge. */}
-      {toolbar ? <div className="shrink-0 pr-1">{toolbar}</div> : null}
+      {}
+      {toolbar ? (
+        <div className="shrink-0 pr-3">
+          <div className={bandClassName}>{toolbar}</div>
+        </div>
+      ) : null}
       <ScrollArea
         type="scroll"
         scrollHideDelay={600}
@@ -155,7 +177,7 @@ export function ResourceCollectionViewport({
         viewportRef={viewportRef}
         viewportProps={{
           id: scrollId,
-          className: cn("overscroll-contain pr-1", contentClassName),
+          className: cn("overscroll-contain pr-3", contentClassName),
           "data-resource-collection-scroll": true,
         }}
       >
@@ -163,10 +185,10 @@ export function ResourceCollectionViewport({
       </ScrollArea>
       {footer ? (
         <div
-          className="sticky bottom-0 z-10 shrink-0 border-t border-border/70 bg-background pt-3"
+          className="sticky bottom-0 z-10 shrink-0 border-t border-border/70 bg-background pt-3 pr-3"
           data-resource-collection-footer
         >
-          {footer}
+          <div className={bandClassName}>{footer}</div>
         </div>
       ) : null}
     </div>
@@ -197,7 +219,6 @@ export function ResourceOverviewSection({
   );
 }
 
-/** Responsive browse projection shared by resource collection pages. */
 export function ResourceBrowseGrid({
   children,
   className,
@@ -323,18 +344,22 @@ export function ResourceOverviewPage({
 export function ResourceSourceShelf({
   label,
   attribution,
+  description,
   leading,
   browseAction,
   scrollOverlay,
   contentMode = "rail",
+  contentSurface = "recessed",
   children,
 }: {
   label: ReactNode;
   attribution?: ReactNode;
+  description?: ReactNode;
   leading?: ReactNode;
   browseAction?: ReactNode;
   scrollOverlay?: ReactNode;
   contentMode?: "rail" | "panel";
+  contentSurface?: "recessed" | "plain";
   children: ReactNode;
 }) {
   return (
@@ -353,13 +378,31 @@ export function ResourceSourceShelf({
             </span>
           ) : null}
         </div>
-        {browseAction ? (
+        {browseAction && description === undefined ? (
           <div className="ml-auto shrink-0 text-xs text-muted-foreground">
             {browseAction}
           </div>
         ) : null}
       </div>
-      <div className="rounded-lg bg-surface-recessed/70 p-[var(--resource-source-shelf-inset)]">
+      {description === undefined ? null : (
+        <div className="flex min-w-0 items-center gap-3 px-[var(--resource-source-shelf-inset)]">
+          <p className="min-w-0 max-w-2xl text-xs leading-relaxed text-muted-foreground">
+            {description}
+          </p>
+          {browseAction ? (
+            <div className="ml-auto shrink-0 text-xs text-muted-foreground">
+              {browseAction}
+            </div>
+          ) : null}
+        </div>
+      )}
+      <div
+        className={cn(
+          contentSurface === "recessed"
+            ? "rounded-lg bg-surface-recessed/70 p-[var(--resource-source-shelf-inset)]"
+            : "px-[var(--resource-source-shelf-inset)]",
+        )}
+      >
         {contentMode === "panel" ? (
           children
         ) : (
@@ -431,25 +474,23 @@ export function ResourceSourceItem({
 type ResourceBrowseCardProps = {
   className?: string;
   leading?: ReactNode;
+  leadingClassName?: string;
   title: ReactNode;
   description?: ReactNode;
   descriptionLines?: 2 | 3;
   byline?: ReactNode;
   headerAction?: ReactNode;
   footerMeta?: ReactNode;
-  /**
-   * Keep the full-card pointer target out of the tab order when a header action
-   * already exposes the exact same operation to keyboard users.
-   */
   pointerOnlyOpen?: boolean;
 } & (
-  | { openLabel: string; onOpen: () => void }
+  | { openLabel: string; onOpen: (trigger: HTMLButtonElement) => void }
   | { openLabel?: undefined; onOpen?: undefined }
 );
 
 export function ResourceBrowseCard({
   className,
   leading,
+  leadingClassName,
   title,
   description,
   descriptionLines = 2,
@@ -467,7 +508,7 @@ export function ResourceBrowseCard({
       className={cn(
         "group relative grid min-h-28 w-full grid-cols-[minmax(0,1fr)_auto] grid-rows-[auto_1fr_auto] gap-2 rounded-lg border border-border bg-card p-3 text-left",
         onOpen &&
-          "transition-[border-color,box-shadow] duration-150 hover:border-foreground/20 hover:shadow-xs",
+          "transition-[border-color,box-shadow,background-color] duration-150 hover:border-foreground/30 hover:bg-[color-mix(in_oklab,var(--ink)_2.5%,transparent)] hover:shadow-sm",
         className,
       )}
     >
@@ -478,13 +519,18 @@ export function ResourceBrowseCard({
           aria-hidden={pointerOnlyOpen || undefined}
           tabIndex={pointerOnlyOpen ? -1 : undefined}
           data-resource-card-pointer-action={pointerOnlyOpen ? "" : undefined}
-          onClick={onOpen}
+          onClick={(event) => onOpen(event.currentTarget)}
           className="absolute inset-0 cursor-pointer rounded-md focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         />
       ) : null}
       {hasLeading ? (
         <span className="pointer-events-none relative col-start-1 row-start-1 flex min-w-0 items-center">
-          <span className="flex size-6 shrink-0 items-center justify-center">
+          <span
+            className={cn(
+              "flex size-6 shrink-0 items-center justify-center",
+              leadingClassName,
+            )}
+          >
             {leading}
           </span>
           <span className="ml-3 min-w-0 flex-1">{renderTitle()}</span>
@@ -497,7 +543,7 @@ export function ResourceBrowseCard({
       {headerAction ? (
         <span
           data-row-action
-          className="relative col-start-2 row-start-1 flex shrink-0 items-center justify-end whitespace-nowrap"
+          className="relative col-start-2 row-start-1 flex shrink-0 cursor-default items-center justify-end whitespace-nowrap"
         >
           {headerAction}
         </span>
@@ -513,12 +559,12 @@ export function ResourceBrowseCard({
         </span>
       ) : null}
       {byline ? (
-        <span className="pointer-events-none relative col-start-1 row-start-3 flex min-h-4 min-w-0 items-center text-left text-xs text-subtle-foreground">
+        <span className="pointer-events-none relative col-start-1 row-start-3 mt-1.5 flex min-h-4 min-w-0 items-center text-left text-xs text-subtle-foreground">
           <span className="block min-w-0 truncate">{byline}</span>
         </span>
       ) : null}
       {footerMeta ? (
-        <span className="pointer-events-none relative col-start-2 row-start-3 flex min-h-4 items-center justify-end text-right">
+        <span className="pointer-events-none relative col-start-2 row-start-3 mt-1.5 flex min-h-4 min-w-0 items-center justify-end text-right">
           {footerMeta}
         </span>
       ) : null}

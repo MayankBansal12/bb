@@ -7,22 +7,24 @@ import type {
   CreateThreadEnvironmentArgs,
   CreateThreadRequest,
   EnvironmentArgs,
+  ProviderEnvironmentArgs,
   StartedOnBehalfOf,
   ThreadCreateOrigin,
 } from "@bb/server-contract";
 
 export interface ThreadCreateServiceRequestInput {
-  /**
-   * May be the server-resolved "project-default" marker; thread creation
-   * resolves it into a concrete environment before any provisioning logic.
-   */
   environment: CreateThreadEnvironmentArgs;
   executionInputSources?: CreateThreadRequest["executionInputSources"];
+  /**
+   * Epoch ms the first message should dispatch at. Present ⇒ the thread is
+   * created `pending` with no turn and the first message is queued as a row
+   * waiting on the clock.
+   */
+  sendAt?: CreateThreadRequest["sendAt"];
   input: PromptInput[];
   sectionId?: CreateThreadRequest["sectionId"];
   model?: CreateThreadRequest["model"];
   origin: ThreadCreateOrigin | null;
-  /** Plugin attribution; paired with origin "plugin". */
   originPluginId?: CreateThreadRequest["originPluginId"];
   originKind?: ThreadOriginKind | null;
   parentThreadId?: string;
@@ -42,9 +44,8 @@ export interface ThreadCreateServiceRequest extends Omit<
   ThreadCreateServiceRequestInput,
   "environment" | "providerId"
 > {
-  environment: EnvironmentArgs;
+  environment: EnvironmentArgs | ProviderEnvironmentArgs;
   providerId: string;
   titleFallback: string | null;
-  /** Resolved at the create boundary: request value, else inherited/default. */
   visibility: ThreadVisibility;
 }

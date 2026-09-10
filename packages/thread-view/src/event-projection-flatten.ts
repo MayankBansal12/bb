@@ -4,7 +4,7 @@ import type {
   EventProjectionEntry,
 } from "./event-projection-types.js";
 
-function getProjectionEntryMessages(
+export function getProjectionEntryMessages(
   entry: EventProjectionEntry,
 ): readonly EventProjectionMessage[] {
   if (entry.kind === "projected-message") {
@@ -19,7 +19,7 @@ function getProjectionEntryMessages(
   return [];
 }
 
-export function flattenEventProjectionMessages(
+function flattenEventProjectionMessages(
   projection: EventProjection,
 ): EventProjectionMessage[] {
   const messages: EventProjectionMessage[] = [];

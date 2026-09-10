@@ -1,10 +1,6 @@
 import { connectCredentialSchema } from "@bb/connect-client";
 import type { ConnectCredential } from "@bb/connect-client";
-import type { PluginKvStorage } from "@bb/plugin-sdk";
-
-// The durable tunnel credential lives in the plugin's kv storage (bb.db). Its
-// shape and the gate calls that use it live in @bb/connect-client, because the
-// desktop app reaches the same gate without a local server.
+import type { PluginKvStorage } from "@get-bb/plugin-sdk";
 
 export const CREDENTIAL_KV_KEY = "credential";
 

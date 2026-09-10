@@ -1,29 +1,26 @@
 import { fuzzyMatchText } from "@bb/fuzzy-match";
-import type { PromptMentionSuggestion } from "@/components/promptbox/mentions/types";
-import { compareCodepoint } from "@/lib/codepoint-compare";
+import type { PromptMentionSuggestion } from "@bb/client-core";
+import { compareCodepoint } from "@bb/client-core";
 
-export type ProjectMentionSuggestion = Extract<
+type ProjectMentionSuggestion = Extract<
   PromptMentionSuggestion,
   { kind: "project" }
 >;
 
-/** A project the mention menu can offer, reduced to what the picker needs. */
 export interface ProjectMentionCandidate {
   id: string;
   name: string;
 }
 
-export interface BuildProjectMentionSuggestionsArgs {
+interface BuildProjectMentionSuggestionsArgs {
   projects: readonly ProjectMentionCandidate[];
   query: string;
   limit: number;
 }
 
-function getProjectSearchTexts(
-  project: ProjectMentionCandidate,
-): readonly string[] {
+function getProjectSearchText(project: ProjectMentionCandidate): string {
   const name = project.name.trim();
-  return name ? [name, project.id] : [project.id];
+  return name || project.id;
 }
 
 function toProjectMentionSuggestion(
@@ -49,7 +46,8 @@ export function buildProjectMentionSuggestions(
   const matches = fuzzyMatchText({
     items: args.projects,
     query: trimmedQuery,
-    getText: getProjectSearchTexts,
+    getText: getProjectSearchText,
+    getAliases: (project) => [project.id],
     limit: args.projects.length,
   });
 

@@ -19,6 +19,92 @@ describe("secondary panel tab-strip edge fades", () => {
     expect(SECONDARY_PANEL_TAB_STRIP_FADE_TONE).toBe("sidebar");
   });
 
+  it("keeps the desktop tab viewport outside the window drag region", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const tabStrip = (usesDesktopChrome: boolean) =>
+      createElement(SecondaryPanelTabStrip, {
+        activeTabId: null,
+        tabs: [],
+        onReorderTab: vi.fn(),
+        usesDesktopChrome,
+        isPanelOpen: true,
+      });
+    const view = render(tabStrip(true));
+    const viewport = view.container.querySelector(".no-scrollbar");
+    expect(viewport?.className).toContain("[app-region:no-drag]");
+    expect(viewport?.className).toContain("[-webkit-app-region:no-drag]");
+
+    view.rerender(tabStrip(false));
+    expect(
+      view.container.querySelector(".no-scrollbar")?.className,
+    ).not.toContain("app-region");
+  });
+
+  it("enlarges coarse-pointer close targets only for file previews", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const { getByRole } = render(
+      createElement(SecondaryPanelTabStrip, {
+        activeTabId: "file-preview",
+        tabs: [
+          {
+            label: "preview.html",
+            isPinned: false,
+            leadingVisual: null,
+            statusLabel: null,
+            onSelect: vi.fn(),
+            onClose: vi.fn(),
+            renderContent: () => null,
+            tab: {
+              environmentId: null,
+              hostId: null,
+              id: "file-preview",
+              kind: "host-file-preview" as const,
+              lineRange: null,
+              path: "preview.html",
+              threadId: null,
+            },
+          },
+          {
+            label: "Browser",
+            isPinned: false,
+            leadingVisual: null,
+            statusLabel: null,
+            onSelect: vi.fn(),
+            onClose: vi.fn(),
+            renderContent: () => null,
+            tab: { id: "browser", kind: "new-tab" as const },
+          },
+        ],
+        onReorderTab: vi.fn(),
+        usesDesktopChrome: false,
+        isPanelOpen: true,
+      }),
+    );
+
+    expect(
+      getByRole("button", { name: "Close preview.html" }).classList.contains(
+        "max-md:pointer-coarse:min-h-9",
+      ),
+    ).toBe(true);
+    expect(
+      getByRole("button", { name: "Close Browser" }).classList.contains(
+        "max-md:pointer-coarse:min-h-9",
+      ),
+    ).toBe(false);
+  });
+
   it("observes the intrinsic tab row so async title changes refresh overflow", () => {
     const observed: Element[] = [];
     let resizeCallback: ResizeObserverCallback | undefined;
@@ -42,20 +128,22 @@ describe("secondary panel tab-strip edge fades", () => {
 
     const { container } = render(
       createElement(SecondaryPanelTabStrip, {
-        fileTabs: [
+        activeTabId: "browser",
+        tabs: [
           {
-            id: "browser",
-            filename: "Browser",
-            isActive: true,
+            label: "Browser",
             isPinned: false,
             leadingVisual: null,
             statusLabel: null,
             onSelect: vi.fn(),
             onClose: vi.fn(),
+            renderContent: () => null,
+            tab: { id: "browser", kind: "new-tab" },
           },
         ],
         onReorderTab: vi.fn(),
         usesDesktopChrome: false,
+        isPanelOpen: true,
       }),
     );
 

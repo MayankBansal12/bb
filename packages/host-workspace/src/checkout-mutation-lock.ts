@@ -1,5 +1,5 @@
 import path from "node:path";
-import { getAbsoluteGitDir, runGit } from "./git.js";
+import { getAbsoluteGitDir, type GitProcessOptions } from "./git.js";
 import {
   withProcessLocalQueuedLocks,
   type ProcessLocalQueuedLockSpec,
@@ -40,34 +40,21 @@ export async function withCheckoutMutationAdmission<T>(
 
 async function resolveCheckoutMutationLockSpec(
   checkoutPath: string,
+  options: GitProcessOptions,
 ): Promise<ProcessLocalQueuedLockSpec> {
-  return { key: await getAbsoluteGitDir(checkoutPath) };
-}
-
-async function tryResolveCheckoutMutationLockSpec(
-  checkoutPath: string,
-): Promise<ProcessLocalQueuedLockSpec | null> {
-  const result = await runGit(["rev-parse", "--absolute-git-dir"], {
-    cwd: checkoutPath,
-    allowFailure: true,
-  });
-  if (result.exitCode !== 0) {
-    return null;
-  }
-
-  const gitDir = result.stdout.trim();
-  return gitDir ? { key: path.resolve(gitDir) } : null;
+  return { key: await getAbsoluteGitDir(checkoutPath, options) };
 }
 
 export async function withCheckoutMutationLock<T>(
   checkoutPath: string,
   work: CheckoutMutationLockWork<T>,
   signal?: AbortSignal,
+  options: GitProcessOptions = {},
 ): Promise<T> {
   return withCheckoutMutationAdmission(
     checkoutPath,
     async () => {
-      const lock = await resolveCheckoutMutationLockSpec(checkoutPath);
+      const lock = await resolveCheckoutMutationLockSpec(checkoutPath, options);
       return withProcessLocalQueuedLocks({ locks: [lock], signal, work });
     },
     signal,
@@ -86,36 +73,18 @@ async function withCheckoutMutationAdmissions<T>(
   });
 }
 
-export async function tryWithCheckoutMutationLock<T>(
-  checkoutPath: string,
-  work: CheckoutMutationLockWork<T>,
-  signal?: AbortSignal,
-): Promise<T | null> {
-  return withCheckoutMutationAdmission(
-    checkoutPath,
-    async () => {
-      const lock = await tryResolveCheckoutMutationLockSpec(checkoutPath);
-      if (!lock) {
-        return null;
-      }
-
-      return withProcessLocalQueuedLocks({ locks: [lock], signal, work });
-    },
-    signal,
-  );
-}
-
 export async function withCheckoutMutationLocks<T>(
   checkoutPaths: string[],
   work: CheckoutMutationLockWork<T>,
   signal?: AbortSignal,
+  options: GitProcessOptions = {},
 ): Promise<T> {
   return withCheckoutMutationAdmissions(
     checkoutPaths,
     async () => {
       const locks = await Promise.all(
         checkoutPaths.map((checkoutPath) =>
-          resolveCheckoutMutationLockSpec(checkoutPath),
+          resolveCheckoutMutationLockSpec(checkoutPath, options),
         ),
       );
       return withProcessLocalQueuedLocks({ locks, signal, work });

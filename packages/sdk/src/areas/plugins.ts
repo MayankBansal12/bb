@@ -1,14 +1,20 @@
 import { jsonValueSchema, type JsonValue } from "@bb/domain";
 import {
+  installedPluginSchema,
+  pluginCatalogInstallPlanResponseSchema,
   pluginCatalogInstallRequestSchema,
   pluginCatalogSearchResponseSchema,
   pluginCatalogStatusResponseSchema,
+  pluginMarketplaceAddRequestSchema,
+  pluginMarketplaceListResponseSchema,
+  pluginMarketplaceMutationResponseSchema,
+  pluginMarketplaceNameSchema,
+  pluginMarketplaceRefreshRequestSchema,
+  pluginMarketplaceRefreshResponseSchema,
+  pluginMarketplaceRemoveResponseSchema,
   pluginApplyUpdateRequestSchema,
   pluginApplyUpdateResultSchema,
-  pluginInstallResponseSchema,
   pluginInstallSourceRequestSchema,
-  pluginListResponseSchema,
-  pluginReloadResponseSchema,
   pluginRemoveResponseSchema,
   pluginSettingsResponseSchema,
   pluginSettingsUpdateRequestSchema,
@@ -18,7 +24,12 @@ import {
   pluginUpdateCheckRequestSchema,
   pluginUpdateCheckResponseSchema,
   type InstalledPlugin,
+  type PluginCatalogInstallPlan as PluginCatalogInstallPlanContract,
+  type PluginCatalogResolvedSource,
+  type PluginCatalogSearchResponse as PluginCatalogSearchResponseContract,
   type PluginCatalogSearchResult as PluginCatalogSearchContract,
+  type PluginMarketplace as PluginMarketplaceContract,
+  type PluginMarketplaceRefreshResult as PluginMarketplaceRefreshContract,
   type PluginCatalogStatus as PluginCatalogStatusContract,
   type PluginApplyUpdateResult as PluginApplyUpdateContract,
   type PluginListResponse,
@@ -26,24 +37,91 @@ import {
   type PluginRemoveResponse,
   type PluginSettingsResponse,
   type PluginSourceDetail,
+  type PluginSourceSelection,
   type PluginTokenResponse,
   type PluginUpdateCheckEntry,
 } from "@bb/server-contract";
 import { z } from "zod";
 import type { CreateSdkAreaArgs } from "./common.js";
 
+/**
+ * A server older than `providerIds` (bb-app < 0.39) or `icons` answers with
+ * the installed-plugin shape minus those fields. The contract keeps them
+ * required — the server fills them once at its boundary — so the tolerance
+ * lives here, on the response side only: the SDK never sends this shape, and a
+ * default on the contract would leak into request bodies.
+ */
+const installedPluginResponseSchema = installedPluginSchema.extend({
+  screenshots: installedPluginSchema.shape.screenshots.default([]),
+  collections: installedPluginSchema.shape.collections.default([]),
+  providerIds: z.array(z.string()).default([]),
+  icons: z.record(z.string(), z.string()).default({}),
+});
+const pluginListResponseSchema = z.object({
+  plugins: z.array(installedPluginResponseSchema),
+});
+const pluginInstallResponseSchema = z.object({
+  ok: z.literal(true),
+  plugin: installedPluginResponseSchema,
+});
+const pluginReloadResponseSchema = z.object({
+  ok: z.literal(true),
+  plugins: z.array(installedPluginResponseSchema),
+});
+const pluginCatalogSearchResponseCompatibilitySchema =
+  pluginCatalogSearchResponseSchema.extend({
+    collections: pluginCatalogSearchResponseSchema.shape.collections.default(
+      [],
+    ),
+  });
+
+export const pluginMutationResponseSchema = z.object({
+  ok: z.boolean(),
+  error: z.string().optional(),
+  plugin: installedPluginResponseSchema.optional(),
+  plugins: z.array(installedPluginResponseSchema).optional(),
+});
+export type PluginMutationResponse = z.infer<
+  typeof pluginMutationResponseSchema
+>;
+
 export interface PluginIdArgs {
   pluginId: string;
 }
 
-/** Install directly from a path:, git:, npm:, or builtin: source spec. */
 export interface PluginInstallArgs {
+  source: string;
+  subdirectory?: string;
+  plugin?: string;
+}
+
+export interface PluginCatalogInstallArgs {
+  entryId: string;
+  marketplace?: string;
+  confirmedSource?: PluginCatalogResolvedSource;
+}
+
+export interface PluginCatalogInstallPlanArgs {
+  entryId: string;
+  marketplace?: string;
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceAddArgs {
   source: string;
 }
 
-/** Install an entry from BB's official catalog. */
-export interface PluginCatalogInstallArgs {
-  entryId: string;
+export interface PluginMarketplaceListArgs {
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceRefreshArgs {
+  name?: string;
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceRemoveArgs {
+  name: string;
 }
 
 export interface PluginReloadArgs {
@@ -108,12 +186,35 @@ export type PluginCheckUpdatesResult = PluginUpdateCheckEntry[];
 export type PluginApplyUpdateResult = PluginApplyUpdateContract;
 
 export type PluginCatalogStatusResult = PluginCatalogStatusContract;
-export type PluginCatalogSearchResult = PluginCatalogSearchContract[];
+export type PluginCatalogSearchEntry = PluginCatalogSearchContract;
+export type PluginCatalogSearchResult = PluginCatalogSearchResponseContract;
+export type PluginCatalogInstallPlanResult = PluginCatalogInstallPlanContract;
+export type PluginMarketplaceListResult = PluginMarketplaceContract[];
+export type PluginMarketplaceAddResult = PluginMarketplaceContract;
+export type PluginMarketplaceRefreshResult = PluginMarketplaceRefreshContract[];
+
+export interface PluginMarketplaceRemoveResult {
+  convertedPluginIds: string[];
+}
 
 export interface PluginCatalogArea {
   install(args: PluginCatalogInstallArgs): Promise<PluginInstallResult>;
+  installPlan(
+    args: PluginCatalogInstallPlanArgs,
+  ): Promise<PluginCatalogInstallPlanResult>;
   search(args: PluginCatalogSearchArgs): Promise<PluginCatalogSearchResult>;
   status(args?: PluginCatalogStatusArgs): Promise<PluginCatalogStatusResult>;
+}
+
+export interface PluginMarketplacesArea {
+  add(args: PluginMarketplaceAddArgs): Promise<PluginMarketplaceAddResult>;
+  list(args?: PluginMarketplaceListArgs): Promise<PluginMarketplaceListResult>;
+  refresh(
+    args?: PluginMarketplaceRefreshArgs,
+  ): Promise<PluginMarketplaceRefreshResult>;
+  remove(
+    args: PluginMarketplaceRemoveArgs,
+  ): Promise<PluginMarketplaceRemoveResult>;
 }
 
 export interface PluginsArea {
@@ -123,6 +224,7 @@ export interface PluginsArea {
     args?: PluginCheckUpdatesArgs,
   ): Promise<PluginCheckUpdatesResult>;
   catalog: PluginCatalogArea;
+  marketplaces: PluginMarketplacesArea;
   disable(args: PluginIdArgs): Promise<PluginDisableResult>;
   enable(args: PluginIdArgs): Promise<PluginEnableResult>;
   getSettings(args: PluginGetSettingsArgs): Promise<PluginGetSettingsResult>;
@@ -138,6 +240,16 @@ export interface PluginsArea {
   updateSettings(
     args: PluginSettingsUpdateArgs,
   ): Promise<PluginUpdateSettingsResult>;
+}
+
+function pluginSourceSelection(
+  args: PluginInstallArgs,
+): PluginSourceSelection | undefined {
+  if (args.subdirectory !== undefined) {
+    return { kind: "subdirectory", path: args.subdirectory };
+  }
+  if (args.plugin !== undefined) return { kind: "entry", name: args.plugin };
+  return undefined;
 }
 
 function pluginPath(pluginId: string, suffix = ""): string {
@@ -179,14 +291,31 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       );
       return response.plugin;
     },
+    async installPlan(input) {
+      const body = pluginCatalogInstallRequestSchema.parse(
+        input.marketplace === undefined
+          ? { entryId: input.entryId }
+          : { entryId: input.entryId, marketplace: input.marketplace },
+      );
+      const query = new URLSearchParams({ entryId: body.entryId });
+      if (body.marketplace !== undefined) {
+        query.set("marketplace", body.marketplace);
+      }
+      const response = await requestParsed(
+        `/api/v1/plugin-catalog/install-plan?${query.toString()}`,
+        pluginCatalogInstallPlanResponseSchema,
+        { signal: input.signal },
+      );
+      return response.plan;
+    },
     async search(input) {
       const query = z.string().parse(input.query);
       const response = await requestParsed(
         `/api/v1/plugin-catalog/search?q=${encodeURIComponent(query)}`,
-        pluginCatalogSearchResponseSchema,
+        pluginCatalogSearchResponseCompatibilitySchema,
         { signal: input.signal },
       );
-      return response.results;
+      return response;
     },
     async status(input = {}) {
       const response = await requestParsed(
@@ -195,6 +324,46 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
         { signal: input.signal },
       );
       return response.catalog;
+    },
+  };
+
+  const marketplaces: PluginMarketplacesArea = {
+    async add(input) {
+      const body = pluginMarketplaceAddRequestSchema.parse(input);
+      const response = await requestParsed(
+        "/api/v1/marketplaces",
+        pluginMarketplaceMutationResponseSchema,
+        jsonInit("POST", body),
+      );
+      return response.marketplace;
+    },
+    async list(input = {}) {
+      const response = await requestParsed(
+        "/api/v1/marketplaces",
+        pluginMarketplaceListResponseSchema,
+        { signal: input.signal },
+      );
+      return response.marketplaces;
+    },
+    async refresh(input = {}) {
+      const body = pluginMarketplaceRefreshRequestSchema.parse(
+        input.name === undefined ? {} : { name: input.name },
+      );
+      const response = await requestParsed(
+        "/api/v1/marketplaces/refresh",
+        pluginMarketplaceRefreshResponseSchema,
+        { ...jsonInit("POST", body), signal: input.signal },
+      );
+      return response.results;
+    },
+    async remove(input) {
+      const name = pluginMarketplaceNameSchema.parse(input.name);
+      const response = await requestParsed(
+        `/api/v1/marketplaces/${encodeURIComponent(name)}`,
+        pluginMarketplaceRemoveResponseSchema,
+        { method: "DELETE" },
+      );
+      return { convertedPluginIds: response.convertedPluginIds };
     },
   };
 
@@ -227,6 +396,7 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       return response.results;
     },
     catalog,
+    marketplaces,
     async disable(input) {
       const response = await requestParsed(
         pluginPath(input.pluginId, "/disable"),
@@ -258,7 +428,17 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       );
     },
     async install(input) {
-      const body = pluginInstallSourceRequestSchema.parse(input);
+      if (input.subdirectory !== undefined && input.plugin !== undefined) {
+        throw new Error(
+          "plugin install accepts subdirectory or plugin, not both",
+        );
+      }
+      const selection = pluginSourceSelection(input);
+      const body =
+        selection === undefined
+          ? { source: input.source }
+          : { source: input.source, selection };
+      pluginInstallSourceRequestSchema.parse(body);
       const response = await requestParsed(
         "/api/v1/plugins/install",
         pluginInstallResponseSchema,

@@ -1,6 +1,7 @@
 import type { IconName } from "@bb/shared-ui/icon";
 import { matchPath } from "react-router-dom";
 import {
+  SETTINGS_PLUGINS_ROUTE_PATH,
   getPluginsRoutePath,
   getRegistrySkillsRoutePath,
   getSkillsRoutePath,
@@ -14,18 +15,21 @@ import {
   AUTOMATIONS_ROUTE_PATH,
   AUTOMATION_DETAIL_ROUTE_PATH,
   AUTOMATION_EDIT_ROUTE_PATH,
+  isToolsRoutePath,
 } from "@/lib/route-paths";
 
 export type ToolsSectionId = "skills" | "plugins";
 
-export interface ToolsSectionDefinition {
+export const TOOLS_PAGE_BAND_CLASSES = "mx-auto w-full max-w-5xl px-4 md:px-5";
+
+interface ToolsSectionDefinition {
   id: ToolsSectionId;
   label: string;
   icon: IconName;
   to: string;
 }
 
-export const TOOLS_SECTIONS = {
+const TOOLS_SECTIONS = {
   skills: {
     id: "skills",
     label: "Skills",
@@ -40,30 +44,42 @@ export const TOOLS_SECTIONS = {
   },
 } satisfies Record<ToolsSectionId, ToolsSectionDefinition>;
 
-/**
- * What each section calls the collection the user already owns. Skills call it
- * the Library; plugins call it Installed. Breadcrumbs and the collection tab
- * both read this, so renaming happens in one place.
- */
-export const TOOLS_OWNED_COLLECTION_LABEL = {
-  skills: "Library",
+const TOOLS_OWNED_COLLECTION_LABEL = {
+  skills: "My skills",
   plugins: "Installed",
 } as const satisfies Record<ToolsSectionId, string>;
 
-export const TOOLS_OWNED_COLLECTION_VIEW = {
+const TOOLS_OWNED_COLLECTION_VIEW = {
   skills: "library",
   plugins: "installed",
 } as const satisfies Record<ToolsSectionId, string>;
 
 export function getToolsOwnedCollectionRoutePath(id: ToolsSectionId): string {
+  if (id === "plugins") return SETTINGS_PLUGINS_ROUTE_PATH;
   return `${TOOLS_SECTIONS[id].to}?view=${TOOLS_OWNED_COLLECTION_VIEW[id]}`;
 }
 
 export const TOOLS_NAV_ITEMS = [TOOLS_SECTIONS.plugins, TOOLS_SECTIONS.skills];
 
-export interface ToolsBreadcrumbSegment {
+interface ToolsBreadcrumbSegment {
   label: string;
   to?: string;
+}
+
+function resolvePluginCreateBreadcrumbs(
+  pathname: string,
+  search: string,
+): ToolsBreadcrumbSegment[] | null {
+  if (
+    pathname !== TOOLS_SECTIONS.plugins.to ||
+    new URLSearchParams(search).get("view") !== "create"
+  ) {
+    return null;
+  }
+  return [
+    { label: "Extensions", to: getPluginsRoutePath() },
+    { label: "Create a plugin" },
+  ];
 }
 
 export function resolveAutomationBreadcrumbs(
@@ -110,9 +126,7 @@ function routeResourceLabel(value: string | undefined, fallback: string) {
   let decoded = value;
   try {
     decoded = decodeURIComponent(value);
-  } catch {
-    // React Router may already have decoded the segment; use it as-is.
-  }
+  } catch {}
   const segments = decoded.split("/").filter(Boolean);
   return segments.at(-1) ?? fallback;
 }
@@ -150,8 +164,6 @@ const DETAIL_ROUTES = [
     fallback: "Skill",
   },
   {
-    // The pre-Library route still resolves so a deep link keeps its header and
-    // document title for the redirect window instead of flashing an empty one.
     pattern: LEGACY_TOOLS_SKILL_DETAIL_ROUTE_PATH,
     section: "skills",
     collection: collectionCrumb("skills"),
@@ -173,7 +185,7 @@ const BROWSE_ROUTES = [
 ] as const;
 
 const ROOT_ROUTE_ALIASES: Record<ToolsSectionId, readonly string[]> = {
-  skills: ["/tools", "/skills"],
+  skills: ["/skills"],
   plugins: [],
 };
 
@@ -183,10 +195,13 @@ export function resolveToolsBreadcrumbs(
   resourceLabel?: string | null,
 ): ToolsBreadcrumbSegment[] | null {
   const view = new URLSearchParams(search).get("view");
-  // Browse is matched before detail on purpose. A single-param detail pattern
-  // such as /tools/plugins/:pluginId also matches /tools/plugins/browse, so
-  // testing detail first resolves the reserved "browse" segment as a resource
-  // id and yields "Plugins / Installed / browse".
+  const pluginCreateBreadcrumbs = resolvePluginCreateBreadcrumbs(
+    pathname,
+    search,
+  );
+  if (pluginCreateBreadcrumbs !== null) {
+    return pluginCreateBreadcrumbs;
+  }
   for (const [section, browseRoute] of BROWSE_ROUTES) {
     if (
       pathname === browseRoute ||
@@ -200,9 +215,14 @@ export function resolveToolsBreadcrumbs(
   for (const detail of DETAIL_ROUTES) {
     const match = matchPath(detail.pattern, pathname);
     if (!match) continue;
+    const collection =
+      detail.section === "plugins" &&
+      view !== TOOLS_OWNED_COLLECTION_VIEW.plugins
+        ? collectionCrumb("plugins", "Browse", getPluginsRoutePath())
+        : detail.collection;
     return [
       sectionCrumb(detail.section),
-      detail.collection,
+      collection,
       {
         label:
           resourceLabel ??
@@ -227,6 +247,102 @@ export function resolveToolsBreadcrumbs(
         { label: TOOLS_OWNED_COLLECTION_LABEL[section.id] },
       ];
     }
+  }
+  return null;
+}
+
+interface ToolsPageDefinition {
+  id:
+    | "plugins-browse"
+    | "plugins-installed"
+    | "skills-browse"
+    | "skills-library";
+  section: ToolsSectionId;
+  label: string;
+  icon: IconName;
+  to: string;
+}
+
+export const TOOLS_PAGES: readonly ToolsPageDefinition[] = [
+  {
+    id: "plugins-browse",
+    section: "plugins",
+    label: `Browse ${TOOLS_SECTIONS.plugins.label.toLowerCase()}`,
+    icon: TOOLS_SECTIONS.plugins.icon,
+    to: TOOLS_SECTIONS.plugins.to,
+  },
+  {
+    id: "plugins-installed",
+    section: "plugins",
+    label: "Installed plugins",
+    icon: "PackageReceive",
+    to: `${TOOLS_SECTIONS.plugins.to}?view=installed`,
+  },
+  {
+    id: "skills-browse",
+    section: "skills",
+    label: `Browse ${TOOLS_SECTIONS.skills.label.toLowerCase()}`,
+    icon: TOOLS_SECTIONS.skills.icon,
+    to: TOOLS_SECTIONS.skills.to,
+  },
+  {
+    id: "skills-library",
+    section: "skills",
+    label: TOOLS_OWNED_COLLECTION_LABEL.skills,
+    icon: "FolderOpen",
+    to: getToolsOwnedCollectionRoutePath("skills"),
+  },
+];
+
+export function resolveToolsActivePage(
+  pathname: string,
+  search = "",
+): ToolsPageDefinition["id"] {
+  const view = new URLSearchParams(search).get("view");
+  for (const detail of DETAIL_ROUTES) {
+    if (matchPath(detail.pattern, pathname) === null) continue;
+    if (detail.section === "plugins") {
+      return "plugins-browse";
+    }
+    return detail.collection.label === TOOLS_OWNED_COLLECTION_LABEL.skills
+      ? "skills-library"
+      : "skills-browse";
+  }
+  const section = resolveToolsSection(pathname);
+  if (section === "plugins") {
+    return view === TOOLS_OWNED_COLLECTION_VIEW.plugins
+      ? "plugins-installed"
+      : "plugins-browse";
+  }
+  return view === TOOLS_OWNED_COLLECTION_VIEW.skills
+    ? "skills-library"
+    : "skills-browse";
+}
+
+export function resolveToolsAreaHeaderMeta(
+  pathname: string,
+  resourceLabel?: string | null,
+  search = "",
+):
+  | { kind: "extensions-title"; title: string }
+  | { kind: "breadcrumbs"; breadcrumbs: ToolsBreadcrumbSegment[] }
+  | null {
+  if (isToolsRoutePath(pathname)) {
+    const pluginCreateBreadcrumbs = resolvePluginCreateBreadcrumbs(
+      pathname,
+      search,
+    );
+    if (pluginCreateBreadcrumbs !== null) {
+      return { kind: "breadcrumbs", breadcrumbs: pluginCreateBreadcrumbs };
+    }
+    return { kind: "extensions-title", title: "Extensions" };
+  }
+  const automationBreadcrumbs = resolveAutomationBreadcrumbs(
+    pathname,
+    resourceLabel,
+  );
+  if (automationBreadcrumbs !== null) {
+    return { kind: "breadcrumbs", breadcrumbs: automationBreadcrumbs };
   }
   return null;
 }

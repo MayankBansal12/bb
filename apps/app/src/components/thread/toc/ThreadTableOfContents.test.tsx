@@ -18,9 +18,6 @@ import type {
   TimelineRow,
 } from "@bb/server-contract";
 
-// The minimap now sources items from the conversation-outline query, so the
-// component needs a QueryClient unless we mock the hook. Mocking also lets us
-// drive the outline (and the scroll surface) directly without a provider tree.
 vi.mock("@/components/ui/bottom-anchored-scroll-body.js", () => ({
   useBottomAnchoredScroll: vi.fn(),
 }));
@@ -42,9 +39,33 @@ import {
   type TocItem,
 } from "./ThreadTableOfContents";
 import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
+import { makeThreadListEntry as makeThreadListEntryFixture } from "@bb/test-helpers/domain-fixtures";
+import { makeThreadWithRuntime as makeThreadWithRuntimeFixture } from "@bb/test-helpers/domain-fixtures";
+import {
+  makeProjectWithThreadsResponse,
+  makeSidebarBootstrapResponse,
+} from "@/test/fixtures/projects";
 
 class ResizeObserverMock implements ResizeObserver {
-  observe: ResizeObserver["observe"] = vi.fn();
+  constructor(private readonly callback: ResizeObserverCallback) {}
+
+  observe: ResizeObserver["observe"] = (target) => {
+    const element = target as HTMLElement;
+    const paddingX =
+      (Number.parseFloat(element.style.paddingLeft) || 0) +
+      (Number.parseFloat(element.style.paddingRight) || 0);
+    const inlineSize = Math.max(0, element.clientWidth - paddingX);
+    this.callback(
+      [
+        {
+          target,
+          contentBoxSize: [{ inlineSize, blockSize: 0 }],
+          contentRect: { width: inlineSize } as DOMRectReadOnly,
+        } as unknown as ResizeObserverEntry,
+      ],
+      this,
+    );
+  };
   unobserve: ResizeObserver["unobserve"] = vi.fn();
   disconnect: ResizeObserver["disconnect"] = vi.fn();
 }
@@ -76,18 +97,21 @@ function userConversationRow(index = 1): TimelineRow {
 }
 
 function TocHost({
+  contextBoundarySeq = null,
   hasOlderTimelineRows = false,
   hostPaddingX = 0,
   hostWidth = 1_200,
   loadOlderTimelineRows = () => {},
+  onNavigateToRow,
   threadId = "thr_toc_test",
   timelineRows,
 }: {
+  contextBoundarySeq?: number | null;
   hasOlderTimelineRows?: boolean;
-  /** Horizontal padding on each side, as the real scroll overlay has. */
   hostPaddingX?: number;
   hostWidth?: number;
   loadOlderTimelineRows?: () => void | Promise<void>;
+  onNavigateToRow?: (rowId: string) => void;
   threadId?: string;
   timelineRows: readonly TimelineRow[];
 }) {
@@ -107,10 +131,12 @@ function TocHost({
       }}
     >
       <ThreadTableOfContents
+        contextBoundarySeq={contextBoundarySeq}
         threadId={threadId}
         timelineRows={timelineRows}
         hasOlderTimelineRows={hasOlderTimelineRows}
         loadOlderTimelineRows={loadOlderTimelineRows}
+        onNavigateToRow={onNavigateToRow}
       />
     </div>
   );
@@ -175,9 +201,13 @@ function outlineResponse(
   return { items, maxSeq: items.length };
 }
 
-function setOutline(items: ThreadConversationOutlineItem[] | undefined): void {
+function setOutline(
+  items: ThreadConversationOutlineItem[] | undefined,
+  maxSeq = items?.length ?? 0,
+): void {
   vi.mocked(useThreadConversationOutline).mockReturnValue({
-    data: items === undefined ? undefined : outlineResponse(items),
+    data:
+      items === undefined ? undefined : { ...outlineResponse(items), maxSeq },
   } as ReturnType<typeof useThreadConversationOutline>);
 }
 
@@ -190,23 +220,12 @@ function timelineRowElement(id: string): HTMLElement {
 function threadWithRuntime(
   thread: Partial<ThreadWithRuntime> = {},
 ): ThreadWithRuntime {
-  return {
+  return makeThreadWithRuntimeFixture({
     id: "thr_worker",
     projectId: "proj_toc",
     environmentId: "env_toc",
-    providerId: "codex",
     title: null,
     titleFallback: null,
-    sectionId: null,
-    status: "idle",
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    archivedAt: null,
-    pinnedAt: null,
-    deletedAt: null,
     lastReadAt: null,
     latestAttentionAt: 1,
     createdAt: 1,
@@ -216,61 +235,35 @@ function threadWithRuntime(
       hostReconnectGraceExpiresAt: null,
     },
     ...thread,
-  };
+  });
 }
 
 function threadListEntry(
   thread: Partial<ThreadListEntry> = {},
 ): ThreadListEntry {
-  return {
-    ...threadWithRuntime(thread),
-    activity: {
-      activeWorkflowCount: 0,
-      activeBackgroundAgentCount: 0,
-      activeBackgroundCommandCount: 0,
-      activePlanModeCount: 0,
-      activeGoalCount: 0,
-    },
-    pinSortKey: null,
-    hasPendingInteraction: false,
+  return makeThreadListEntryFixture({
+    ...threadWithRuntime(),
     environmentHostId: "host_toc",
     environmentName: "ToC environment",
     environmentBranchName: "main",
-    environmentWorkspaceDisplayKind: "managed-worktree",
     ...thread,
-  };
+  });
 }
 
 function sidebarNavigation(
   threads: ThreadListEntry[],
 ): SidebarBootstrapResponse {
-  return {
-    sections: [],
+  return makeSidebarBootstrapResponse({
     projects: [
-      {
+      makeProjectWithThreadsResponse({
         id: "proj_toc",
-        kind: "standard",
         name: "ToC project",
-        gitRemoteUrl: null,
         createdAt: 1,
         updatedAt: 1,
-        sources: [],
         threads,
-        defaultExecutionOptions: null,
-      },
+      }),
     ],
-    personalProject: {
-      id: "proj_personal",
-      kind: "personal",
-      name: "Personal",
-      gitRemoteUrl: null,
-      createdAt: 1,
-      updatedAt: 1,
-      sources: [],
-      threads: [],
-      defaultExecutionOptions: null,
-    },
-  };
+  });
 }
 
 const userItems: TocItem[] = [
@@ -322,7 +315,6 @@ beforeEach(() => {
     captureScrollAnchor: vi.fn(),
   } as unknown as ReturnType<typeof useBottomAnchoredScroll>);
 
-  // Default: outline not loaded, so the minimap falls back to timelineRows.
   setOutline(undefined);
 });
 
@@ -361,6 +353,36 @@ describe("selectTocRailItems", () => {
 });
 
 describe("ThreadTableOfContents", () => {
+  it("does not restore an outline cached before the current context boundary", async () => {
+    setOutline(
+      [1, 2, 3].map((index) => ({
+        id: `old-${index}`,
+        role: "user" as const,
+        preview: `Old message ${index}`,
+        attachmentSummary: null,
+      })),
+      5,
+    );
+
+    render(
+      <TocHost
+        contextBoundarySeq={10}
+        timelineRows={[
+          userConversationRow(10),
+          userConversationRow(11),
+          userConversationRow(12),
+        ]}
+      />,
+    );
+    openTocPanel();
+
+    expect(await screen.findByText("Your messages")).not.toBeNull();
+    expect(screen.queryByText("Old message 1")).toBeNull();
+    expect(
+      screen.getByText("Loaded after client-side navigation 10"),
+    ).not.toBeNull();
+  });
+
   it("defers the full outline request until the latest timeline is available", () => {
     const view = render(<TocHost timelineRows={[]} />);
 
@@ -386,8 +408,6 @@ describe("ThreadTableOfContents", () => {
     );
   });
 
-  // The overlay pads itself, so `clientWidth` runs 24px ahead of the content
-  // box the `@container` rule measures. Both boundaries must agree with CSS.
   it("does not request the outline when padding hides the TOC", () => {
     render(
       <TocHost
@@ -649,16 +669,52 @@ describe("ThreadTableOfContents", () => {
       },
     ]);
 
-    // timelineRows is empty: the minimap lists the full thread from the outline,
-    // not just the loaded window.
     render(<TocHost timelineRows={[]} />);
     openTocPanel();
 
     expect(await screen.findByText("First question")).not.toBeNull();
     expect(screen.getByText("Second question")).not.toBeNull();
     expect(screen.getByText("Image attachment")).not.toBeNull();
-    // The agent tab is offered because the outline has assistant messages.
     expect(screen.getByText("Agent messages")).not.toBeNull();
+  });
+
+  it("merges live timeline messages into the cached full outline", async () => {
+    setOutline([
+      {
+        id: "row_user_1",
+        role: "user",
+        preview: "First cached question",
+        attachmentSummary: null,
+      },
+      {
+        id: "row_user_2",
+        role: "user",
+        preview: "Second cached question",
+        attachmentSummary: null,
+      },
+      {
+        id: "row_user_3",
+        role: "user",
+        preview: "Stale third question",
+        attachmentSummary: null,
+      },
+    ]);
+
+    render(
+      <TocHost
+        timelineRows={[userConversationRow(3), userConversationRow(4)]}
+      />,
+    );
+    openTocPanel();
+
+    expect(await screen.findByText("First cached question")).not.toBeNull();
+    expect(
+      screen.getByText("Loaded after client-side navigation 3"),
+    ).not.toBeNull();
+    expect(
+      screen.getByText("Loaded after client-side navigation 4"),
+    ).not.toBeNull();
+    expect(screen.queryByText("Stale third question")).toBeNull();
   });
 
   it("renders an agent-to-agent message source as a thread mention", async () => {
@@ -769,6 +825,7 @@ describe("ThreadTableOfContents", () => {
   it("scrolls straight to a message already loaded in the window", async () => {
     scrollElement.appendChild(timelineRowElement("u2"));
     const loadOlder = vi.fn();
+    const onNavigateToRow = vi.fn();
     setOutline([
       {
         id: "u1",
@@ -795,18 +852,18 @@ describe("ThreadTableOfContents", () => {
         timelineRows={[]}
         hasOlderTimelineRows
         loadOlderTimelineRows={loadOlder}
+        onNavigateToRow={onNavigateToRow}
       />,
     );
     openTocPanel();
     fireEvent.click(await screen.findByText("Loaded question"));
 
     await waitFor(() => expect(scrollElementIntoView).toHaveBeenCalledTimes(1));
+    expect(onNavigateToRow).toHaveBeenCalledWith("u2");
     expect(loadOlder).not.toHaveBeenCalled();
   });
 
   it("auto-paginates older pages to reach an unloaded message, then scrolls to it", async () => {
-    // The target isn't in the loaded window; loadOlder simulates it paginating
-    // in, mirroring the real controller prepending older rows to the DOM.
     const loadOlder = vi.fn(() => {
       scrollElement.appendChild(timelineRowElement("u_old"));
     });
@@ -878,7 +935,6 @@ describe("ThreadTableOfContents", () => {
     openTocPanel();
     fireEvent.click(await screen.findByText("Unreachable"));
 
-    // hasOlder is false, so the loop body never runs; no scroll, no pagination.
     await waitFor(() => expect(loadOlder).not.toHaveBeenCalled());
     expect(scrollElementIntoView).not.toHaveBeenCalled();
   });
@@ -967,14 +1023,11 @@ describe("ThreadTableOfContents", () => {
   });
 
   it("finds active items with logarithmic row measurements", () => {
-    const allItems = Array.from(
-      { length: 256 },
-      (_, index): TocItem => ({
-        id: `item-${index}`,
-        label: `Message ${index}`,
-        role: index % 2 === 0 ? "user" : "assistant",
-      }),
-    );
+    const allItems = Array.from({ length: 256 }, (_, index): TocItem => ({
+      id: `item-${index}`,
+      label: `Message ${index}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+    }));
     const manyUserItems = allItems.filter((item) => item.role === "user");
     const manyAgentItems = allItems.filter((item) => item.role === "assistant");
     const visibleIndex = 200;

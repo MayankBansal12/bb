@@ -1,87 +1,28 @@
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Command } from "commander";
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+import { RESERVED_BB_CLI_COMMANDS } from "@bb/domain/plugin-cli";
 
-import { registerEnvironmentCommands } from "../commands/environment.js";
-import { registerGuideCommand } from "../commands/guide.js";
-import { registerManagerCommands } from "../commands/manager.js";
-import { registerPluginCommands } from "../commands/plugin.js";
-import { registerProjectCommands } from "../commands/project.js";
-import { registerProviderCommands } from "../commands/provider.js";
-import { registerSkillCommands } from "../commands/skill.js";
-import { registerStatusCommand } from "../commands/status.js";
-import { registerThemeCommands } from "../commands/theme.js";
-import { registerThreadCommands } from "../commands/thread/index.js";
+import {
+  CORE_COMMAND_GROUPS,
+  pluginProxyCandidate,
+} from "../command-groups.js";
 import {
   describeUnreachableServer,
   fetchPluginCliContributions,
   findDisabledPluginForCommand,
   findPluginCliCommand,
-  pluginProxyCandidate,
+  PLUGIN_CLI_HEADERS_TIMEOUT_MS,
   runPluginCliCommand,
   type PluginCliContributionEntry,
 } from "../plugin-cli-proxy.js";
 
-// Mirror of RESERVED_BB_CLI_COMMANDS in
-// apps/server/src/services/plugins/plugin-api.ts — the server rejects plugin
-// CLI commands shadowing core bb commands. Update both together.
-const RESERVED_BB_CLI_COMMANDS = [
-  "environment",
-  "guide",
-  "help",
-  "manager",
-  "plugin",
-  "project",
-  "provider",
-  "skill",
-  "status",
-  "theme",
-  "thread",
-];
-
-function buildProgram(): Command {
-  const program = new Command();
-  const getUrl = () => "http://localhost";
-  registerStatusCommand(program, getUrl);
-  registerProjectCommands(program, getUrl);
-  registerProviderCommands(program, getUrl);
-  registerManagerCommands(program, getUrl);
-  registerThreadCommands(program, getUrl);
-  registerEnvironmentCommands(program, getUrl);
-  registerThemeCommands(program, getUrl);
-  registerPluginCommands(program, getUrl);
-  registerSkillCommands(program, getUrl, () => ({ serverUrl: getUrl() }));
-  registerGuideCommand(program);
-  return program;
-}
-
-function topLevelCommandNames(program: Command): string[] {
-  return program.commands.flatMap((command) => [
-    command.name(),
-    ...command.aliases(),
-  ]);
-}
-
 describe("reserved bb CLI command names", () => {
-  it("every core top-level command is on the server's reserved list", () => {
-    const names = topLevelCommandNames(buildProgram());
-    const reserved = new Set(RESERVED_BB_CLI_COMMANDS);
-    for (const name of names) {
-      expect(
-        reserved,
-        `"${name}" is missing from RESERVED_BB_CLI_COMMANDS`,
-      ).toContain(name);
-    }
-  });
-
-  it("the reserved list carries no stale entries", () => {
-    const names = new Set(topLevelCommandNames(buildProgram()));
-    names.add("help"); // commander built-in
-    for (const reserved of RESERVED_BB_CLI_COMMANDS) {
-      expect(
-        names,
-        `"${reserved}" is reserved but not a core command`,
-      ).toContain(reserved);
-    }
+  it("matches the complete core command-group registry plus help", () => {
+    expect([...RESERVED_BB_CLI_COMMANDS].sort()).toEqual(
+      [...CORE_COMMAND_GROUPS.map((group) => group.name), "help"].sort(),
+    );
   });
 });
 
@@ -93,10 +34,7 @@ describe("pluginProxyCandidate", () => {
   });
 
   it("proxies the builtin plugin commands the kernel no longer owns", () => {
-    // `automation` and `connect` moved into builtin plugins: they must not
-    // be reserved, and the real program must not register them, so the
-    // proxy resolves them against the running server.
-    const names = new Set(topLevelCommandNames(buildProgram()));
+    const names = new Set(CORE_COMMAND_GROUPS.map((group) => group.name));
     names.add("help");
     for (const moved of ["automation", "connect"]) {
       expect(RESERVED_BB_CLI_COMMANDS).not.toContain(moved);
@@ -120,8 +58,6 @@ describe("fetchPluginCliContributions", () => {
   });
 
   it("distinguishes an unreachable server from an old/invalid one", async () => {
-    // Unreachable (server down): fetch rejects → keep the thrown error so
-    // the caller can diagnose refused vs blocked vs timed out.
     const thrown = new Error("ECONNREFUSED");
     vi.stubGlobal(
       "fetch",
@@ -138,7 +74,6 @@ describe("fetchPluginCliContributions", () => {
       lastTimeoutMs: 2000,
     });
 
-    // Old server without the route: silent fallback to commander's error.
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response("not found", { status: 404 })),
@@ -206,7 +141,6 @@ describe("fetchPluginCliContributions retries", () => {
     });
   }
 
-  /** Record the sleeps instead of taking them, so the test stays instant. */
   function recordingSleep() {
     const slept: number[] = [];
     return {
@@ -218,8 +152,6 @@ describe("fetchPluginCliContributions retries", () => {
   }
 
   it("recovers when a busy server answers on a later attempt", async () => {
-    // The regression: a single stalled probe used to fail the whole command,
-    // so `bb memory add` reported bb down and the write was simply lost.
     const fetchMock = vi
       .fn()
       .mockRejectedValueOnce(timeoutError())
@@ -288,8 +220,6 @@ describe("fetchPluginCliContributions retries", () => {
   });
 
   it("fails fast when nothing is listening", async () => {
-    // ECONNREFUSED is the one cause that really does mean bb is down;
-    // retrying it would only delay a correct, actionable answer.
     const fetchMock = vi.fn().mockRejectedValue(connectError("ECONNREFUSED"));
     vi.stubGlobal("fetch", fetchMock);
     const { slept, sleep } = recordingSleep();
@@ -352,8 +282,6 @@ describe("describeUnreachableServer", () => {
       }),
     );
     return new TypeError("fetch failed", {
-      // NodeAggregateError exposes the first attempt's code on the aggregate,
-      // even when later attempts failed for a different reason.
       cause: Object.assign(new AggregateError(errors), {
         code: errors[0]?.code,
       }),
@@ -401,8 +329,6 @@ describe("describeUnreachableServer", () => {
     const message = describeUnreachableServer(url, timeout, 2000);
     expect(message).toContain(`bb did not respond at ${url} within 2000ms`);
     expect(message).toContain("it may be busy or temporarily unreachable");
-    // The reader is usually an agent: a timeout must never read as "bb is
-    // down", and must say the work is still pending so it is not dropped.
     expect(message).not.toContain("not running at");
     expect(message).not.toContain("bb is running");
     expect(message).toContain("re-run it");
@@ -456,7 +382,6 @@ describe("findDisabledPluginForCommand", () => {
       status: null,
       statusDetail: null,
     });
-    // Enabled plugins and unknown names never match.
     await expect(
       findDisabledPluginForCommand("http://localhost", "automations"),
     ).resolves.toBeNull();
@@ -570,4 +495,100 @@ describe("runPluginCliCommand", () => {
       { channel: "stderr", value: "warning\n" },
     ]);
   });
+
+  it("materializes an arbitrary stdin flag only in the proxied request", async () => {
+    const requests: string[][] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url, init: RequestInit | undefined) => {
+        const parsed = JSON.parse(String(init?.body)) as { argv: string[] };
+        requests.push(parsed.argv);
+        return new Response(JSON.stringify({ exitCode: 0 }), { status: 200 });
+      }),
+    );
+    const writes: string[] = [];
+    const output = {
+      write(value: string, callback: (error?: Error | null) => void) {
+        writes.push(value);
+        callback();
+        return true;
+      },
+    };
+    const input = {
+      isTTY: false,
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from("opaque-credential\n");
+      },
+    };
+    const argv = ["deploy", "--credential-stdin", "--format", "json"];
+
+    await expect(
+      runPluginCliCommand(
+        "http://localhost",
+        "fixture",
+        argv,
+        { stdout: output, stderr: output },
+        input,
+      ),
+    ).resolves.toBe(0);
+    expect(argv).toEqual(["deploy", "--credential-stdin", "--format", "json"]);
+    expect(requests).toEqual([
+      ["deploy", "--credential", "opaque-credential", "--format", "json"],
+    ]);
+    expect(writes).toEqual([]);
+  });
+
+  it("outlives the global fetch headers timeout while a plugin command waits on a human", async () => {
+    const RESPONSE_DELAY_MS = 1500;
+    const server: Server = createServer((request, response) => {
+      setTimeout(() => {
+        response.setHeader("content-type", "application/json");
+        response.end(
+          JSON.stringify({
+            exitCode: 0,
+            stdout: `${request.method} ${request.url}`,
+          }),
+        );
+      }, RESPONSE_DELAY_MS);
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const previousDispatcher = getGlobalDispatcher();
+    setGlobalDispatcher(new Agent({ headersTimeout: 200 }));
+    try {
+      await expect(
+        fetch(`${baseUrl}/api/v1/plugins/secrets/cli`, { method: "POST" }),
+      ).rejects.toMatchObject({
+        message: "fetch failed",
+        cause: { code: "UND_ERR_HEADERS_TIMEOUT" },
+      });
+
+      const writes: string[] = [];
+      const stream = {
+        write(value: string, callback: (error?: Error | null) => void) {
+          writes.push(value);
+          callback();
+          return true;
+        },
+      };
+      const exitCode = await runPluginCliCommand(
+        baseUrl,
+        "secrets",
+        ["request", "--purpose", "Testing the transport \u2014 an em dash"],
+        { stdout: stream, stderr: stream },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(writes).toEqual(["POST /api/v1/plugins/secrets/cli\n"]);
+      expect(PLUGIN_CLI_HEADERS_TIMEOUT_MS).toBeGreaterThan(60 * 60 * 1000);
+      expect(PLUGIN_CLI_HEADERS_TIMEOUT_MS).toBeLessThanOrEqual(
+        2 * 60 * 60 * 1000,
+      );
+    } finally {
+      setGlobalDispatcher(previousDispatcher);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 15_000);
 });

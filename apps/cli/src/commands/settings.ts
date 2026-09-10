@@ -3,12 +3,19 @@ import {
   appCommandIdSchema,
   appShortcutSchema,
   appSettingsSchema,
+  describeUiPreference,
   experimentKeySchema,
   experimentsSchema,
+  isUiPreferenceKey,
+  parseUiPreferenceValue,
+  UI_PREFERENCE_KEYS,
   type AppSettings,
   type AppShortcut,
   type Experiments,
+  type UiPreferenceKey,
+  type UiPreferenceValue,
 } from "@bb/domain";
+import { BbHttpError } from "@bb/sdk";
 import { action } from "../action.js";
 import { createCliBbSdk } from "../client.js";
 import { outputJson } from "./helpers.js";
@@ -54,25 +61,41 @@ function parseShortcut(value: string): AppShortcut {
   });
 }
 
+function generalSettingValueCandidates(value: string): unknown[] {
+  if (value === "on") return [true, value];
+  if (value === "off") return [false, value];
+  try {
+    return [JSON.parse(value), value];
+  } catch {
+    return [value];
+  }
+}
+
 function updateGeneralSetting(
   settings: AppSettings,
   key: string,
-  value: boolean,
+  value: string,
 ): AppSettings {
-  switch (key) {
-    case "caffeinate":
-    case "showKeyboardHints":
-    case "steerActiveThreadOnEnter":
-    case "showUnhandledProviderEvents":
-    case "codexMemoryEnabled":
-    case "claudeCodeMemoryEnabled":
-    case "codexSubagentsDisabled":
-    case "claudeCodeSubagentsDisabled":
-    case "claudeCodeWorkflowsDisabled":
-      return appSettingsSchema.parse({ ...settings, [key]: value });
-    default:
-      throw new Error(`Unknown general setting '${key}'.`);
+  const settingKey = appSettingsSchema.keyof().safeParse(key);
+  if (!settingKey.success) {
+    throw new Error(
+      `Unknown general setting '${key}'. Known settings: ${appSettingsSchema
+        .keyof()
+        .options.join(", ")}.`,
+    );
   }
+
+  for (const candidate of generalSettingValueCandidates(value)) {
+    const updated = appSettingsSchema.safeParse({
+      ...settings,
+      [settingKey.data]: candidate,
+    });
+    if (updated.success) return updated.data;
+  }
+
+  throw new Error(
+    `Invalid value '${value}' for '${settingKey.data}'. Booleans take true, false, on, or off, null clears a nullable setting, and structured values take JSON.`,
+  );
 }
 
 function updateExperiment(
@@ -89,6 +112,40 @@ function updateExperiment(
     ...experiments,
     [experimentKey.data]: enabled,
   });
+}
+
+function requireUiPreferenceKey(key: string): UiPreferenceKey {
+  if (isUiPreferenceKey(key)) return key;
+  throw new Error(
+    `Unknown UI preference '${key}'. Known preferences: ${UI_PREFERENCE_KEYS.join(", ")}.`,
+  );
+}
+
+function uiPreferenceValueCandidates(value: string): unknown[] {
+  try {
+    return [JSON.parse(value), value];
+  } catch {
+    return [value];
+  }
+}
+
+function parseUiPreferenceInput<Key extends UiPreferenceKey>(
+  key: Key,
+  value: string,
+): UiPreferenceValue<Key> {
+  let message = "";
+  for (const candidate of uiPreferenceValueCandidates(value)) {
+    const parsed = parseUiPreferenceValue(key, candidate);
+    if (parsed.success) return parsed.value;
+    message = parsed.message;
+  }
+  throw new Error(
+    `Invalid value '${value}' for '${key}': ${message}. Lists and null take JSON; plain strings may be unquoted.`,
+  );
+}
+
+function isUiPreferenceConflict(error: unknown): boolean {
+  return error instanceof BbHttpError && error.status === 409;
 }
 
 export function registerSettingsCommands(
@@ -112,46 +169,123 @@ export function registerSettingsCommands(
     );
 
   settings
+    .command("ai-services")
+    .description(
+      "Show the AI-service settings (BB_INFERENCE, BB_INFERENCE_FALLBACK, BB_TRANSCRIPTION) and the plugin services they may name",
+    )
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (opts: JsonOptions) => {
+        const { aiServices } = await createCliBbSdk(getUrl()).system.config();
+        if (outputJson(opts, aiServices)) return;
+        console.log(`BB_INFERENCE          ${aiServices.inference}`);
+        console.log(`BB_INFERENCE_FALLBACK ${aiServices.inferenceFallback}`);
+        console.log(`BB_TRANSCRIPTION      ${aiServices.transcription}`);
+        console.log("");
+        if (aiServices.services.length === 0) {
+          console.log("No plugin registers an AI service.");
+          return;
+        }
+        console.log(
+          "Registered services (<id>/<model> in the settings above):",
+        );
+        for (const service of aiServices.services) {
+          console.log(
+            `  ${service.id}  ${service.displayName}  [${service.kinds.join(", ")}]  plugin ${service.pluginId}`,
+          );
+        }
+      }),
+    );
+
+  settings
     .command("general <key> <value>")
-    .description("Set a boolean Settings → General preference")
+    .description("Set a Settings → General preference")
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (key: string, value: string, opts: JsonOptions) => {
         const sdk = createCliBbSdk(getUrl());
         const config = await sdk.system.config();
         const result = await sdk.system.updateGeneralSettings(
-          updateGeneralSetting(
-            config.generalSettings,
-            key,
-            parseBoolean(value),
-          ),
+          updateGeneralSetting(config.generalSettings, key, value),
         );
         if (outputJson(opts, result)) return;
         console.log(`${key} updated`);
       }),
     );
 
-  settings
-    .command("replay-onboarding")
-    .description("Show the first-run setup guide again on the next app load")
+  const ui = settings
+    .command("ui")
+    .description(
+      "Manage server-synced UI preferences such as sidebar layout and navigation",
+    );
+  ui.command("list")
+    .description("List every UI preference with its value and revision")
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (opts: JsonOptions) => {
-        const sdk = createCliBbSdk(getUrl());
-        const config = await sdk.system.config();
-        let experiments = config.experiments;
-        if (!config.experiments.newOnboarding) {
-          experiments = await sdk.system.updateExperiments({
-            ...config.experiments,
-            newOnboarding: true,
-          });
+        const result =
+          await createCliBbSdk(getUrl()).system.uiPreferences.list();
+        if (outputJson(opts, result)) return;
+        for (const key of UI_PREFERENCE_KEYS) {
+          const entry = result.preferences[key];
+          console.log(
+            `${key}  ${JSON.stringify(entry.value)}  (revision ${entry.revision})`,
+          );
+          console.log(`  ${describeUiPreference(key)}`);
         }
-        const generalSettings = await sdk.system.updateGeneralSettings({
-          ...config.generalSettings,
-          onboardingCompletedAt: null,
-        });
-        if (outputJson(opts, { experiments, generalSettings })) return;
-        console.log("New onboarding is enabled; onboarding will show again");
+      }),
+    );
+  ui.command("get <key>")
+    .description("Show one UI preference")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const { preferences } =
+          await createCliBbSdk(getUrl()).system.uiPreferences.list();
+        const entry = preferences[key];
+        if (outputJson(opts, { key, ...entry })) return;
+        console.log(JSON.stringify(entry.value));
+      }),
+    );
+  ui.command("set <key> <value>")
+    .description("Set a UI preference; lists and null take JSON")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, value: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const parsedValue = parseUiPreferenceInput(key, value);
+        const sdk = createCliBbSdk(getUrl());
+        const write = async () => {
+          const { preferences } = await sdk.system.uiPreferences.list();
+          return sdk.system.uiPreferences.set({
+            expectedRevision: preferences[key].revision,
+            key,
+            value: parsedValue,
+          });
+        };
+        let result;
+        try {
+          result = await write();
+        } catch (error) {
+          if (!isUiPreferenceConflict(error)) throw error;
+          result = await write();
+        }
+        if (outputJson(opts, result)) return;
+        console.log(`${key} updated`);
+      }),
+    );
+  ui.command("reset <key>")
+    .description("Reset a UI preference to its default")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const result = await createCliBbSdk(
+          getUrl(),
+        ).system.uiPreferences.reset({ key });
+        if (outputJson(opts, result)) return;
+        console.log(`${key} reset`);
       }),
     );
 
@@ -186,7 +320,7 @@ export function registerSettingsCommands(
           updateGeneralSetting(
             config.generalSettings,
             "showKeyboardHints",
-            parseBoolean(value),
+            value,
           ),
         );
         if (outputJson(opts, result)) return;

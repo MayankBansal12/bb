@@ -1,6 +1,10 @@
 import { useCallback, useContext, useMemo, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
-import type { ThreadChatMessageAction, ThreadChatProps } from "@bb/plugin-sdk";
+import type {
+  ThreadChatMessageAction,
+  ThreadChatProps,
+} from "@get-bb/plugin-sdk";
+import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import {
   formatEnvironmentDisplay,
   type EnvironmentDisplayHostContext,
@@ -17,10 +21,17 @@ import {
 } from "@/components/thread/timeline";
 import { useThreadTimelineNavigation } from "@/components/thread/timeline/ThreadTimelineNavigationContext";
 import { PluginContext } from "@/components/plugin/plugin-context";
+import { ThreadProviderContext } from "@/components/thread/thread-provider-context";
 import { useEnvironment } from "@/hooks/queries/environment-queries";
+import { useSystemProviderInfo } from "@/hooks/queries/system-queries";
 import { useThread } from "@/hooks/queries/thread-queries";
 import { useHostDaemon } from "@/hooks/useHostDaemon";
-import { getEnvironmentWorkspaceLabelIconName } from "@/lib/environment-workspace-display";
+import { useHosts } from "@/hooks/queries/host-queries";
+import {
+  findEnvironmentDisplayProvider,
+  getEnvironmentWorkspaceSummaryDisplay,
+} from "@/lib/environment-workspace-display";
+import { useSystemEnvironmentProviders } from "@/hooks/queries/environment-provider-queries";
 import { formatWorkspaceCheckoutDisplay } from "@/lib/workspace-checkout-display";
 import { BbHttpError } from "@/lib/sdk";
 import {
@@ -28,16 +39,6 @@ import {
   getThreadRoutePath,
 } from "@/lib/route-paths";
 
-/**
- * Host implementation of the SDK's `ThreadChat` (plugin design: the one
- * deliberate exception to the §5.5 no-host-components rule). A thin adapter
- * over `EmbeddedThreadChat`: the public contract is just `threadId` +
- * presentation, so everything the engine needs (project, provider,
- * environment, drafts scope) is derived from the thread itself. Renders
- * wherever plugin slots mount — the whole plugin UI tree lives inside the
- * host app's providers (react-query, router, jotai), so no extra context
- * wiring is required here.
- */
 export function PluginThreadChat({
   threadId,
   variant = "full",
@@ -88,10 +89,37 @@ function PluginThreadChatBody({
 }: PluginThreadChatBodyProps) {
   const threadQuery = useThread(threadId, { enabled: threadId.length > 0 });
   const thread = threadQuery.data;
+  const threadProviderInfo = useSystemProviderInfo(
+    thread?.environmentId
+      ? {
+          enabled: true,
+          environmentId: thread.environmentId,
+          providerId: thread.providerId,
+        }
+      : {
+          enabled: thread !== undefined,
+          providerId: thread?.providerId,
+        },
+  );
+  const threadProviderPluginId = threadProviderInfo?.pluginId ?? null;
+  const threadProviderContextValue = useMemo(
+    () => ({
+      providerId: thread?.providerId ?? null,
+      pluginId: threadProviderPluginId,
+    }),
+    [thread?.providerId, threadProviderPluginId],
+  );
   const navigate = useNavigate();
   const { isLocalDaemonHost } = useHostDaemon();
   const environmentQuery = useEnvironment(thread?.environmentId ?? null);
   const environment = environmentQuery.data ?? null;
+  const hostsQuery = useHosts({ enabled: environment !== null });
+  const environmentHostName = environment
+    ? (hostsQuery.data?.find((host) => host.id === environment.hostId)?.name ??
+      null)
+    : null;
+  const hasMultipleMachines = (hostsQuery.data?.length ?? 0) > 1;
+  const { providers: environmentProviders } = useSystemEnvironmentProviders();
   const timelineNavigation = useThreadTimelineNavigation();
   const canUseHostFileNavigation =
     thread !== undefined &&
@@ -108,8 +136,6 @@ function PluginThreadChatBody({
     (canUseHostFileNavigation
       ? timelineNavigation.workspaceRootPath
       : undefined);
-  // Null outside a plugin slot mount (host-internal usages, tests): actions
-  // then render their icon hint instead of the plugin's branding icon.
   const pluginId = useContext(PluginContext);
   const consumerMessageActions = useMemo<
     readonly ThreadTimelineConsumerMessageAction[] | undefined
@@ -119,8 +145,6 @@ function PluginThreadChatBody({
         ? undefined
         : messageActions.map((action) => ({
             id: action.id,
-            // An explicit icon hint wins over plugin branding so actions like
-            // send-to-main keep their semantic glyph (legacy parity).
             pluginId: action.icon !== undefined ? null : pluginId,
             icon: action.icon ?? null,
             label: action.title,
@@ -130,9 +154,6 @@ function PluginThreadChatBody({
     [messageActions, pluginId],
   );
 
-  // Threads and projects always stay navigable. A hosted thread panel can also
-  // open workspace-file mentions through its owning detail surface; standalone
-  // plugin surfaces and thread-storage mentions have no unambiguous file tab.
   const resolveMentionLink = useCallback<PromptMentionLinkResolver>(
     (resource) => {
       if (resource.kind === "thread") {
@@ -163,25 +184,35 @@ function PluginThreadChatBody({
 
   const environmentSummary = useMemo(() => {
     if (environment === null) {
-      return (
-        <ThreadEnvironmentSummary
-          environmentLabel="Working locally"
-          environmentCompactLabel="Local"
-        />
-      );
+      return null;
     }
     const host: EnvironmentDisplayHostContext = {
       locality: isLocalDaemonHost(environment.hostId) ? "local" : "remote",
       identity: null,
     };
-    const display = formatEnvironmentDisplay({ environment, host });
+    const providerLookup = findEnvironmentDisplayProvider(
+      environmentProviders,
+      environment.environmentProviderId,
+    );
+    const display = formatEnvironmentDisplay({
+      environment,
+      host,
+      providerLookup,
+    });
+    const summaryDisplay = getEnvironmentWorkspaceSummaryDisplay({
+      display,
+      providerLookup,
+      environmentName: environment.name,
+      hasMultipleMachines,
+      hostName: environmentHostName,
+      isProjectless: thread?.projectId === PERSONAL_PROJECT_ID,
+    });
     return (
       <ThreadEnvironmentSummary
-        environmentLabel={display.modeLabel}
-        environmentCompactLabel={display.compactModeLabel}
-        environmentIcon={getEnvironmentWorkspaceLabelIconName(
-          display.workspaceDisplayKind,
-        )}
+        environmentLabel={summaryDisplay?.label}
+        environmentCompactLabel={summaryDisplay?.compactLabel}
+        environmentIcon={summaryDisplay?.icon}
+        environmentTypeLabel={summaryDisplay?.typeLabel}
         environmentCheckout={
           environment.branchName
             ? formatWorkspaceCheckoutDisplay({
@@ -195,7 +226,14 @@ function PluginThreadChatBody({
         }
       />
     );
-  }, [environment, isLocalDaemonHost]);
+  }, [
+    environment,
+    environmentHostName,
+    environmentProviders,
+    hasMultipleMachines,
+    isLocalDaemonHost,
+    thread?.projectId,
+  ]);
 
   const isThreadMissing =
     threadQuery.error instanceof BbHttpError &&
@@ -232,51 +270,55 @@ function PluginThreadChatBody({
         workspaceRootPath={workspaceRootPath}
       />
     );
-    return layout === "contained" ? (
-      <div className="min-h-0 flex-1 overflow-y-auto bg-background px-2 pb-3 pt-3">
-        {transcript}
-      </div>
-    ) : (
-      <div className="bg-background px-2 pb-3 pt-3">{transcript}</div>
+    return (
+      <ThreadProviderContext.Provider value={threadProviderContextValue}>
+        {layout === "contained" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto bg-background px-2 pb-3 pt-3">
+            {transcript}
+          </div>
+        ) : (
+          <div className="bg-background px-2 pb-3 pt-3">{transcript}</div>
+        )}
+      </ThreadProviderContext.Provider>
     );
   }
 
   return (
-    <EmbeddedThreadChat
-      variant="compact"
-      layout={layout}
-      measure={variant === "full" ? "page" : "panel"}
-      surfaceTone={variant === "compact" ? "sidebar" : "background"}
-      threadId={threadId}
-      projectId={thread.projectId}
-      providerId={thread.providerId}
-      promptContextEnvironmentId={thread.environmentId}
-      resolveMentionLink={resolveMentionLink}
-      leadingContent={leadingContent}
-      consumerMessageActions={consumerMessageActions}
-      includePluginMessageActions={false}
-      onOpenLink={onOpenLink}
-      onOpenLocalFileLink={onOpenLocalFileLink}
-      workspaceRootPath={workspaceRootPath}
-      composer={{
-        draftScope: {
-          kind: "thread",
-          projectId: thread.projectId,
-          threadId,
-        },
-        executionDefaultsThreadId: threadId,
-        executionResetKey: threadId,
-        executionEnvironmentId: thread.environmentId ?? undefined,
-        // "inherit" pins sends to the thread's own resolved defaults, never
-        // widened by a plugin surface. "editable" is the opt-in that hands
-        // the picker to the user for this thread alone.
-        permissionPolicy:
-          permissionPolicy === "editable" ? "editable" : "snapshot",
-        environmentSummary,
-        pluginComposerBottomScope: { kind: "thread", threadId },
-        composerIdentity: `plugin-thread-chat:${threadId}`,
-        focusRequestKey: focusRequest,
-      }}
-    />
+    <ThreadProviderContext.Provider value={threadProviderContextValue}>
+      <EmbeddedThreadChat
+        variant="compact"
+        layout={layout}
+        measure={variant === "full" ? "page" : "panel"}
+        surfaceTone={variant === "compact" ? "sidebar" : "background"}
+        threadId={threadId}
+        projectId={thread.projectId}
+        providerId={thread.providerId}
+        promptContextEnvironmentId={thread.environmentId}
+        resolveMentionLink={resolveMentionLink}
+        leadingContent={leadingContent}
+        consumerMessageActions={consumerMessageActions}
+        includePluginMessageActions={false}
+        onOpenLink={onOpenLink}
+        onOpenLocalFileLink={onOpenLocalFileLink}
+        workspaceRootPath={workspaceRootPath}
+        composer={{
+          draftScope: {
+            kind: "thread",
+            projectId: thread.projectId,
+            threadId,
+          },
+          executionDefaultsThreadId: threadId,
+          executionResetKey: threadId,
+          executionEnvironmentId: thread.environmentId ?? undefined,
+          executionEnvironmentHostId: environment?.hostId,
+          permissionPolicy:
+            permissionPolicy === "editable" ? "editable" : "snapshot",
+          environmentSummary,
+          pluginComposerBottomScope: { kind: "thread", threadId },
+          composerIdentity: `plugin-thread-chat:${threadId}`,
+          focusRequestKey: focusRequest,
+        }}
+      />
+    </ThreadProviderContext.Provider>
   );
 }

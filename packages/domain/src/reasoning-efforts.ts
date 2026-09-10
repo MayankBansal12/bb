@@ -23,13 +23,14 @@ export const XHIGH_REASONING_EFFORT: ModelReasoningEffort = {
 };
 export const ULTRACODE_REASONING_EFFORT: ModelReasoningEffort = {
   reasoningEffort: "ultracode",
-  description: "Extra high reasoning effort plus multi-agent workflow orchestration",
+  description:
+    "Extra high reasoning effort plus multi-agent workflow orchestration",
 };
 export const MAX_REASONING_EFFORT: ModelReasoningEffort = {
   reasoningEffort: "max",
   description: "Maximum reasoning effort",
 };
-export const ULTRA_REASONING_EFFORT: ModelReasoningEffort = {
+const ULTRA_REASONING_EFFORT: ModelReasoningEffort = {
   reasoningEffort: "ultra",
   description: "Maximum reasoning with automatic task delegation",
 };
@@ -46,19 +47,8 @@ const REASONING_EFFORT_BY_LEVEL: Record<ReasoningLevel, ModelReasoningEffort> =
     ultra: ULTRA_REASONING_EFFORT,
   };
 
-// Expands coarse reasoning levels into the descriptive picker entries above.
-// Returns fresh objects so callers can hand the result out in mutable API
-// responses without aliasing the module-level constants.
 export function reasoningEffortsForLevels(
   levels: readonly ReasoningLevel[],
 ): ModelReasoningEffort[] {
   return levels.map((level) => ({ ...REASONING_EFFORT_BY_LEVEL[level] }));
-}
-
-// Defensive copy so callers can hand out reasoning efforts in mutable API
-// responses without aliasing the module-level constants above.
-export function cloneReasoningEfforts(
-  efforts: readonly ModelReasoningEffort[],
-): ModelReasoningEffort[] {
-  return efforts.map((effort) => ({ ...effort }));
 }

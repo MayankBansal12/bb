@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useMediaQuery } from "@bb/shared-ui/hooks/use-media-query";
+import { usePrefersReducedMotion } from "@bb/shared-ui/hooks/use-media-query";
 import { cn } from "@bb/shared-ui/lib/utils";
 
 interface WaveformVisualizerProps {
@@ -24,9 +24,7 @@ export function WaveformVisualizer({
 }: WaveformVisualizerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const barsRef = useRef<number[]>([]);
-  const prefersReducedMotion = useMediaQuery(
-    "(prefers-reduced-motion: reduce)",
-  );
+  const prefersReducedMotion = usePrefersReducedMotion();
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -34,8 +32,6 @@ export function WaveformVisualizer({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Everything below is derived from the canvas size and only changes in
-    // measure() (mount + resize), so it's computed there instead of per frame.
     let color = "currentColor";
     let cssWidth = 0;
     let cssHeight = 0;
@@ -51,7 +47,6 @@ export function WaveformVisualizer({
       cssHeight = rect.height;
       canvas.width = Math.max(1, Math.round(cssWidth * dpr));
       canvas.height = Math.max(1, Math.round(cssHeight * dpr));
-      // Resizing the canvas resets all 2D context state, so re-apply it here.
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       color = getComputedStyle(canvas).color || color;
       ctx.strokeStyle = color;
@@ -120,7 +115,6 @@ export function WaveformVisualizer({
 
     const audioCtx = new AudioContext();
     void audioCtx.resume();
-    // Some mobile browsers feed silence to WebAudio when MediaRecorder owns the original track.
     const analysisTrack = audioTrack.clone();
     const source = audioCtx.createMediaStreamSource(
       new MediaStream([analysisTrack]),
@@ -148,7 +142,6 @@ export function WaveformVisualizer({
         const bars = barsRef.current;
         bars.push(amp);
         if (bars.length > barCount) bars.shift();
-        // Bars only change on sample frames, so only redraw then.
         draw();
       }
       frame++;

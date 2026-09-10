@@ -1,17 +1,60 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { CronExpressionParser } from "cron-parser";
 import { Hono } from "hono";
-import { z } from "zod";
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "../backend-contract.js";
+import { PLUGIN_INTERACTION_MAX_TITLE_LENGTH } from "@bb/domain/plugin-interaction-limits";
+import {
+  adoptHttpRouteResponse,
+  AGENT_TOOL_NAME_PATTERN,
+  agentToolIconRefusalMessage,
+  aiServiceAlreadyRegisteredMessage,
+  pluginHookAlreadyRegisteredMessage,
+  assertAiServiceRegistrable,
+  assertNoRecursiveJsonSchemaReferences,
+  BACKGROUND_NAME_PATTERN,
+  CLI_COMMAND_NAME_PATTERN,
+  enforcePluginCliOutputLimit,
+  isStandardSchema,
+  isZodSchemaLike,
+  storePluginHook,
+  validatePluginEnvironmentProviderDeclaration,
+  type NormalizedPluginEnvironmentProvider,
+  KV_VALUE_MAX_BYTES,
+  MENTION_PROVIDER_ID_PATTERN,
+  normalizeMentionProviderTriggers,
+  parsePluginAgentToolPresentation,
+  pluginCliCollisionWarning,
+  PLUGIN_AGENT_DYNAMIC_INSTRUCTIONS_MAX_CHARS,
+  PLUGIN_AGENT_SELECTION_MAX_IDS,
+  PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS,
+  PLUGIN_AGENT_TOOL_PARAMETERS_MAX_BYTES,
+  PLUGIN_HTTP_METHODS,
+  providerAlreadyRegisteredMessage,
+  providerIconRefusalMessage,
+  providerWithoutBridgeMessage,
+  readRpcMethodContract,
+  registerSettingDescriptors,
+  rejectStaleAgentToolFields,
+  RESERVED_AGENT_TOOL_NAMES,
+  RPC_METHOD_PATTERN,
+  summarizeParseIssues,
+  undeclaredIconProblem,
+  validatePluginAiServiceDeclaration,
+  validatePluginProviderDeclaration,
+  validatePluginProviderEnvEntries,
+  validateSettingsUpdate,
+  zodSchemaToJsonSchema,
+  type NormalizedPluginProviderDeclaration,
+} from "../internal/host-policy.js";
 import type {
   BbPluginApi,
   PluginAgentConfiguration,
   PluginAgentConfigurationContext,
   PluginAgentToolContext,
-  PluginAgentToolExperimentalStatusLabels,
+  PluginAgentToolPresentation,
   PluginAgentToolResult,
   PluginAgents,
   PluginBackground,
@@ -19,8 +62,11 @@ import type {
   PluginCliCommandInfo,
   PluginCliContext,
   PluginCliExecutionResult,
-  PluginCliOutputLimitError,
   PluginCliResult,
+  PluginHookHandler,
+  PluginEnvironments,
+  PluginHookName,
+  PluginHooks,
   PluginEvents,
   PluginHttp,
   PluginHttpAuthMode,
@@ -34,10 +80,20 @@ import type {
   PluginMentionItem,
   PluginMentionSearchContext,
   PluginMentionTrigger,
+  PluginAiServiceDeclaration,
+  PluginAiServices,
+  PluginProviderDeclaration,
+  ExperimentalPluginProviderEnvContext,
+  ExperimentalPluginProviderEnvEntry,
+  ExperimentalPluginProviderEnvHealth,
+  ExperimentalPluginProviderEnvHealthContext,
+  ExperimentalPluginWebSocket,
+  ExperimentalPluginWebSocketHandler,
+  ExperimentalPluginWebSocketHandlers,
+  PluginProviders,
   PluginRealtime,
   PluginRpc,
   PluginServerApi,
-  PluginSettingDescriptor,
   PluginSettingDescriptors,
   PluginSettingValue,
   PluginSettings,
@@ -49,18 +105,23 @@ import type {
   PluginThreadEventPayloads,
   PluginUi,
   PluginRpcError,
-  PluginRpcMethodContract,
   PluginRpcValidationIssue,
   StandardSchemaV1,
   StandardSchemaV1Issue,
   StandardSchemaV1Result,
   JsonValue,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import {
   createFakeSdk,
   type FakeSdkHarness,
   type FakeSdkOverrides,
 } from "./fake-sdk.js";
+
+const LEGACY_UNKNOWN_MIGRATION_HASH = "legacy-unknown";
+
+function migrationStatementHash(statement: string): string {
+  return createHash("sha256").update(statement).digest("hex");
+}
 
 /**
  * `createFakePluginHost` — an in-process stand-in for the BB server's plugin
@@ -100,138 +161,6 @@ export class PluginContextStaleError extends Error {
   }
 }
 
-/** JSON values ≤256KB; larger writes are rejected with a clear error. */
-const KV_VALUE_MAX_BYTES = 256 * 1024;
-/** Mirrors the server's pending-interaction title schema. */
-const PLUGIN_INTERACTION_MAX_TITLE_LENGTH = 160;
-
-const PLUGIN_HTTP_METHODS = new Set([
-  "GET",
-  "POST",
-  "PUT",
-  "PATCH",
-  "DELETE",
-  "HEAD",
-  "OPTIONS",
-]);
-
-const RPC_METHOD_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const BACKGROUND_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const CLI_COMMAND_NAME_PATTERN = /^[a-z0-9-]+$/;
-const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS = 4096;
-/** Status labels ride on every tool-call event and share one timeline row. */
-const PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS = 80;
-const PLUGIN_AGENT_SELECTION_MAX_IDS = 256;
-const PLUGIN_AGENT_DYNAMIC_INSTRUCTIONS_MAX_CHARS = 4096;
-
-function enforcePluginCliOutputLimit(
-  result: Omit<PluginCliExecutionResult, "error">,
-  jsonOutput: boolean,
-): PluginCliExecutionResult {
-  const stdoutBytes = Buffer.byteLength(result.stdout, "utf8");
-  const stderrBytes = Buffer.byteLength(result.stderr, "utf8");
-  const totalBytes = stdoutBytes + stderrBytes;
-  if (totalBytes <= PLUGIN_CLI_OUTPUT_MAX_BYTES) return result;
-
-  const error: PluginCliOutputLimitError = {
-    code: "plugin_cli_output_too_large",
-    message:
-      `Plugin CLI output is ${totalBytes} bytes (${stdoutBytes} stdout + ${stderrBytes} stderr), ` +
-      `exceeding the ${PLUGIN_CLI_OUTPUT_MAX_BYTES}-byte limit. Narrow the query, request a smaller page, or use a file/streaming command.`,
-    maxBytes: PLUGIN_CLI_OUTPUT_MAX_BYTES,
-    stdoutBytes,
-    stderrBytes,
-    totalBytes,
-  };
-  return jsonOutput
-    ? {
-        exitCode: 1,
-        stdout: JSON.stringify({ error }),
-        stderr: "",
-        error,
-      }
-    : { exitCode: 1, stdout: "", stderr: error.message, error };
-}
-const MENTION_PROVIDER_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const PLUGIN_MENTION_TRIGGER_VALUES = [
-  "@",
-  "#",
-  "$",
-  "!",
-  "~",
-] as const satisfies readonly PluginMentionTrigger[];
-const DEFAULT_PLUGIN_MENTION_TRIGGERS = [
-  "@",
-] as const satisfies readonly PluginMentionTrigger[];
-const SETTING_KEY_PATTERN = /^[a-zA-Z0-9_-]+$/;
-
-function isPluginMentionTrigger(value: unknown): value is PluginMentionTrigger {
-  return (
-    typeof value === "string" &&
-    (PLUGIN_MENTION_TRIGGER_VALUES as readonly string[]).includes(value)
-  );
-}
-
-function normalizeMentionProviderTriggers(
-  providerId: string,
-  triggers: unknown,
-): readonly PluginMentionTrigger[] {
-  if (triggers === undefined) {
-    return DEFAULT_PLUGIN_MENTION_TRIGGERS;
-  }
-  if (!Array.isArray(triggers)) {
-    throw new Error(
-      `mention provider "${providerId}" triggers must be an array`,
-    );
-  }
-  if (triggers.length === 0) {
-    throw new Error(
-      `mention provider "${providerId}" triggers must include at least one trigger`,
-    );
-  }
-  const seen = new Set<PluginMentionTrigger>();
-  const normalized: PluginMentionTrigger[] = [];
-  for (const trigger of triggers) {
-    if (!isPluginMentionTrigger(trigger)) {
-      throw new Error(
-        `mention provider "${providerId}" trigger ${JSON.stringify(trigger)} is invalid — use one of ${PLUGIN_MENTION_TRIGGER_VALUES.join(" ")}`,
-      );
-    }
-    if (seen.has(trigger)) {
-      throw new Error(
-        `mention provider "${providerId}" trigger ${JSON.stringify(trigger)} is duplicated`,
-      );
-    }
-    seen.add(trigger);
-    normalized.push(trigger);
-  }
-  return normalized;
-}
-
-/**
- * Copies of the server's hand-maintained reserved-name lists
- * (RESERVED_BB_CLI_COMMANDS / RESERVED_AGENT_TOOL_NAMES in
- * apps/server/src/services/plugins/plugin-api.ts) so registrations fail here
- * the same way they fail there. Update alongside the server lists.
- */
-const RESERVED_BB_CLI_COMMANDS: readonly string[] = [
-  "environment",
-  "guide",
-  "help",
-  "manager",
-  "plugin",
-  "project",
-  "provider",
-  "status",
-  "theme",
-  "thread",
-  "ui",
-];
-const RESERVED_AGENT_TOOL_NAMES: readonly string[] = [
-  "update_environment_directory",
-];
-
 export type FakeLogLevel = "debug" | "info" | "warn" | "error";
 
 export interface FakeLogEntry {
@@ -244,6 +173,24 @@ export interface FakeHttpRouteRecord {
   path: string;
   auth: PluginHttpAuthMode;
   handler: PluginHttpHandler;
+}
+
+export interface ExperimentalFakeWebSocketRouteRecord {
+  path: string;
+  auth: PluginHttpAuthMode;
+  handler: ExperimentalPluginWebSocketHandler;
+}
+
+export interface ExperimentalFakeWebSocketSession {
+  readonly sent: readonly (string | Uint8Array)[];
+  readonly closeCalls: readonly {
+    code: number | null;
+    reason: string | null;
+  }[];
+  readonly readyState: number;
+  receive(data: string | Uint8Array): Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+  error(error: Error): Promise<void>;
 }
 
 export interface FakeScheduleRecord {
@@ -270,8 +217,14 @@ export interface FakeCliRecord {
 export interface FakeAgentToolRecord {
   name: string;
   description: string;
-  experimentalStatusLabels: PluginAgentToolExperimentalStatusLabels | null;
   instructions: string | null;
+  /**
+   * The plugin's declared row presentation, null when it declared none.
+   * Parsed by the shared `parsePluginAgentToolPresentation`, so the record
+   * holds exactly what the production host stores and a presentation bb
+   * rejects is rejected here with the same message.
+   */
+  presentation: PluginAgentToolPresentation | null;
   /** JSON-schema object the host would send providers. */
   inputSchema: unknown;
   parse(
@@ -282,7 +235,6 @@ export interface FakeAgentToolRecord {
     ctx: PluginAgentToolContext,
   ): PluginAgentToolResult | Promise<PluginAgentToolResult>;
 }
-
 
 export interface FakeMentionProviderRecord {
   id: string;
@@ -302,10 +254,18 @@ export interface FakeRealtimeSignal {
   payload: unknown;
 }
 
+export interface ExperimentalFakeHostRpcCall {
+  method: string;
+  input: unknown;
+  hostId: string;
+  signal?: AbortSignal;
+}
+
 /** Everything the plugin registered, exposed raw for assertions. */
 export interface FakePluginRegistrations {
   settingsDescriptors: PluginSettingDescriptors;
   httpRoutes: FakeHttpRouteRecord[];
+  websocketRoutes: ExperimentalFakeWebSocketRouteRecord[];
   rpcMethods: string[];
   services: FakeServiceRecord[];
   schedules: FakeScheduleRecord[];
@@ -320,7 +280,38 @@ export interface FakePluginRegistrations {
     | ((ctx: { threadId: string; projectId: string }) => string | null)
     | null;
   threadEventHandlers: Record<PluginThreadEventName, number>;
+  /** The handler registered per hook by `bb.experimental_hooks.on`. */
+  hooks: {
+    [K in PluginHookName]: PluginHookHandler<K> | null;
+  };
+  environmentProviders: ReadonlyMap<
+    string,
+    NormalizedPluginEnvironmentProvider
+  >;
   mentionProviders: FakeMentionProviderRecord[];
+  /** Live provider registrations from `bb.providers.register`
+   * (normalized declarations, registration order; dispose removes). */
+  providerRegistrations: NormalizedPluginProviderDeclaration[];
+  providerEnvResolvers: ReadonlyMap<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvContext,
+    ) =>
+      | Promise<readonly ExperimentalPluginProviderEnvEntry[]>
+      | readonly ExperimentalPluginProviderEnvEntry[]
+  >;
+  providerEnvHealthResolvers: ReadonlyMap<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvHealthContext,
+    ) =>
+      | ExperimentalPluginProviderEnvHealth
+      | null
+      | Promise<ExperimentalPluginProviderEnvHealth | null>
+  >;
+  /** Live AI-service registrations from `experimental_aiServices.register`
+   * (normalized declarations, registration order; dispose removes). */
+  aiServiceRegistrations: PluginAiServiceDeclaration[];
 }
 
 /** Read-only state for assertions after a plugin registers or handles work. */
@@ -332,6 +323,12 @@ export interface FakePluginInspectionState {
   readonly realtimeSignals: FakeRealtimeSignal[];
   /** Every `bb.status.needsConfiguration` message, in order. */
   readonly needsConfigurationMessages: string[];
+  /**
+   * How many times the plugin called
+   * `bb.experimental_hooks.recheck()` — the wake it asks core for when a
+   * condition its own waits depend on has changed.
+   */
+  readonly recheckCount: number;
   /** Recorded `bb.sdk` calls + stub control. */
   readonly sdk: FakeSdkHarness;
   readonly registrations: FakePluginRegistrations;
@@ -339,6 +336,8 @@ export interface FakePluginInspectionState {
     hostId: string;
     ports: number[];
   }>;
+  /** Calls made through bb.hosts.experimental_client, after input validation. */
+  readonly experimental_hostRpcCalls: readonly ExperimentalFakeHostRpcCall[];
   readonly pendingInteractions: readonly (PluginInteractionRequest & {
     id: string;
   })[];
@@ -346,6 +345,14 @@ export interface FakePluginInspectionState {
 
 /** Deterministic inputs that stand in for behavior normally driven by BB. */
 export interface FakePluginBehaviorDrivers {
+  /** Deliver an unexpected host-worker exit to every registered client. */
+  experimental_emitHostWorkerExit(hostId: string): Promise<void>;
+  /** Deliver a host signal through its registered payload schema. */
+  experimental_emitHostSignal(
+    hostId: string,
+    signal: string,
+    payload: unknown,
+  ): Promise<void>;
   submitInteraction(id: string, value: JsonValue): void;
   cancelInteraction(id: string): void;
   /**
@@ -381,6 +388,11 @@ export interface FakePluginBehaviorDrivers {
     path: string,
     init?: RequestInit,
   ): Promise<Response>;
+  /** Open and drive an exact-match `bb.http.experimental_websocket` route. */
+  experimental_openWebSocket(
+    path: string,
+    init?: RequestInit,
+  ): Promise<ExperimentalFakeWebSocketSession>;
   /**
    * Start a registered background service once, deterministically. `done`
    * settles when `start` returns; abort `controller` to signal shutdown.
@@ -422,6 +434,14 @@ export interface FakePluginBehaviorDrivers {
     skills: string[];
     instructions: string | null;
   }>;
+  resolveProviderEnv(
+    providerId: string,
+    context: ExperimentalPluginProviderEnvContext,
+  ): Promise<ExperimentalPluginProviderEnvEntry[]>;
+  resolveProviderEnvHealth(
+    providerId: string,
+    context: ExperimentalPluginProviderEnvHealthContext,
+  ): Promise<ExperimentalPluginProviderEnvHealth | null>;
 }
 
 /** Reload/shutdown controls, kept separate from behavior and inspection. */
@@ -461,10 +481,19 @@ export interface CreateFakePluginHostOptions {
   /** Defaults to "test-plugin". */
   pluginId?: string;
   /**
+   * Value served by `bb.server.experimental_appUrl`. Defaults to `null`.
+   */
+  appUrl?: string | null;
+  /**
    * Value served by `bb.server.loopbackBaseUrl` (always bound here, like
    * `bb.sdk`). Defaults to "http://127.0.0.1:38886".
    */
   loopbackBaseUrl?: string;
+  /**
+   * Value served by `bb.server.experimental_dataDir`. Defaults to
+   * "/tmp/bb-fake-data-dir".
+   */
+  dataDir?: string;
   /**
    * Pre-seeded stored settings values (as if saved before this load) —
    * including secret ones, which the fake keeps in memory instead of
@@ -478,92 +507,33 @@ export interface CreateFakePluginHostOptions {
   agentSkillIds?: readonly string[];
   /** Read-only identities returned by bb.hosts.ensureSharedPortTunnel. */
   sharedPortTunnelIdentities?: Record<string, PluginSharedPortTunnelIdentity>;
+  /**
+   * Whether the plugin's manifest declares a `bb.host` entry. Production
+   * refuses `bb.providers.register` (the provider would have no bridge to
+   * run on) and `experimental_aiServices.register` (the service would have
+   * nothing to run on) without one; the fake applies the same rules.
+   * Defaults to true.
+   */
+  experimental_hostEntry?: boolean;
+  /**
+   * The icon names the plugin's manifest declares under
+   * `bb.branding.experimental_icons`. Production refuses a provider `icon`
+   * or a tool `presentation.icon.glyph` that is a namespaced glyph
+   * (`"<pluginId>/<name>"`) naming another plugin or a name not declared
+   * there; the fake applies the same rule against this list. Defaults to
+   * none declared, so every namespaced glyph is refused until the test
+   * names the icons the manifest would.
+   */
+  experimental_declaredIconNames?: readonly string[];
+  /** Deterministic stand-in for the targeted daemon host entry. */
+  experimental_callHostRpc?: (
+    call: ExperimentalFakeHostRpcCall,
+  ) => unknown | Promise<unknown>;
 }
 
 export interface FakePluginHost {
   bb: BbPluginApi;
   harness: FakePluginHarness;
-}
-
-// ---------------------------------------------------------------------------
-// Settings descriptor validation — ported from the server's
-// plugin-settings.ts so plugins trip over the same errors here.
-// ---------------------------------------------------------------------------
-
-const settingsBaseFields = {
-  label: z.string().min(1),
-  description: z.string().min(1).optional(),
-};
-
-const settingDescriptorSchema = z.discriminatedUnion("type", [
-  z
-    .object({
-      type: z.literal("string"),
-      ...settingsBaseFields,
-      secret: z.literal(true).optional(),
-      default: z.string().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("boolean"),
-      ...settingsBaseFields,
-      default: z.boolean().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("select"),
-      ...settingsBaseFields,
-      options: z.array(z.string().min(1)).min(1),
-      default: z.string().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("project"),
-      ...settingsBaseFields,
-      default: z.string().optional(),
-    })
-    .strict(),
-]);
-
-function registerSettingDescriptors(
-  target: PluginSettingDescriptors,
-  added: Record<string, unknown>,
-): PluginSettingDescriptors {
-  const validated: PluginSettingDescriptors = {};
-  for (const [key, raw] of Object.entries(added)) {
-    if (!SETTING_KEY_PATTERN.test(key)) {
-      throw new Error(
-        `invalid setting key "${key}" — use letters, digits, "-" and "_"`,
-      );
-    }
-    if (key in target) {
-      throw new Error(`setting "${key}" is already defined`);
-    }
-    const parsed = settingDescriptorSchema.safeParse(raw);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0];
-      const path = issue?.path.join(".") ?? "";
-      throw new Error(
-        `invalid descriptor for setting "${key}"${path ? ` (${path})` : ""}: ${issue?.message ?? "unknown error"}`,
-      );
-    }
-    const descriptor = parsed.data;
-    if (
-      descriptor.type === "select" &&
-      descriptor.default !== undefined &&
-      !descriptor.options.includes(descriptor.default)
-    ) {
-      throw new Error(
-        `default for setting "${key}" must be one of its options`,
-      );
-    }
-    validated[key] = descriptor;
-  }
-  Object.assign(target, validated);
-  return validated;
 }
 
 /** Effective typed values: stored value when valid, else the default, else undefined. */
@@ -574,7 +544,26 @@ function readSettingsValues(
   const values: Record<string, PluginSettingValue | undefined> = {};
   for (const [key, descriptor] of Object.entries(descriptors)) {
     let value = stored.get(key);
-    const expected = descriptor.type === "boolean" ? "boolean" : "string";
+    if (descriptor.type === "number" && typeof value === "string") {
+      const legacyNumber = Number(value.trim());
+      value =
+        value.trim().length > 0 && Number.isFinite(legacyNumber)
+          ? legacyNumber
+          : undefined;
+    }
+    if (
+      descriptor.type === "number" &&
+      typeof value === "number" &&
+      !Number.isFinite(value)
+    ) {
+      value = undefined;
+    }
+    const expected =
+      descriptor.type === "boolean"
+        ? "boolean"
+        : descriptor.type === "number"
+          ? "number"
+          : "string";
     if (typeof value !== expected) value = undefined;
     if (
       descriptor.type === "select" &&
@@ -588,68 +577,10 @@ function readSettingsValues(
   return values;
 }
 
-function validateSettingsUpdate(
-  descriptors: PluginSettingDescriptors,
-  values: Record<string, unknown>,
-): string[] {
-  const errors: string[] = [];
-  for (const [key, value] of Object.entries(values)) {
-    const descriptor: PluginSettingDescriptor | undefined = descriptors[key];
-    if (!descriptor) {
-      errors.push(`unknown setting "${key}"`);
-      continue;
-    }
-    if (value === null) continue; // unset
-    if (descriptor.type === "boolean") {
-      if (typeof value !== "boolean") {
-        errors.push(`setting "${key}" expects a boolean`);
-      }
-      continue;
-    }
-    if (typeof value !== "string") {
-      errors.push(`setting "${key}" expects a string`);
-      continue;
-    }
-    if (descriptor.type === "select" && !descriptor.options.includes(value)) {
-      errors.push(
-        `setting "${key}" must be one of: ${descriptor.options.join(", ")}`,
-      );
-    }
-  }
-  return errors;
-}
-
 // ---------------------------------------------------------------------------
 
 function isNeedsConfigurationError(error: unknown): error is Error {
   return error instanceof Error && error.name === "NeedsConfigurationError";
-}
-
-/** Duck-typed zod detection, same as the host (plugins may carry their own zod). */
-function isZodSchemaLike(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { safeParse?: unknown }).safeParse === "function"
-  );
-}
-
-function summarizeParseIssues(error: unknown): string {
-  const issues = (
-    error as { issues?: Array<{ path?: PropertyKey[]; message?: string }> }
-  )?.issues;
-  if (Array.isArray(issues) && issues.length > 0) {
-    return issues
-      .map((issue) => {
-        const path =
-          Array.isArray(issue.path) && issue.path.length > 0
-            ? issue.path.join(".")
-            : "(input)";
-        return `${path}: ${issue.message ?? "invalid"}`;
-      })
-      .join("; ");
-  }
-  return error instanceof Error ? error.message : String(error);
 }
 
 function errorMessage(error: unknown): string {
@@ -676,40 +607,17 @@ interface FakeRpcRecord {
   handler: (input: never) => unknown;
 }
 
-function isStandardSchema(value: unknown): value is StandardSchemaV1 {
-  if (typeof value !== "object" || value === null) return false;
-  const standard = Reflect.get(value, "~standard");
-  return (
-    typeof standard === "object" &&
-    standard !== null &&
-    Reflect.get(standard, "version") === 1 &&
-    typeof Reflect.get(standard, "vendor") === "string" &&
-    typeof Reflect.get(standard, "validate") === "function"
-  );
-}
+type FakeHostWorkerExitSubscription = (event: {
+  readonly hostId: string;
+}) => void | Promise<void>;
 
-function readRpcMethodContract(
-  method: string,
-  value: unknown,
-): PluginRpcMethodContract {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      `rpc method "${method}" contract must provide input and output Standard Schemas`,
-    );
-  }
-  const input = Reflect.get(value, "input");
-  const output = Reflect.get(value, "output");
-  if (!isStandardSchema(input)) {
-    throw new Error(
-      `rpc method "${method}" input must be a Standard Schema v1 validator`,
-    );
-  }
-  if (!isStandardSchema(output)) {
-    throw new Error(
-      `rpc method "${method}" output must be a Standard Schema v1 validator`,
-    );
-  }
-  return { input, output };
+interface FakeHostSignalSubscription {
+  signal: string;
+  payloadSchema: StandardSchemaV1;
+  handler: (event: {
+    hostId: string;
+    payload: unknown;
+  }) => void | Promise<void>;
 }
 
 function normalizeRpcIssues(
@@ -827,8 +735,6 @@ function normalizeRpcJsonResult(value: unknown): JsonValue {
   return visit(value, "$result");
 }
 
-const AGENT_TOOL_PARAMETERS_MAX_BYTES = 128 * 1024;
-
 function normalizeAgentToolSelections(args: {
   knownIds: ReadonlySet<string>;
   pluginId: string;
@@ -923,9 +829,12 @@ function normalizeAgentToolParameters(args: {
       `configure() output.tools[${index}].parameters is not JSON-serializable`,
     );
   }
-  if (Buffer.byteLength(serialized, "utf8") > AGENT_TOOL_PARAMETERS_MAX_BYTES) {
+  if (
+    Buffer.byteLength(serialized, "utf8") >
+    PLUGIN_AGENT_TOOL_PARAMETERS_MAX_BYTES
+  ) {
     throw new Error(
-      `configure() output.tools[${index}].parameters exceeds the ${AGENT_TOOL_PARAMETERS_MAX_BYTES}-byte limit`,
+      `configure() output.tools[${index}].parameters exceeds the ${PLUGIN_AGENT_TOOL_PARAMETERS_MAX_BYTES}-byte limit`,
     );
   }
   const parameters = JSON.parse(serialized) as Record<string, unknown>;
@@ -934,6 +843,10 @@ function normalizeAgentToolParameters(args: {
       `configure() output.tools[${index}].parameters must have root type "object"`,
     );
   }
+  assertNoRecursiveJsonSchemaReferences(
+    parameters,
+    `configure() output.tools[${index}].parameters`,
+  );
   return parameters;
 }
 
@@ -1067,6 +980,9 @@ function createFakePluginHostInternal(
       ),
     } satisfies FakePluginPersistentState);
   const pluginId = options.pluginId ?? "test-plugin";
+  const declaredIconNames = new Set(
+    options.experimental_declaredIconNames ?? [],
+  );
   const agentSkillIds = [...(options.agentSkillIds ?? [])];
   if (new Set(agentSkillIds).size !== agentSkillIds.length) {
     throw new Error("agentSkillIds must not contain duplicates");
@@ -1129,13 +1045,14 @@ function createFakePluginHostInternal(
   const storageRoot = persistentState.storageRoot;
 
   // One shared temp-file handle: every database() call sees the same data,
-  // like the host's handles over one on-disk file.
+  // like the host's handles over one on-disk file. Like the host, a handle
+  // the plugin closed itself is replaced on the next call.
   let databaseHandle: Database.Database | undefined;
   const storage: PluginStorage = {
     kv,
     database() {
       assertLive();
-      if (!databaseHandle) {
+      if (!databaseHandle?.open) {
         databaseHandle = new Database(join(storageRoot, "data.db"));
         databaseHandle.pragma("busy_timeout = 5000");
       }
@@ -1144,23 +1061,56 @@ function createFakePluginHostInternal(
     migrate(database, statements) {
       assertLive();
       database.exec(
-        "CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, statement_hash TEXT)",
       );
-      const applied = new Set(
-        (
-          database.prepare("SELECT id FROM _bb_migrations").all() as Array<{
-            id: number;
-          }>
-        ).map((row) => row.id),
+      const migrationColumns = database
+        .prepare<[], { name: string }>("PRAGMA table_info(_bb_migrations)")
+        .all();
+      if (
+        !migrationColumns.some((column) => column.name === "statement_hash")
+      ) {
+        database.exec(
+          "ALTER TABLE _bb_migrations ADD COLUMN statement_hash TEXT",
+        );
+      }
+      const rows = database
+        .prepare<[], { id: number; statement_hash: string | null }>(
+          "SELECT id, statement_hash FROM _bb_migrations ORDER BY id",
+        )
+        .all();
+      const applied = new Map<number, string | null>();
+      for (const row of rows) applied.set(row.id, row.statement_hash);
+      const statementHashes = statements.map(migrationStatementHash);
+      statementHashes.forEach((statementHash, index) => {
+        const recordedHash = applied.get(index);
+        if (
+          recordedHash !== undefined &&
+          recordedHash !== null &&
+          recordedHash !== statementHash
+        ) {
+          throw new Error(
+            `migration ${index} does not match the recorded statement; append a new migration instead of changing or reusing an index`,
+          );
+        }
+      });
+      const adopt = database.prepare(
+        "UPDATE _bb_migrations SET statement_hash = ? WHERE id = ? AND statement_hash IS NULL",
       );
       const record = database.prepare(
-        "INSERT INTO _bb_migrations (id, applied_at) VALUES (?, ?)",
+        "INSERT INTO _bb_migrations (id, applied_at, statement_hash) VALUES (?, ?, ?)",
       );
       database.transaction(() => {
+        for (const row of rows) {
+          if (row.statement_hash !== null) continue;
+          adopt.run(
+            statementHashes[row.id] ?? LEGACY_UNKNOWN_MIGRATION_HASH,
+            row.id,
+          );
+        }
         statements.forEach((statement, index) => {
           if (applied.has(index)) return;
           database.exec(statement);
-          record.run(index, Date.now());
+          record.run(index, Date.now(), statementHashes[index]);
         });
       })();
     },
@@ -1176,10 +1126,44 @@ function createFakePluginHostInternal(
   > = [];
   const storedSettings = persistentState.storedSettings;
 
+  async function setSettingsValues(
+    values: Record<string, unknown>,
+  ): Promise<void> {
+    const errors = validateSettingsUpdate(settingsDescriptors, values);
+    if (errors.length > 0) {
+      throw new Error(errors.join("; "));
+    }
+    const prev = readSettingsValues(settingsDescriptors, storedSettings);
+    for (const [key, value] of Object.entries(values)) {
+      if (value === null) storedSettings.delete(key);
+      else if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        storedSettings.set(key, value);
+      } else {
+        throw new Error(`setting "${key}" has an unsupported value`);
+      }
+    }
+    const next = readSettingsValues(settingsDescriptors, storedSettings);
+    if (JSON.stringify(next) === JSON.stringify(prev)) return;
+    for (const listener of settingsListeners) {
+      try {
+        listener(next, prev);
+      } catch (error) {
+        emitLog(
+          "warn",
+          `settings onChange listener failed: ${errorMessage(error)}`,
+        );
+      }
+    }
+  }
+
   const settings: PluginSettings = {
     define(descriptors) {
       assertLive();
-      registerSettingDescriptors(
+      const validated = registerSettingDescriptors(
         settingsDescriptors,
         descriptors as Record<string, unknown>,
       );
@@ -1187,10 +1171,20 @@ function createFakePluginHostInternal(
       return {
         async get() {
           assertLive();
-          return readSettingsValues(
-            settingsDescriptors,
-            storedSettings,
-          ) as Values;
+          return readSettingsValues(validated, storedSettings) as Values;
+        },
+        async experimental_set(values) {
+          assertLive();
+          const rawValues: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(values)) {
+            rawValues[key] = value;
+          }
+          const errors = validateSettingsUpdate(validated, rawValues);
+          if (errors.length > 0) {
+            throw new Error(errors.join("; "));
+          }
+          await setSettingsValues(rawValues);
+          return readSettingsValues(validated, storedSettings) as Values;
         },
         onChange(listener) {
           assertLive();
@@ -1204,6 +1198,10 @@ function createFakePluginHostInternal(
 
   // --- http ---
   const httpRoutes: FakeHttpRouteRecord[] = [];
+  const websocketRoutes: ExperimentalFakeWebSocketRouteRecord[] = [];
+  const websocketSessions = new Set<{
+    closeForReload(): Promise<void>;
+  }>();
   const http: PluginHttp = {
     route(method, path, handler, opts) {
       assertLive();
@@ -1240,6 +1238,29 @@ function createFakePluginHostInternal(
       }
       httpRoutes.push({ method: normalizedMethod, path, auth, handler });
     },
+    experimental_websocket(path, handler, opts) {
+      assertLive();
+      if (typeof path !== "string" || !path.startsWith("/")) {
+        throw new Error(
+          `websocket route path must be a string starting with "/", got ${JSON.stringify(path)}`,
+        );
+      }
+      if (typeof handler !== "function") {
+        throw new Error(
+          `websocket route handler for ${path} must be a function`,
+        );
+      }
+      const auth = opts?.auth ?? "local";
+      if (auth !== "local" && auth !== "token" && auth !== "none") {
+        throw new Error(
+          `invalid auth mode "${String(auth)}" for websocket ${path} — use "local", "token", or "none"`,
+        );
+      }
+      if (websocketRoutes.some((route) => route.path === path)) {
+        throw new Error(`websocket route ${path} is already registered`);
+      }
+      websocketRoutes.push({ path, auth, handler });
+    },
   };
 
   // --- rpc ---
@@ -1274,7 +1295,7 @@ function createFakePluginHostInternal(
       for (const [name, contractValue] of contractEntries) {
         if (!RPC_METHOD_PATTERN.test(name)) {
           throw new Error(
-            `invalid rpc method name "${name}" — use letters, digits, "-" and "_"`,
+            `invalid rpc method name "${name}" — use dot-separated segments with letters, digits, "-" and "_"`,
           );
         }
         const methodContract = readRpcMethodContract(name, contractValue);
@@ -1382,11 +1403,6 @@ function createFakePluginHostInternal(
           `invalid cli command name ${JSON.stringify(name)} — use lowercase letters, digits, and "-"`,
         );
       }
-      if (RESERVED_BB_CLI_COMMANDS.includes(name)) {
-        throw new Error(
-          `cli command name "${name}" is reserved by the bb CLI — pick another name`,
-        );
-      }
       if (
         typeof registration.summary !== "string" ||
         registration.summary.trim().length === 0
@@ -1425,17 +1441,105 @@ function createFakePluginHostInternal(
         commands: validatedCommands,
         run: registration.run.bind(registration),
       };
+      const warning = pluginCliCollisionWarning(pluginId, name);
+      if (warning) emitLog("warn", warning);
     },
   };
 
   // --- agents ---
   const agentTools: FakeAgentToolRecord[] = [];
+  const providerRegistrations: NormalizedPluginProviderDeclaration[] = [];
+  const providerEnvResolvers = new Map<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvContext,
+    ) =>
+      | readonly ExperimentalPluginProviderEnvEntry[]
+      | Promise<readonly ExperimentalPluginProviderEnvEntry[]>
+  >();
+  const providerEnvHealthResolvers = new Map<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvHealthContext,
+    ) =>
+      | ExperimentalPluginProviderEnvHealth
+      | null
+      | Promise<ExperimentalPluginProviderEnvHealth | null>
+  >();
   let agentConfigurationProvider:
     | ((context: PluginAgentConfigurationContext) => PluginAgentConfiguration)
     | null = null;
   let instructionProvider:
     | ((ctx: { threadId: string; projectId: string }) => string | null)
     | null = null;
+  function registerProviderDeclaration(
+    declaration: PluginProviderDeclaration,
+  ): { dispose(): void } {
+    assertLive();
+    // The shared validator: the fake host must accept and reject provider
+    // declarations exactly like production.
+    const normalized = validatePluginProviderDeclaration(declaration);
+    // The same refusals production makes at the register call, in its
+    // order: the icon against the manifest's declared icons, then the
+    // bridge the declaration runs on, then the id.
+    const iconProblem =
+      normalized.icon === undefined
+        ? null
+        : undeclaredIconProblem(pluginId, declaredIconNames, normalized.icon);
+    if (iconProblem !== null) {
+      throw new Error(providerIconRefusalMessage(normalized.id, iconProblem));
+    }
+    if (options.experimental_hostEntry === false) {
+      throw new Error(providerWithoutBridgeMessage(normalized.id));
+    }
+    if (
+      providerRegistrations.some((existing) => existing.id === normalized.id)
+    ) {
+      throw new Error(providerAlreadyRegisteredMessage(normalized.id));
+    }
+    providerRegistrations.push(normalized);
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      const index = providerRegistrations.indexOf(normalized);
+      if (index !== -1) providerRegistrations.splice(index, 1);
+    };
+    disposeHooks.push(dispose);
+    return { dispose };
+  }
+
+  const aiServiceRegistrations: PluginAiServiceDeclaration[] = [];
+  const experimental_aiServices: PluginAiServices = {
+    register(declaration) {
+      assertLive();
+      const normalized = validatePluginAiServiceDeclaration(declaration);
+      // The same refusals production makes at the register call. The fake
+      // host builds no artifact; the declared entry stands in for it.
+      assertAiServiceRegistrable({
+        id: normalized.id,
+        hostArtifact:
+          options.experimental_hostEntry === false ? null : "declared",
+        hostArtifactProblem: null,
+      });
+      if (
+        aiServiceRegistrations.some((existing) => existing.id === normalized.id)
+      ) {
+        throw new Error(aiServiceAlreadyRegisteredMessage(normalized.id));
+      }
+      aiServiceRegistrations.push(normalized);
+      let disposed = false;
+      const dispose = (): void => {
+        if (disposed) return;
+        disposed = true;
+        const index = aiServiceRegistrations.indexOf(normalized);
+        if (index !== -1) aiServiceRegistrations.splice(index, 1);
+      };
+      disposeHooks.push(dispose);
+      return { dispose };
+    },
+  };
+
   const agents: PluginAgents = {
     configure(provider) {
       assertLive();
@@ -1465,7 +1569,7 @@ function createFakePluginHostInternal(
       name: string;
       description: string;
       instructions?: string;
-      experimental_statusLabels?: PluginAgentToolExperimentalStatusLabels;
+      presentation?: PluginAgentToolPresentation;
       parameters: unknown;
       execute(
         params: never,
@@ -1484,6 +1588,7 @@ function createFakePluginHostInternal(
           `tool name "${name}" is a built-in bb tool — pick another name`,
         );
       }
+      rejectStaleAgentToolFields(name, tool);
       if (
         typeof tool.description !== "string" ||
         tool.description.trim().length === 0
@@ -1504,30 +1609,21 @@ function createFakePluginHostInternal(
           `tool "${name}" instructions exceed the ${PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS}-character limit`,
         );
       }
-      const experimentalStatusLabels = tool.experimental_statusLabels;
-      if (
-        experimentalStatusLabels !== undefined &&
-        (typeof experimentalStatusLabels !== "object" ||
-          experimentalStatusLabels === null ||
-          typeof experimentalStatusLabels.pending !== "string" ||
-          typeof experimentalStatusLabels.completed !== "string" ||
-          experimentalStatusLabels.pending.trim().length === 0 ||
-          experimentalStatusLabels.completed.trim().length === 0)
-      ) {
-        throw new Error(
-          `tool "${name}" experimental_statusLabels must provide non-empty pending and completed strings`,
+      const presentation = parsePluginAgentToolPresentation(
+        name,
+        tool.presentation,
+      );
+      if (presentation?.icon !== undefined) {
+        // A namespaced glyph must name one of THIS plugin's declared icons,
+        // checked here like production checks it at the register call.
+        const problem = undeclaredIconProblem(
+          pluginId,
+          declaredIconNames,
+          presentation.icon.glyph,
         );
-      }
-      if (
-        experimentalStatusLabels !== undefined &&
-        (experimentalStatusLabels.pending.length >
-          PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS ||
-          experimentalStatusLabels.completed.length >
-            PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS)
-      ) {
-        throw new Error(
-          `tool "${name}" experimental_statusLabels exceed the ${PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS}-character limit`,
-        );
+        if (problem !== null) {
+          throw new Error(agentToolIconRefusalMessage(name, problem));
+        }
       }
       if (typeof tool.execute !== "function") {
         throw new Error(
@@ -1539,16 +1635,14 @@ function createFakePluginHostInternal(
       let parse: FakeAgentToolRecord["parse"];
       if (isZodSchemaLike(parameters)) {
         try {
-          inputSchema = z.toJSONSchema(parameters as z.ZodType, {
-            io: "input",
-          });
+          inputSchema = zodSchemaToJsonSchema(parameters);
         } catch (error) {
           throw new Error(
             `tool "${name}" parameters look like a zod schema but could not be converted to JSON Schema (${errorMessage(error)}) — use zod 4, or pass a plain JSON-schema object`,
           );
         }
         parse = (input) => {
-          const result = (parameters as z.ZodType).safeParse(input);
+          const result = parameters.safeParse(input);
           if (result.success) return { ok: true, value: result.data };
           return { ok: false, error: summarizeParseIssues(result.error) };
         };
@@ -1570,16 +1664,14 @@ function createFakePluginHostInternal(
           `tool "${name}" parameters must be a zod schema or a JSON-schema object`,
         );
       }
+      assertNoRecursiveJsonSchemaReferences(
+        inputSchema,
+        `tool "${name}" parameters`,
+      );
       const record: FakeAgentToolRecord = {
         name,
         description: tool.description,
-        experimentalStatusLabels:
-          experimentalStatusLabels === undefined
-            ? null
-            : {
-                pending: experimentalStatusLabels.pending,
-                completed: experimentalStatusLabels.completed,
-              },
+        presentation,
         instructions:
           tool.instructions !== undefined && tool.instructions.trim().length > 0
             ? tool.instructions
@@ -1641,6 +1733,10 @@ function createFakePluginHostInternal(
     },
   };
 
+  // --- hooks ---
+  /** How many times `bb.experimental_hooks.recheck()` was called. */
+  let requestedDrains = 0;
+
   // --- status ---
   const needsConfigurationMessages: string[] = [];
   const status: PluginStatusApi = {
@@ -1655,11 +1751,21 @@ function createFakePluginHostInternal(
   };
 
   // --- server ---
+  const appUrl = options.appUrl ?? null;
   const loopbackBaseUrl = options.loopbackBaseUrl ?? "http://127.0.0.1:38886";
+  const dataDir = options.dataDir ?? "/tmp/bb-fake-data-dir";
   const server: PluginServerApi = {
+    get experimental_appUrl(): string | null {
+      assertLive();
+      return appUrl;
+    },
     get loopbackBaseUrl(): string {
       assertLive();
       return loopbackBaseUrl;
+    },
+    get experimental_dataDir(): string {
+      assertLive();
+      return dataDir;
     },
   };
 
@@ -1679,7 +1785,22 @@ function createFakePluginHostInternal(
     "thread.failed": [],
     "thread.archived": [],
     "thread.deleted": [],
+    "interaction.pending": [],
+    "message.queued": [],
+    "message.dispatched": [],
+    "turn.failed": [],
+    "message.cancelled": [],
+    "thread.unarchived": [],
   };
+  const hooks: {
+    [K in PluginHookName]: PluginHookHandler<K> | null;
+  } = {
+    "message.dispatch": null,
+  };
+  const environmentProviders = new Map<
+    string,
+    NormalizedPluginEnvironmentProvider
+  >();
   const disposeHooks: Array<() => void | Promise<void>> = [];
   const serviceControllers: AbortController[] = [];
   let nextInteractionId = 1;
@@ -1775,7 +1896,103 @@ function createFakePluginHostInternal(
 
   const sharedPortDeclarations: FakePluginHarness["sharedPortDeclarations"] =
     [];
+  const hostRpcCalls: ExperimentalFakeHostRpcCall[] = [];
+  const hostWorkerExitSubscriptions: FakeHostWorkerExitSubscription[] = [];
+  const hostSignalSubscriptions: FakeHostSignalSubscription[] = [];
   const hosts: PluginHosts = {
+    experimental_client({ contract, experimental_signals }) {
+      return {
+        async call(method, input, callOptions) {
+          assertLive();
+          const methodContract = contract[method];
+          if (methodContract === undefined) {
+            throw new Error(`unknown host rpc method "${String(method)}"`);
+          }
+          if (
+            typeof callOptions !== "object" ||
+            callOptions === null ||
+            typeof callOptions.hostId !== "string" ||
+            callOptions.hostId.length === 0
+          ) {
+            throw new Error(
+              `host rpc method "${String(method)}" requires a host id`,
+            );
+          }
+          if (callOptions.signal?.aborted) {
+            throw Object.assign(new Error("Host plugin call was cancelled"), {
+              name: "AbortError",
+            });
+          }
+          const validatedInput = normalizeRpcJsonResult(
+            await validateRpcValue(methodContract.input, input, "input"),
+          );
+          const call: ExperimentalFakeHostRpcCall = {
+            method: String(method),
+            input: validatedInput,
+            hostId: callOptions.hostId,
+            ...(callOptions.signal === undefined
+              ? {}
+              : { signal: callOptions.signal }),
+          };
+          hostRpcCalls.push(call);
+          if (options.experimental_callHostRpc === undefined) {
+            throw new Error(
+              `fake plugin host has no experimental_callHostRpc stub for "${String(method)}"`,
+            );
+          }
+          const rawOutput = await options.experimental_callHostRpc(call);
+          const validatedOutput = await validateRpcValue(
+            methodContract.output,
+            rawOutput,
+            "output",
+          );
+          return normalizeRpcJsonResult(validatedOutput) as never;
+        },
+        experimental_onWorkerExit(handler) {
+          assertLive();
+          if (typeof handler !== "function") {
+            throw new Error("host worker exit subscription requires a handler");
+          }
+          hostWorkerExitSubscriptions.push(handler);
+          let subscribed = true;
+          return () => {
+            if (!subscribed) return;
+            subscribed = false;
+            const index = hostWorkerExitSubscriptions.indexOf(handler);
+            if (index >= 0) hostWorkerExitSubscriptions.splice(index, 1);
+          };
+        },
+        experimental_onSignal(signal, handler) {
+          assertLive();
+          const descriptor = experimental_signals?.[signal];
+          if (
+            typeof signal !== "string" ||
+            signal.length === 0 ||
+            typeof descriptor !== "object" ||
+            descriptor === null ||
+            !isStandardSchema(descriptor.payload)
+          ) {
+            throw new Error(`unknown host signal "${String(signal)}"`);
+          }
+          if (typeof handler !== "function") {
+            throw new Error("host signal subscription requires a handler");
+          }
+          const record: FakeHostSignalSubscription = {
+            signal,
+            payloadSchema: descriptor.payload,
+            handler,
+          };
+          hostSignalSubscriptions.push(record);
+          let subscribed = true;
+          return () => {
+            if (!subscribed) return;
+            subscribed = false;
+            const index = hostSignalSubscriptions.indexOf(record);
+            if (index >= 0) hostSignalSubscriptions.splice(index, 1);
+          };
+        },
+      };
+    },
     async ensureSharedPortTunnel(hostId) {
       assertLive();
       if (hostId.trim().length === 0) {
@@ -1833,6 +2050,85 @@ function createFakePluginHostInternal(
     },
   };
 
+  const providers: PluginProviders = {
+    register(declaration) {
+      return registerProviderDeclaration(declaration);
+    },
+    experimental_contributeEnv(providerId, resolve) {
+      assertLive();
+      if (typeof providerId !== "string" || providerId.trim().length === 0) {
+        throw new Error(
+          "provider environment contribution requires a provider id",
+        );
+      }
+      if (providerEnvResolvers.has(providerId)) {
+        throw new Error(
+          `provider environment contribution for "${providerId}" is already registered`,
+        );
+      }
+      if (typeof resolve !== "function") {
+        throw new Error(
+          "provider environment contribution requires a resolver function",
+        );
+      }
+      providerEnvResolvers.set(providerId, resolve);
+    },
+    experimental_contributeEnvHealth(providerId, resolve) {
+      assertLive();
+      if (typeof providerId !== "string" || providerId.trim().length === 0) {
+        throw new Error(
+          "provider environment health contribution requires a provider id",
+        );
+      }
+      if (providerEnvHealthResolvers.has(providerId)) {
+        throw new Error(
+          `provider environment health contribution for "${providerId}" is already registered`,
+        );
+      }
+      if (typeof resolve !== "function") {
+        throw new Error(
+          "provider environment health contribution requires a resolver function",
+        );
+      }
+      providerEnvHealthResolvers.set(providerId, resolve);
+    },
+  };
+
+  const experimental_hooks: PluginHooks = {
+    on(hook, handler) {
+      if (hooks[hook] !== null) {
+        throw new Error(pluginHookAlreadyRegisteredMessage(hook));
+      }
+      storePluginHook(hooks, hook, handler);
+    },
+    async recheck(_hook) {
+      assertLive();
+      // The real host schedules a background walk and resolves; there is no
+      // queue here to walk, so the fake records the ask. Asserting on the
+      // count is how a test pins the wake path — the condition the plugin
+      // watches changed, so it told core to re-ask.
+      requestedDrains += 1;
+    },
+  };
+
+  const experimental_environments: PluginEnvironments = {
+    register(declaration) {
+      assertLive();
+      const target = validatePluginEnvironmentProviderDeclaration(declaration);
+      const problem =
+        target.icon === null
+          ? null
+          : undeclaredIconProblem(pluginId, declaredIconNames, target.icon);
+      if (problem !== null)
+        throw new Error(providerIconRefusalMessage(target.id, problem));
+      environmentProviders.set(target.id, target);
+    },
+    async recheck() {
+      assertLive();
+      requestedDrains += 1;
+    },
+  };
+
   const bb: BbPluginApi = {
     pluginId,
     log,
@@ -1844,11 +2140,15 @@ function createFakePluginHostInternal(
     background,
     cli,
     agents,
+    providers,
     ui,
     events,
+    experimental_hooks,
+    experimental_environments,
     status,
     server,
     hosts,
+    experimental_aiServices,
     get sdk() {
       assertLive();
       return sdk;
@@ -1866,6 +2166,9 @@ function createFakePluginHostInternal(
       clearTimeout(pending.timer);
       pendingInteractions.delete(id);
       pending.resolve({ outcome: "cancelled", reason: "plugin-disposed" });
+    }
+    for (const session of [...websocketSessions]) {
+      await session.closeForReload();
     }
     // Host order (§3): services first, then hooks LIFO (isolated), then
     // vended database handles, then handle invalidation.
@@ -1887,6 +2190,8 @@ function createFakePluginHostInternal(
     if (cleanupStorage) {
       rmSync(storageRoot, { recursive: true, force: true });
     }
+    hostWorkerExitSubscriptions.splice(0);
+    hostSignalSubscriptions.splice(0);
     invalidated = true;
   }
 
@@ -1904,11 +2209,16 @@ function createFakePluginHostInternal(
     logEntries,
     realtimeSignals,
     needsConfigurationMessages,
+    get recheckCount() {
+      return requestedDrains;
+    },
     sharedPortDeclarations,
+    experimental_hostRpcCalls: hostRpcCalls,
     sdk: sdkHarness,
     registrations: {
       settingsDescriptors,
       httpRoutes,
+      websocketRoutes,
       get rpcMethods() {
         return [...rpcHandlers.keys()];
       },
@@ -1932,15 +2242,100 @@ function createFakePluginHostInternal(
           "thread.failed": threadEventHandlers["thread.failed"].length,
           "thread.archived": threadEventHandlers["thread.archived"].length,
           "thread.deleted": threadEventHandlers["thread.deleted"].length,
+          "interaction.pending":
+            threadEventHandlers["interaction.pending"].length,
+          "message.queued": threadEventHandlers["message.queued"].length,
+          "message.dispatched":
+            threadEventHandlers["message.dispatched"].length,
+          "turn.failed": threadEventHandlers["turn.failed"].length,
+          "message.cancelled": threadEventHandlers["message.cancelled"].length,
+          "thread.unarchived": threadEventHandlers["thread.unarchived"].length,
         };
       },
+      get hooks() {
+        return { ...hooks };
+      },
+      get environmentProviders() {
+        return new Map(environmentProviders);
+      },
+
       mentionProviders,
+      providerRegistrations,
+      providerEnvResolvers,
+      providerEnvHealthResolvers,
+      aiServiceRegistrations,
     },
     get pendingInteractions() {
       return [...pendingInteractions].map(([id, pending]) => ({
         id,
         ...pending.request,
       }));
+    },
+    async experimental_emitHostWorkerExit(hostId) {
+      assertLive();
+      if (hostId.trim().length === 0) {
+        throw new Error("host worker exit hostId must be non-empty");
+      }
+      for (const handler of [...hostWorkerExitSubscriptions]) {
+        await handler({ hostId });
+      }
+    },
+    async resolveProviderEnv(providerId, context) {
+      assertLive();
+      const resolve = providerEnvResolvers.get(providerId);
+      if (resolve === undefined) return [];
+      try {
+        return validatePluginProviderEnvEntries(await resolve(context));
+      } catch (error) {
+        emitLog(
+          "warn",
+          `provider environment contribution failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return [];
+      }
+    },
+    async resolveProviderEnvHealth(providerId, context) {
+      assertLive();
+      if (!providerEnvResolvers.has(providerId)) return null;
+      const resolve = providerEnvHealthResolvers.get(providerId);
+      if (resolve === undefined) return null;
+      try {
+        const value = await resolve(context);
+        if (value === null) return null;
+        if (value.label.trim().length === 0) {
+          throw new Error("label must not be empty");
+        }
+        if (value.statusMessage.trim().length === 0) {
+          throw new Error("statusMessage must not be empty");
+        }
+        return value;
+      } catch (error) {
+        emitLog(
+          "warn",
+          `provider environment health contribution failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return null;
+      }
+    },
+    async experimental_emitHostSignal(hostId, signal, payload) {
+      assertLive();
+      if (hostId.trim().length === 0) {
+        throw new Error("host signal hostId must be non-empty");
+      }
+      const subscriptions = hostSignalSubscriptions.filter(
+        (subscription) => subscription.signal === signal,
+      );
+      for (const subscription of subscriptions) {
+        const normalized = normalizeRpcJsonResult(
+          await validateRpcValue(subscription.payloadSchema, payload, "input"),
+        );
+        const parsed = await validateRpcValue(
+          subscription.payloadSchema,
+          normalized,
+          "input",
+        );
+        await subscription.handler({ hostId, payload: parsed });
+      }
     },
     submitInteraction(id, value) {
       const pending = pendingInteractions.get(id);
@@ -1958,27 +2353,7 @@ function createFakePluginHostInternal(
     },
 
     async setSettings(values) {
-      const errors = validateSettingsUpdate(settingsDescriptors, values);
-      if (errors.length > 0) {
-        throw new Error(errors.join("; "));
-      }
-      const prev = readSettingsValues(settingsDescriptors, storedSettings);
-      for (const [key, value] of Object.entries(values)) {
-        if (value === null) storedSettings.delete(key);
-        else storedSettings.set(key, value);
-      }
-      const next = readSettingsValues(settingsDescriptors, storedSettings);
-      if (JSON.stringify(next) === JSON.stringify(prev)) return;
-      for (const listener of settingsListeners) {
-        try {
-          listener(next, prev);
-        } catch (error) {
-          emitLog(
-            "warn",
-            `settings onChange listener failed: ${errorMessage(error)}`,
-          );
-        }
-      }
+      await setSettingsValues(values);
     },
 
     async callRpc(method, input) {
@@ -2066,11 +2441,7 @@ function createFakePluginHostInternal(
       const app = new Hono();
       app.on(route.method, route.path, async (context) => {
         try {
-          const response = await route.handler(context);
-          if (!(response instanceof Response)) {
-            throw new Error("http route handler must return a Response");
-          }
-          return response;
+          return adoptHttpRouteResponse(await route.handler(context));
         } catch (error) {
           const message = errorMessage(error);
           emitLog(
@@ -2084,6 +2455,146 @@ function createFakePluginHostInternal(
         }
       });
       return app.request(path, { ...init, method: normalizedMethod });
+    },
+
+    async experimental_openWebSocket(path, init) {
+      assertLive();
+      const url = new URL(path, "http://plugin.test");
+      const route = websocketRoutes.find(
+        (candidate) => candidate.path === url.pathname,
+      );
+      if (!route) {
+        throw new Error(
+          `no websocket route ${url.pathname} is registered — registered: ${
+            websocketRoutes.map((candidate) => candidate.path).join(", ") ||
+            "(none)"
+          }`,
+        );
+      }
+      const request = new Request(url, { ...init, method: "GET" });
+      let handlers: ExperimentalPluginWebSocketHandlers;
+      try {
+        handlers = route.handler({
+          request,
+          url,
+          headers: request.headers,
+        });
+        if (
+          typeof handlers !== "object" ||
+          handlers === null ||
+          Array.isArray(handlers)
+        ) {
+          throw new Error("websocket route handler must return an object");
+        }
+        for (const name of [
+          "onOpen",
+          "onMessage",
+          "onClose",
+          "onError",
+        ] as const) {
+          const callback = handlers[name];
+          if (callback !== undefined && typeof callback !== "function") {
+            throw new Error(
+              `websocket route handler ${name} must be a function`,
+            );
+          }
+        }
+      } catch (error) {
+        emitLog(
+          "warn",
+          `websocket ${route.path} connect failed: ${errorMessage(error)}`,
+        );
+        throw error;
+      }
+
+      const sent: Array<string | Uint8Array> = [];
+      const closeCalls: Array<{
+        code: number | null;
+        reason: string | null;
+      }> = [];
+      let readyState = 0;
+      let closeNotified = false;
+      let eventQueue = Promise.resolve();
+      const invoke = async (
+        event: "open" | "message" | "close" | "error",
+        run: () => void | Promise<void>,
+      ): Promise<void> => {
+        eventQueue = eventQueue.then(async () => {
+          try {
+            await run();
+          } catch (error) {
+            emitLog(
+              "warn",
+              `websocket ${route.path} ${event} failed: ${errorMessage(error)}`,
+            );
+          }
+        });
+        await eventQueue;
+      };
+      const socket: ExperimentalPluginWebSocket = {
+        send(data) {
+          sent.push(typeof data === "string" ? data : new Uint8Array(data));
+        },
+        close(code, reason) {
+          closeCalls.push({ code: code ?? null, reason: reason ?? null });
+          if (readyState < 2) readyState = 2;
+        },
+        get readyState() {
+          return readyState;
+        },
+      };
+      const notifyClose = async (
+        code: number,
+        reason: string,
+      ): Promise<void> => {
+        if (closeNotified) return;
+        closeNotified = true;
+        readyState = 3;
+        websocketSessions.delete(session);
+        if (handlers.onClose !== undefined) {
+          await invoke("close", () =>
+            handlers.onClose?.(socket, { code, reason }),
+          );
+        }
+      };
+      const session: ExperimentalFakeWebSocketSession & {
+        closeForReload(): Promise<void>;
+      } = {
+        sent,
+        closeCalls,
+        get readyState() {
+          return readyState;
+        },
+        async receive(data) {
+          if (readyState !== 1) {
+            throw new Error(
+              "cannot receive a websocket message while not open",
+            );
+          }
+          if (handlers.onMessage !== undefined) {
+            await invoke("message", () => handlers.onMessage?.(socket, data));
+          }
+        },
+        async close(code = 1000, reason = "") {
+          if (readyState < 2) socket.close(code, reason);
+          await notifyClose(code, reason);
+        },
+        async error(error) {
+          if (handlers.onError !== undefined) {
+            await invoke("error", () => handlers.onError?.(socket, error));
+          }
+        },
+        async closeForReload() {
+          socket.close(1012, "Plugin reloaded or disabled");
+          await notifyClose(1012, "Plugin reloaded or disabled");
+        },
+      };
+      websocketSessions.add(session);
+      readyState = 1;
+      if (handlers.onOpen !== undefined) {
+        await invoke("open", () => handlers.onOpen?.(socket));
+      }
+      return session;
     },
 
     runService(name) {

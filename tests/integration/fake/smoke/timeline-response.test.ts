@@ -45,6 +45,7 @@ function makeTimelineResponse(
 ): ThreadTimelineResponse {
   return {
     rows,
+    contextBoundarySeq: null,
     activePromptMode: null,
     activeThinking: null,
     activeWorkflows: [],
@@ -103,6 +104,8 @@ describe("timeline response helpers", () => {
         workKind: "delegation",
         callId: "call_test",
         toolName: "spawnAgent",
+        childRef: null,
+        background: false,
         subagentType: null,
         description: null,
         output: "",

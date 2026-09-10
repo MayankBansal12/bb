@@ -18,19 +18,13 @@ type MainFailureHandler = (error: unknown) => void;
 const entrypointDir = dirname(fileURLToPath(import.meta.url));
 
 function resolveEntrypointBridgeBundleDir(): string | undefined {
-  return existsSync(join(entrypointDir, "bb-claude-code-bridge.mjs"))
+  return existsSync(join(entrypointDir, "bb-provider-bridge-worker.mjs"))
     ? entrypointDir
     : undefined;
 }
 
 function resolveDiagnosticsLogsDir(): string {
-  const hostDaemonStartConfig = loadHostDaemonStartConfig({
-    enableLocalApi: true,
-  });
-
-  if (hostDaemonStartConfig.dataDir === undefined) {
-    throw new Error("Host daemon data directory is required");
-  }
+  const hostDaemonStartConfig = loadHostDaemonStartConfig({});
 
   return join(hostDaemonStartConfig.dataDir, "logs");
 }
@@ -43,9 +37,7 @@ function reportStartupFailure(args: ReportStartupFailureArgs): void {
       processName: "host-daemon",
       error: args.error,
     });
-  } catch {
-    // Keep the original startup failure visible even if diagnostic logging fails.
-  }
+  } catch {}
 
   const message =
     args.error instanceof Error
@@ -57,7 +49,6 @@ function reportStartupFailure(args: ReportStartupFailureArgs): void {
 
 async function runHostDaemonEntrypoint(): Promise<void> {
   const hostDaemonEntrypointConfig = loadHostDaemonEntrypointConfig();
-  // Keep this import after diagnostics so ESM evaluation failures are reported.
   const hostDaemonModule = await import("./start-host-daemon.js");
   const daemon = await hostDaemonModule.startHostDaemon({
     bbExecutableDirectory: hostDaemonEntrypointConfig.BB_CLI_DIR,

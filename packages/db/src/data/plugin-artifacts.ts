@@ -1,4 +1,4 @@
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, or, sql } from "drizzle-orm";
 import type { DbConnection } from "../connection.js";
 import { installedPlugins, pluginArtifacts } from "../schema.js";
 
@@ -8,6 +8,7 @@ export interface PluginArtifactRow {
   sourceKind: "npm" | "git";
   npmResolvedVersion: string | null;
   gitResolvedCommit: string | null;
+  gitCheckoutRoot: string | null;
   path: string;
   integrity: string | null;
   contentHash: string | null;
@@ -32,12 +33,14 @@ export type CreatePluginArtifactInput = PluginArtifactInputBase &
         sourceKind: "npm";
         npmResolvedVersion: string;
         gitResolvedCommit: null;
+        gitCheckoutRoot: null;
         integrity: string;
       }
     | {
         sourceKind: "git";
         npmResolvedVersion: null;
         gitResolvedCommit: string;
+        gitCheckoutRoot: string;
         integrity: string | null;
       }
   );
@@ -51,11 +54,13 @@ export function createPluginArtifact(
       (typeof artifact.npmResolvedVersion !== "string" ||
         artifact.npmResolvedVersion.length === 0 ||
         typeof artifact.integrity !== "string" ||
-        artifact.integrity.length === 0 ||
-        artifact.gitResolvedCommit !== null)) ||
+        artifact.gitResolvedCommit !== null ||
+        artifact.gitCheckoutRoot !== null)) ||
     (artifact.sourceKind === "git" &&
       (typeof artifact.gitResolvedCommit !== "string" ||
         artifact.gitResolvedCommit.length === 0 ||
+        typeof artifact.gitCheckoutRoot !== "string" ||
+        artifact.gitCheckoutRoot.length === 0 ||
         artifact.npmResolvedVersion !== null))
   ) {
     throw new Error(
@@ -87,6 +92,73 @@ export function listPluginArtifacts(
     .from(pluginArtifacts)
     .where(eq(pluginArtifacts.pluginId, pluginId))
     .orderBy(asc(pluginArtifacts.createdAt), asc(pluginArtifacts.id))
+    .all();
+}
+
+export function listPendingGitPluginArtifacts(
+  db: DbConnection,
+): PluginArtifactRow[] {
+  return db
+    .select()
+    .from(pluginArtifacts)
+    .where(
+      and(
+        eq(pluginArtifacts.sourceKind, "git"),
+        eq(pluginArtifacts.validationResult, "pending"),
+      ),
+    )
+    .orderBy(asc(pluginArtifacts.createdAt), asc(pluginArtifacts.id))
+    .all();
+}
+
+export function listPluginArtifactsUnderPath(
+  db: DbConnection,
+  directory: string,
+  separator: string,
+): PluginArtifactRow[] {
+  const prefix = directory.endsWith(separator)
+    ? directory
+    : `${directory}${separator}`;
+  const pattern = `${prefix.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+  return db
+    .select()
+    .from(pluginArtifacts)
+    .where(sql`${pluginArtifacts.path} LIKE ${pattern} ESCAPE '\\'`)
+    .orderBy(asc(pluginArtifacts.path), asc(pluginArtifacts.id))
+    .all();
+}
+
+export function listPluginArtifactsAtOrUnderPath(
+  db: DbConnection,
+  directory: string,
+  separator: string,
+): PluginArtifactRow[] {
+  const prefix = directory.endsWith(separator)
+    ? directory
+    : `${directory}${separator}`;
+  const pattern = `${prefix.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+  return db
+    .select()
+    .from(pluginArtifacts)
+    .where(
+      or(
+        eq(pluginArtifacts.path, directory),
+        sql`${pluginArtifacts.path} LIKE ${pattern} ESCAPE '\\'`,
+      ),
+    )
+    .orderBy(asc(pluginArtifacts.path), asc(pluginArtifacts.id))
+    .all();
+}
+
+export function listPluginArtifactsInGitCheckout(
+  db: DbConnection,
+  checkoutRoot: string,
+): PluginArtifactRow[] {
+  return db
+    .select()
+    .from(pluginArtifacts)
+    .where(eq(pluginArtifacts.gitCheckoutRoot, checkoutRoot))
+    .orderBy(asc(pluginArtifacts.path), asc(pluginArtifacts.id))
     .all();
 }
 
@@ -170,6 +242,26 @@ export function setPluginArtifactValidation(
       .update(pluginArtifacts)
       .set({ ...validation, updatedAt: Date.now() })
       .where(eq(pluginArtifacts.id, id))
+      .run().changes > 0
+  );
+}
+
+export function setPluginArtifactGitCheckoutRoot(
+  db: DbConnection,
+  id: string,
+  checkoutRoot: string,
+): boolean {
+  return (
+    db
+      .update(pluginArtifacts)
+      .set({ gitCheckoutRoot: checkoutRoot, updatedAt: Date.now() })
+      .where(
+        and(
+          eq(pluginArtifacts.id, id),
+          eq(pluginArtifacts.sourceKind, "git"),
+          isNull(pluginArtifacts.gitCheckoutRoot),
+        ),
+      )
       .run().changes > 0
   );
 }

@@ -2,8 +2,7 @@ import { and, eq, isNotNull, isNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import {
   CONNECT_CODE_TTL_MS,
-  MAX_MACHINES_PER_ACCOUNT,
-  MAX_SERVERS_PER_ACCOUNT,
+  MAX_PER_ACCOUNT,
   SERVER_OFFLINE_AFTER_MS,
   checkLabelAvailability,
   connectCode,
@@ -18,12 +17,6 @@ import type { ConnectDb, LabelAvailability, LabelClaim } from "@bb/connect-db";
 import type { Env } from "./env.js";
 import { generateConnectCode, generateToken, sha256Hex } from "./tokens.js";
 
-/**
- * Injected dependencies for the product-state functions. `db` is the shared
- * `ConnectDb` shape (D1 in the worker, in-memory better-sqlite3 in tests, per
- * AGENTS "never mock the database"); `closeTunnel` abstracts the TunnelDO so the
- * DB logic is testable without a Durable Object.
- */
 export interface Deps {
   db: ConnectDb;
   appUrl: string;
@@ -88,34 +81,25 @@ async function closeMachineTunnel(
   await closeTunnel(machineRoutingKey(claim.label, claim.generation));
 }
 
-/** One connected bb server, projected for the dashboard. */
 export interface ServerSummary {
   id: string;
-  /** Routing label — `<subdomain>.<baseDomain>`. */
   subdomain: string;
   name: string;
-  /** The account handle names the primary/first server (subdomain === handle). */
   isPrimary: boolean;
-  /** Has a live tunnel credential (paired, not revoked). */
   connected: boolean;
-  /** Connected AND heartbeated within the offline window. */
   online: boolean;
   lastSeenAt: number | null;
   version: string | null;
-  /** Row-creation time; the best "connected since" proxy we persist. */
   createdAt: number;
   serverUrl: string;
 }
 
 export interface AccountState {
   handle: string | null;
-  /** Primary first, then oldest → newest. Empty until a handle is claimed. */
   servers: ServerSummary[];
   appUrl: string;
   serverUrlTemplate: string;
-  /** GitHub login for the account footer link; null for pre-column rows. */
   githubLogin: string | null;
-  /** Per-account server ceiling, surfaced in the footer as "N of MAX bbs". */
   maxServers: number;
   machines: MachineSummary[];
 }
@@ -123,9 +107,7 @@ export interface AccountState {
 export interface MachineSummary {
   id: string;
   name: string | null;
-  /** Routing label (`<subdomain>.<baseDomain>`); null until first expose. */
   subdomain: string | null;
-  /** Heartbeated within the same offline window servers use. */
   online: boolean;
   lastSeenAt: number | null;
   createdAt: number;
@@ -158,7 +140,6 @@ function toServerSummary(
   };
 }
 
-/** Resolve the target server for a code/action: an explicit id (owner-scoped) or the primary. */
 async function resolveServer(
   db: ConnectDb,
   userId: string,
@@ -193,7 +174,6 @@ async function resolveServer(
   )[0];
 }
 
-/** Product-state read for the dashboard: every server the account owns. */
 export async function getAccountState(
   deps: Deps,
   userId: string,
@@ -216,7 +196,7 @@ export async function getAccountState(
     appUrl: deps.appUrl,
     serverUrlTemplate,
     githubLogin: userRow?.githubLogin ?? null,
-    maxServers: MAX_SERVERS_PER_ACCOUNT,
+    maxServers: MAX_PER_ACCOUNT,
   };
 
   const machineRows = await db
@@ -237,7 +217,8 @@ export async function getAccountState(
         id: row.id,
         name: row.name,
         subdomain: row.subdomain,
-        online: lastSeenMs != null && now - lastSeenMs < SERVER_OFFLINE_AFTER_MS,
+        online:
+          lastSeenMs != null && now - lastSeenMs < SERVER_OFFLINE_AFTER_MS,
         lastSeenAt: lastSeenMs,
         createdAt: row.createdAt.getTime(),
       };
@@ -279,10 +260,6 @@ export async function revokeMachine(
     .get();
   if (!existing) return { error: "not-found" };
 
-  // Revoke first so neither a stale assignment request nor a reconnect can
-  // attach after the closure barrier. Keep the claim pinned until the DO has
-  // positively acknowledged close; failures are retryable and never free the
-  // label for another tenant.
   await deps.db
     .update(machine)
     .set({ revokedAt: existing.revokedAt ?? new Date() })
@@ -320,8 +297,7 @@ export async function revokeMachine(
   return { ok: true };
 }
 
-/** Retry closure/release for revocations left pending by a transient DO error. */
-export async function retryPendingMachineRevocations(
+async function retryPendingMachineRevocations(
   deps: Pick<Deps, "db" | "closeTunnel">,
   userId: string,
 ): Promise<void> {
@@ -341,7 +317,6 @@ export async function retryPendingMachineRevocations(
   }
 }
 
-/** Live label-availability check for the claim UIs (handle + "connect another"). */
 export async function checkAvailability(
   deps: Deps,
   rawLabel: string,
@@ -357,7 +332,6 @@ type ClaimError =
   | "invalid-format"
   | "reserved";
 
-/** Claim the account handle + create the primary server row (subdomain = handle). */
 export async function claimHandle(
   deps: Deps,
   userId: string,
@@ -371,7 +345,6 @@ export async function claimHandle(
     .get();
   if (existing) return { error: "already-claimed" };
 
-  // One namespace for handles + subdomains, so validate/collision-check both.
   const avail = await checkLabelAvailability(db, rawHandle);
   if (!avail.available) {
     return { error: avail.reason === "invalid" ? avail.error : "taken" };
@@ -380,8 +353,6 @@ export async function claimHandle(
 
   const now = new Date();
   try {
-    // The profile trigger inserts label_claim in this same SQLite statement;
-    // a global collision aborts both source and claim atomically.
     await db.insert(profile).values({ userId, handle, createdAt: now }).run();
   } catch {
     return { error: "taken" };
@@ -409,10 +380,6 @@ export async function claimHandle(
 
 type CreateServerError = "no-handle" | "server-limit" | "taken" | ClaimError;
 
-/**
- * Claim another server label for the account (the "Connect another bb" beat 1).
- * The row is created immediately so the label is held while the machine pairs.
- */
 export async function createServer(
   deps: Deps,
   userId: string,
@@ -431,7 +398,7 @@ export async function createServer(
     .from(server)
     .where(eq(server.userId, userId))
     .all();
-  if (owned.length >= MAX_SERVERS_PER_ACCOUNT) return { error: "server-limit" };
+  if (owned.length >= MAX_PER_ACCOUNT) return { error: "server-limit" };
 
   const avail = await checkLabelAvailability(db, rawLabel);
   if (!avail.available) {
@@ -442,7 +409,6 @@ export async function createServer(
   const now = new Date();
   const id = crypto.randomUUID();
   try {
-    // The server trigger claims the label in this same SQLite statement.
     await db
       .insert(server)
       .values({ id, userId, name: label, subdomain: label, createdAt: now })
@@ -450,16 +416,12 @@ export async function createServer(
   } catch {
     return { error: "taken" };
   }
-  // Re-check the cap after inserting: the pre-insert count is a TOCTOU
-  // (concurrent claims could each see room and all insert). Deleting our own
-  // row on overflow keeps the ceiling atomic without a transaction, mirroring
-  // redeemMachineCode's re-check-at-the-atomic-step pattern.
   const afterCount = await db
     .select()
     .from(server)
     .where(eq(server.userId, userId))
     .all();
-  if (afterCount.length > MAX_SERVERS_PER_ACCOUNT) {
+  if (afterCount.length > MAX_PER_ACCOUNT) {
     await db.delete(server).where(eq(server.id, id)).run();
     return { error: "server-limit" };
   }
@@ -485,11 +447,6 @@ export interface IssuedCode {
   serverId: string;
 }
 
-/**
- * Mint (or, with `reuse`, return an existing valid) one-time server-pair code
- * for a specific server. `reuse` backs the setup-mode panels so a poll/reload
- * does not spam fresh codes; the explicit "re-pair" action mints a new one.
- */
 export async function createConnectCode(
   deps: Deps,
   userId: string,
@@ -547,8 +504,7 @@ export async function createConnectCode(
   };
 }
 
-/** Mint a one-time machine-pair code (dashboard "Add machine"). */
-export async function createMachineCode(
+async function createMachineCode(
   deps: Deps,
   userId: string,
   serverId?: string,
@@ -563,8 +519,6 @@ export async function createMachineCode(
     .get();
   if (!prof) return { error: "no-handle" };
 
-  // The machine credential is account-scoped, but the install one-liner names a
-  // specific server URL (`--server`) — resolve it so the command dials the right bb.
   const srv = await resolveServer(db, userId, serverId);
   if (!srv) return { error: "no-server" };
 
@@ -573,9 +527,7 @@ export async function createMachineCode(
     .from(machine)
     .where(eq(machine.userId, userId))
     .all();
-  if (
-    active.filter((m) => m.revokedAt == null).length >= MAX_MACHINES_PER_ACCOUNT
-  ) {
+  if (active.filter((m) => m.revokedAt == null).length >= MAX_PER_ACCOUNT) {
     return { error: "machine-limit" };
   }
 
@@ -586,8 +538,6 @@ export async function createMachineCode(
     .values({
       code,
       userId,
-      // Machine credentials are account-scoped, but the code remembers which
-      // server the "Add machine" flow targeted so redeem can echo its URL.
       serverId: srv.id,
       purpose: "machine-pair",
       expiresAt: new Date(now.getTime() + CONNECT_CODE_TTL_MS),
@@ -601,11 +551,6 @@ export async function createMachineCode(
   };
 }
 
-/**
- * Mint a machine code for the exact bb identified by its durable tunnel
- * credential. This is the server-to-cloud half of the in-product one-command
- * flow; no browser session is involved.
- */
 export async function createMachineCodeForServerCredential(
   deps: Deps,
   credential: string,
@@ -663,11 +608,6 @@ export async function revokeMachineForServerCredential(
     : result;
 }
 
-/**
- * Revoke ONE server's credential and sever its live tunnel. Server-scoped: only
- * the target row is cleared and only its TunnelDO (keyed by subdomain) is closed,
- * so disconnecting one bb never touches the account's other servers.
- */
 export async function disconnectServer(
   deps: Deps,
   userId: string,
@@ -688,20 +628,10 @@ export async function disconnectServer(
     .run();
   try {
     await deps.closeTunnel?.(srv.subdomain);
-  } catch {
-    // best-effort; the credential is already revoked so reconnect is blocked
-  }
+  } catch {}
   return { ok: true };
 }
 
-/**
- * Delete a never-paired secondary server row, freeing its subdomain for re-claim.
- * Distinct from `disconnectServer`: disconnect revokes a live credential but keeps
- * the row (so it can be re-paired at the same address); remove drops the row
- * entirely. Refuses the primary (subdomain === account handle) — that row is the
- * account's identity and must survive — and refuses a still-connected row, since
- * a live bb should be disconnected (revoked + tunnel closed), not silently deleted.
- */
 export async function removeServer(
   deps: Deps,
   userId: string,
@@ -728,10 +658,6 @@ export async function removeServer(
   return { ok: true };
 }
 
-/**
- * Rows affected by a drizzle `.run()` across D1 (`meta.changes`) and
- * better-sqlite3 (`changes`) drivers.
- */
 function rowsChanged(result: unknown): number {
   if (result && typeof result === "object") {
     const r = result as { meta?: { changes?: number }; changes?: number };
@@ -741,19 +667,6 @@ function rowsChanged(result: unknown): number {
   return 0;
 }
 
-/**
- * Redeem a connect code (called by the tunnel client — the code is the
- * credential). Atomically consumes the code, mints a durable tunnel credential,
- * pins it (hashed) on the server row, returns plaintext once.
- *
- * `handle` is the redeemed server's routing label (its subdomain). For the
- * primary server this equals the account handle, so primary pairing is
- * byte-identical to the pre-multi-server behavior. The tunnel client uses
- * this field to build serverUrl / share URLs — it must not be the account's
- * primary handle when a non-primary server was paired.
- *
- * Accepts `Deps` (D1 in the worker via `depsFromEnv`, better-sqlite3 in tests).
- */
 export async function redeemConnectCode(
   deps: Pick<Deps, "db" | "serverUrlTemplate">,
   code: string,
@@ -803,7 +716,6 @@ export async function redeemConnectCode(
     .from(server)
     .where(eq(server.id, row.serverId))
     .get();
-  // Routing label of the redeemed server (not necessarily the account handle).
   const handle = srv?.subdomain ?? null;
   const serverUrl = handle
     ? serverUrlForLabel(handle, serverUrlTemplate)
@@ -812,17 +724,12 @@ export async function redeemConnectCode(
     credential,
     serverId: row.serverId,
     handle,
-    // Keyed by this server's subdomain (which may be non-primary), not the account handle.
     tunnelUrl: serverUrl
       ? `${serverUrl.replace(/^http/u, "ws")}/__tunnel`
       : null,
   };
 }
 
-/**
- * Redeem a machine-pair code (called by the daemon join). Consumes the code,
- * creates a machine row, and returns the durable machine credential once.
- */
 export async function redeemMachineCode(
   deps: Pick<Deps, "db" | "serverUrlTemplate">,
   code: string,
@@ -850,19 +757,12 @@ export async function redeemMachineCode(
   if (row.expiresAt.getTime() < Date.now())
     return { error: "expired", status: 410 };
 
-  // Re-check the cap here, not just at code creation: createMachineCode's
-  // count is a TOCTOU (N codes each minted while under the limit could all
-  // redeem past it). Checked before consuming so a rejected redeem leaves the
-  // code usable.
   const machines = await db
     .select()
     .from(machine)
     .where(eq(machine.userId, row.userId))
     .all();
-  if (
-    machines.filter((m) => m.revokedAt == null).length >=
-    MAX_MACHINES_PER_ACCOUNT
-  ) {
+  if (machines.filter((m) => m.revokedAt == null).length >= MAX_PER_ACCOUNT) {
     return { error: "machine-limit", status: 409 };
   }
 
@@ -893,8 +793,6 @@ export async function redeemMachineCode(
     .from(profile)
     .where(eq(profile.userId, row.userId))
     .get();
-  // Echo the server the "Add machine" flow targeted (carried on the code);
-  // fall back to the primary handle for codes minted before serverId was set.
   const targetServer =
     row.serverId == null
       ? null

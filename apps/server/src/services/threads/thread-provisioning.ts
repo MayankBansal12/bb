@@ -1,8 +1,7 @@
-import { getThread, type DbNotifier, type DbTransaction } from "@bb/db";
+import { getThread, type DbTransaction, type EnvironmentRow } from "@bb/db";
 import {
-  type Environment,
+  type EnvironmentProviderSelection,
   type PromptInput,
-  type ProvisioningTranscriptEntry,
   type ResolvedThreadExecutionOptions,
   type SystemMessageKind,
   type SystemMessageSubject,
@@ -12,6 +11,7 @@ import {
 } from "@bb/domain";
 import type { StartedOnBehalfOf } from "@bb/server-contract";
 import type { AppDeps } from "../../types.js";
+import { requestQueuedMessageDispatch } from "./queued-message-dispatch.js";
 import {
   appendClientTurnEvent,
   appendPreparedClientTurnRequestedEventWithNotificationInTransaction,
@@ -21,9 +21,7 @@ import {
 import { requestThreadStart } from "./thread-lifecycle.js";
 import { resolvePermissionEscalation } from "./thread-runtime-config.js";
 import {
-  attachedEnvironmentIdForContext,
   createMetadataPendingContext,
-  createReprovisioningContext,
   type ThreadForkDescriptor,
   type ThreadProvisionEnvironmentIntent,
   type ThreadProvisionContext,
@@ -32,49 +30,44 @@ import {
 import {
   ensureThreadProvisionEnvironmentReady,
   ensureWorkspaceReadyEvent,
-  ensureWorkspaceReadyEventInTransaction,
   failThreadProvisioning,
   loadActiveThreadProvisionContext,
-  saveThreadProvisionContext,
   type ThreadProvisioningDeps,
 } from "./thread-provisioning-environment.js";
 import {
   forgetActiveThreadProvisionContext,
   getActiveThreadProvisionContext,
+  rememberActiveThreadProvisionContext,
 } from "./thread-provisioning-active-context.js";
 import { applyLoggedThreadLifecycleEvent } from "./lifecycle-outcome.js";
+import { runtimeErrorLogFields } from "../lib/error-log-fields.js";
 import { recordAcceptedPromptHistoryEntry } from "../prompt-history.js";
 
 interface RequestThreadProvisionArgs {
   environmentIntent: ThreadProvisionEnvironmentIntent;
   execution: ResolvedThreadExecutionOptions;
-  // Non-null ⇒ provision this thread by cloning the source provider session
-  // (native fork) instead of starting fresh. null ⇒ not a fork. Resolved by the
-  // server at create time (originKind/provider capability/source session/host).
   fork: ThreadForkDescriptor | null;
   input: PromptInput[];
-  /** Input sent to the provider when the persisted start input is seed-only. */
   providerInput?: PromptInput[];
-  // Non-null ⇒ the thread-start turn is attributed to another agent/thread and
-  // the provider run is deferred until the user's first message (fork /
-  // side-chat anchors). null ⇒ a normal user-initiated start.
   startedOnBehalfOf: StartedOnBehalfOf | null;
   thread: Thread;
   titleProvided: boolean;
 }
 
-interface RequestThreadReprovisionArgs {
+interface RequestThreadTargetReprovisionArgs {
   beforeRequestAppendInTransaction?: (args: { tx: DbTransaction }) => void;
-  environment: Environment;
-  provisionEventSequence: number;
+  environment: EnvironmentRow;
   execution: ResolvedThreadExecutionOptions;
   input: PromptInput[];
   inputGroups?: PromptInput[][];
   initiator: ThreadTurnInitiator;
-  provisioningId: string;
   senderThreadId: string | null;
   systemMessageKind?: SystemMessageKind;
   systemMessageSubject?: SystemMessageSubject | null;
+  provider: {
+    environmentProviderId: string;
+    selection: EnvironmentProviderSelection;
+  };
   thread: Thread;
 }
 
@@ -88,27 +81,14 @@ interface CurrentProvisioningFailureThreadArgs {
   threadId: string;
 }
 
-interface RecordThreadProvisionWorkspaceReadyArgs {
-  entries: ProvisioningTranscriptEntry[];
-  environmentId: string;
-  threadId: string;
-}
-
-interface ThreadProvisionWorkspaceReadyTransactionDeps {
-  db: DbTransaction;
-  hub: DbNotifier;
-}
-
 interface EnvironmentPayloadThreadArgs {
   context: ThreadProvisionProvisionableContext;
-  environment: Environment;
+  environment: EnvironmentRow;
   thread: Thread;
 }
 
-type CurrentProvisioningFailureThreadDeps = Pick<AppDeps, "db">;
-
 function getCurrentProvisioningFailureThread(
-  deps: CurrentProvisioningFailureThreadDeps,
+  deps: Pick<AppDeps, "db">,
   args: CurrentProvisioningFailureThreadArgs,
 ): Thread | null {
   const currentThread = getThread(deps.db, args.threadId);
@@ -174,38 +154,31 @@ async function startThreadIfEnvironmentReady(
     entries: buildCwdBranchEntries({
       path: args.environment.path,
       branchName: args.environment.branchName,
+      headSha: null,
     }),
   });
   if (!workspaceReady.reached) {
     throw new Error("Thread did not reach workspace-ready provisioning state");
   }
 
+  // The workspace exists, so anything that queued waiting for it stops
+  // waiting here rather than after the dispatch below: the wait is over at
+  // this line, and the `run.succeeded` branch below returns without
+  // dispatching anything. A thread with nothing queued no-ops.
+  requestQueuedMessageDispatch(deps, {
+    kind: "workspace-ready",
+    threadId: args.thread.id,
+  });
+
   if (
     args.context.request.seedWithoutRun &&
     args.context.request.fork === null
   ) {
-    // Non-fork seed anchor: the thread-start turn is already persisted and
-    // displayed (initiator agent/system) but no provider session was cloned.
-    // The started agent must wait for the user's first message, so we do not
-    // dispatch a provider run here — we settle the started thread into `idle`,
-    // ready to accept the user's turn. Its provider session is created lazily on
-    // the first turn. (Both forks and side chats now clone the parent's session
-    // natively, so they carry a fork descriptor and take the eager-start path
-    // below; this lazy-seed branch is the fallback for a seed-without-run anchor
-    // whose session could not be cloned.)
-    //
-    // The thread is `starting`; the start established it with no turn to run, so
-    // we fire `run.succeeded` — the zero-work run completed — to settle it
-    // `idle`, the same starting→idle landing a no-turn fork establish takes.
     const outcome = applyLoggedThreadLifecycleEvent(deps, {
       threadId: args.thread.id,
       event: { type: "run.succeeded" },
     });
     if (!outcome.applied) {
-      // The thread left `starting` before we could seed it idle (e.g. a
-      // concurrent stop/transition). The anchor turn is persisted but the
-      // thread will not land in `idle` here, so surface it instead of silently
-      // dropping the transition.
       deps.logger.warn(
         { threadId: args.thread.id },
         "Seed-without-run thread was no longer starting; idle settle skipped",
@@ -214,14 +187,6 @@ async function startThreadIfEnvironmentReady(
     return;
   }
 
-  // A native fork must be provisioned eagerly: rather than the lazy idle
-  // short-circuit, we issue the real start carrying the fork descriptor so the
-  // child's provider session is cloned from the parent at its branch point now.
-  //
-  // When a side-chat preload is created with empty input, the runtime starts no
-  // first turn (its no-input-no-turn guard). The forked provider session is
-  // established and the thread lands idle; the user steers the first executed
-  // turn later. Submitted fork prompts carry their input and run immediately.
   await requestThreadStart(deps, {
     thread: args.thread,
     environment: {
@@ -229,7 +194,6 @@ async function startThreadIfEnvironmentReady(
       hostId: args.environment.hostId,
       path: args.environment.path,
       status: args.environment.status,
-      workspaceProvisionType: args.environment.workspaceProvisionType,
     },
     fork: args.context.request.fork,
     input: args.context.request.input,
@@ -239,7 +203,6 @@ async function startThreadIfEnvironmentReady(
     requestId: args.context.request.clientRequestId,
     execution: args.context.request.execution,
     permissionEscalation: resolvePermissionEscalation({
-      thread: args.thread,
       initiator: "user",
     }),
     projectId: args.thread.projectId,
@@ -290,17 +253,51 @@ export function requestThreadProvision(
     input: args.providerInput ?? args.input,
     seedWithoutRun: args.startedOnBehalfOf !== null,
   });
-  saveThreadProvisionContext({
+  rememberActiveThreadProvisionContext({
     threadId: args.thread.id,
     context,
   });
   return context;
 }
 
-export function requestThreadReprovision(
+export function requestThreadTargetReprovision(
   deps: Pick<AppDeps, "db" | "hub">,
-  args: RequestThreadReprovisionArgs,
+  args: RequestThreadTargetReprovisionArgs,
 ): ThreadProvisionContext {
+  const request = appendReprovisionTurnRequest(deps, args);
+  const context = createMetadataPendingContext({
+    clientRequestId: request.requestId,
+    environmentIntent: {
+      type: "provider",
+      environmentProviderId: args.provider.environmentProviderId,
+      machine: {
+        type: "existing",
+        hostId: args.environment.hostId,
+      },
+      inputs: args.provider.selection.inputs,
+      selectionResolved: true,
+      produced: null,
+    },
+    execution: args.execution,
+    fork: null,
+    input: args.input,
+    ...(args.inputGroups !== undefined
+      ? { inputGroups: args.inputGroups }
+      : {}),
+    seedWithoutRun: false,
+    titleProvided: true,
+  });
+  rememberActiveThreadProvisionContext({
+    threadId: args.thread.id,
+    context,
+  });
+  return context;
+}
+
+function appendReprovisionTurnRequest(
+  deps: Pick<AppDeps, "db" | "hub">,
+  args: Omit<RequestThreadTargetReprovisionArgs, "provider">,
+) {
   const requestId = createClientTurnRequestId();
   const request = deps.db.transaction(
     (tx) => {
@@ -346,34 +343,7 @@ export function requestThreadReprovision(
     request.notificationChanges,
     request.notificationMetadata,
   );
-
-  const context = createReprovisioningContext({
-    clientRequestId: request.requestId,
-    provisionEventSequence: args.provisionEventSequence,
-    execution: args.execution,
-    environmentId: args.environment.id,
-    input: args.input,
-    ...(args.inputGroups !== undefined
-      ? { inputGroups: args.inputGroups }
-      : {}),
-    provisioningId: args.provisioningId,
-  });
-  saveThreadProvisionContext({
-    threadId: args.thread.id,
-    context,
-  });
-  return context;
-}
-
-export function recordThreadProvisionWorkspaceReadyInTransaction(
-  deps: ThreadProvisionWorkspaceReadyTransactionDeps,
-  args: RecordThreadProvisionWorkspaceReadyArgs,
-): void {
-  ensureWorkspaceReadyEventInTransaction(deps, {
-    threadId: args.threadId,
-    environmentId: args.environmentId,
-    entries: args.entries,
-  });
+  return request;
 }
 
 async function advanceThreadProvisioningOnce(
@@ -407,6 +377,9 @@ async function advanceThreadProvisioningOnce(
       context,
       thread,
     });
+    if (ready === null) {
+      return;
+    }
     context = ready.context;
     await startThreadIfEnvironmentReady(deps, {
       context: ready.context,
@@ -424,8 +397,7 @@ async function advanceThreadProvisioningOnce(
     const detail = error instanceof Error ? error.message : String(error);
     failThreadProvisioning(deps, {
       thread: failureThread,
-      environmentId:
-        attachedEnvironmentIdForContext(context) ?? failureThread.environmentId,
+      environmentId: context.state.environmentId ?? failureThread.environmentId,
       detail,
     });
   }
@@ -438,4 +410,28 @@ export async function advanceThreadProvisioning(
   await deps.lifecycleDedupers.threadProvisionAdvance.run(args.threadId, () =>
     advanceThreadProvisioningOnce(deps, args),
   );
+}
+
+/**
+ * Drives provisioning off the caller's stack. Creation returns the thread row
+ * before the workspace exists, and a cold-start row whose wait cleared returns
+ * to its sweep or route the same way, so neither waits on the daemon.
+ */
+export function scheduleThreadProvisioningAdvance(
+  deps: ThreadProvisioningDeps & Pick<AppDeps, "config" | "logger">,
+  context: ThreadProvisionContext,
+  threadId: string,
+): void {
+  void advanceThreadProvisioning(deps, {
+    context,
+    threadId,
+  }).catch((error) => {
+    deps.logger.warn(
+      {
+        threadId,
+        ...runtimeErrorLogFields(deps.config, error),
+      },
+      "Failed to advance thread provisioning",
+    );
+  });
 }

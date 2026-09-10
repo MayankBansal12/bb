@@ -4,6 +4,16 @@ import {
   buildAudioInputConstraints,
   useAudioInputDevicePreferenceValue,
 } from "@/lib/audio-input-device-preference";
+import {
+  isDocumentVisible,
+  subscribeToDocumentVisibility,
+} from "@/lib/document-visibility";
+import {
+  readVoiceSupportEnvironment,
+  resolveVoiceSupport,
+  voiceUnsupportedMessage,
+  type VoiceUnsupportedReason,
+} from "./voice-input-support";
 
 type VoiceInputState = "idle" | "recording" | "transcribing" | "error";
 
@@ -117,6 +127,8 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
 
   const [state, setState] = useState<VoiceInputState>("idle");
   const [isSupported, setIsSupported] = useState(false);
+  const [unsupportedReason, setUnsupportedReason] =
+    useState<VoiceUnsupportedReason | null>("unsupported-browser");
   const [stream, setStream] = useState<MediaStream | null>(null);
 
   const showError = useCallback((message: string) => {
@@ -193,15 +205,9 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      setIsSupported(false);
-      return;
-    }
-    const hasMediaDevices =
-      typeof navigator !== "undefined" &&
-      Boolean(navigator.mediaDevices?.getUserMedia);
-    const hasMediaRecorder = typeof window.MediaRecorder !== "undefined";
-    setIsSupported(hasMediaDevices && hasMediaRecorder);
+    const support = resolveVoiceSupport(readVoiceSupportEnvironment());
+    setIsSupported(support.isSupported);
+    setUnsupportedReason(support.reason);
   }, []);
 
   useEffect(() => {
@@ -210,9 +216,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       if (recorder && recorder.state === "recording") {
         try {
           recorder.stop();
-        } catch {
-          // noop
-        }
+        } catch {}
       }
       mediaRecorderRef.current = null;
       chunksRef.current = [];
@@ -229,28 +233,16 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   }, [releaseRecordingWakeLock, stopMediaStream]);
 
   useEffect(() => {
-    if (typeof document === "undefined") {
-      return;
-    }
-
-    const handleVisibilityChange = () => {
-      if (
-        document.visibilityState === "visible" &&
-        shouldHoldWakeLockRef.current
-      ) {
+    return subscribeToDocumentVisibility(() => {
+      if (isDocumentVisible() && shouldHoldWakeLockRef.current) {
         requestRecordingWakeLock();
       }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
+    });
   }, [requestRecordingWakeLock]);
 
   const start = useCallback(async () => {
     if (!isSupported) {
-      showError("Voice input is not supported in this browser");
+      showError(voiceUnsupportedMessage(unsupportedReason));
       return;
     }
     if (state === "recording" || state === "transcribing") {
@@ -376,6 +368,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   }, [
     isSupported,
     options,
+    unsupportedReason,
     preferredAudioInputDeviceId,
     releaseRecordingWakeLock,
     requestRecordingWakeLock,
@@ -428,6 +421,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   return {
     state,
     isSupported,
+    unsupportedReason,
     stream,
     isRecording: state === "recording",
     isProcessing: state === "transcribing",
