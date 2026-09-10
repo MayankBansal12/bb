@@ -1,4 +1,6 @@
 import {
+  createContext,
+  useContext,
   memo,
   useCallback,
   useMemo,
@@ -229,6 +231,7 @@ interface ChronologicalBuiltInSidebarSections {
 }
 
 interface ChronologicalSectionThreadSectionsProps extends SectionThreadTreeProps {
+  progressiveDisclosureEnabled: boolean;
   builtInSections?: ChronologicalBuiltInSidebarSections;
   topLevelSectionOrder: readonly SidebarSectionId[];
   onTopLevelSectionOrderChange: (order: SidebarSectionId[]) => void;
@@ -1332,6 +1335,13 @@ const SectionTreeItemRow = memo(function SectionTreeItemRow({
   sortableRef,
   sortableStyle,
 }: SectionTreeItemRowProps) {
+  const progressiveDisclosureEnabled = useContext(ManualDisclosureContext);
+  const disclosure = useThreadItemDisclosure(
+    section.items,
+    progressiveDisclosureEnabled,
+    selectedThreadId,
+    sectionDnd?.activeThread?.id,
+  );
   const [isTopLevelActionsOpen, setIsTopLevelActionsOpen] = useState(false);
   const collapsedSections = useAtomValue(sidebarCollapsedThreadSectionsAtom);
   const setCollapsedSections = useSetAtom(sidebarCollapsedThreadSectionsAtom);
@@ -1358,7 +1368,7 @@ const SectionTreeItemRow = memo(function SectionTreeItemRow({
   );
   const { itemKeys, estimateRows, getNavigationEntries, alwaysMountedKeys } =
     useWindowedThreadItems({
-      items: section.items,
+      items: disclosure.visibleItems,
       collapsedThreadIds,
       collapsedEnvironmentIds,
       selectedThreadId,
@@ -1373,11 +1383,12 @@ const SectionTreeItemRow = memo(function SectionTreeItemRow({
         <SectionDndSortableList sectionDnd={sectionDnd} parentKey={section.key}>
           <SidebarWindowedItems
             itemKeys={itemKeys}
+            focusItemKey={disclosure.focusItemKey}
             estimateRows={estimateRows}
             getNavigationEntries={getNavigationEntries}
             alwaysMountedKeys={alwaysMountedKeys}
             renderItem={(index) => {
-              const item = section.items[index];
+              const item = disclosure.visibleItems[index];
               if (!item) {
                 return null;
               }
@@ -1406,6 +1417,12 @@ const SectionTreeItemRow = memo(function SectionTreeItemRow({
               );
             }}
           />
+          {disclosure.hasMoreItems ? (
+            <ThreadDisclosureButton
+              onClick={disclosure.handleShowMore}
+              depth={headerDepth}
+            />
+          ) : null}
         </SectionDndSortableList>
       ) : null}
       {sectionDnd ? (
@@ -1874,13 +1891,78 @@ const THREAD_DISCLOSURE_CONTROL_CLASS = cn(
 function isAttentionProjectThreadItem(
   item: ProjectThreadItem,
   selectedThreadId: string | undefined,
+  draggedThreadId: string | undefined,
 ): boolean {
   return getProjectThreadItemDescendants([item]).some(
     (thread) =>
       thread.hasPendingInteraction ||
       isBusyThread(thread) ||
       isUnreadDoneThread(thread) ||
-      thread.id === selectedThreadId,
+      thread.id === selectedThreadId ||
+      thread.id === draggedThreadId,
+  );
+}
+
+const ManualDisclosureContext = createContext(false);
+
+function useThreadItemDisclosure(
+  items: readonly ProjectThreadItem[],
+  progressiveDisclosureEnabled: boolean,
+  selectedThreadId?: string,
+  draggedThreadId?: string,
+) {
+  const [revealedItemKeys, setRevealedItemKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [focusItemKey, setFocusItemKey] = useState<string>();
+  const visibleItems: ProjectThreadItem[] = [];
+  const hiddenItems: ProjectThreadItem[] = [];
+  items.forEach((item, index) => {
+    const visible =
+      !progressiveDisclosureEnabled ||
+      index < THREAD_ITEMS_INITIAL_LIMIT ||
+      revealedItemKeys.has(getItemKey(item)) ||
+      isAttentionProjectThreadItem(item, selectedThreadId, draggedThreadId);
+    (visible ? visibleItems : hiddenItems).push(item);
+  });
+  const handleShowMore: MouseEventHandler<HTMLButtonElement> = (event) => {
+    const nextItems = hiddenItems.slice(0, THREAD_ITEMS_EXPAND_SIZE);
+    setRevealedItemKeys(
+      new Set([
+        ...revealedItemKeys,
+        ...visibleItems.map(getItemKey),
+        ...nextItems.map(getItemKey),
+      ]),
+    );
+    setFocusItemKey(
+      event.detail === 0 && nextItems[0] ? getItemKey(nextItems[0]) : undefined,
+    );
+  };
+
+  return {
+    visibleItems,
+    focusItemKey,
+    hasMoreItems: hiddenItems.length > 0,
+    handleShowMore,
+  };
+}
+
+function ThreadDisclosureButton({
+  onClick,
+  depth,
+}: {
+  onClick: MouseEventHandler<HTMLButtonElement>;
+  depth: number;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={THREAD_DISCLOSURE_CONTROL_CLASS}
+      style={{ marginLeft: getSidebarThreadRowPaddingLeft(depth) }}
+    >
+      Show more
+    </button>
   );
 }
 
@@ -1902,55 +1984,22 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
       ? threadListState.threads
       : EMPTY_PROJECT_THREADS;
   const draftThreadIds = usePromptDraftInputThreadIds(projectThreads);
-  const [revealedItemKeys, setRevealedItemKeys] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
-  const [focusItemKey, setFocusItemKey] = useState<string>();
   const allRootItems = useMemo(
     () =>
       buildProjectThreadGroups(projectThreads, compareThreads, draftThreadIds),
     [compareThreads, draftThreadIds, projectThreads],
   );
-  const rootItems = useMemo(() => {
-    if (!progressiveDisclosureEnabled) {
-      return allRootItems;
-    }
-    return allRootItems.filter(
-      (item, index) =>
-        index < THREAD_ITEMS_INITIAL_LIMIT ||
-        revealedItemKeys.has(getItemKey(item)) ||
-        isAttentionProjectThreadItem(item, selectedThreadId),
-    );
-  }, [
+  const disclosure = useThreadItemDisclosure(
     allRootItems,
-    selectedThreadId,
-    revealedItemKeys,
     progressiveDisclosureEnabled,
-  ]);
-  const visibleItemKeys = new Set(rootItems.map(getItemKey));
-  const hiddenItems = allRootItems.filter(
-    (item) => !visibleItemKeys.has(getItemKey(item)),
+    selectedThreadId,
   );
-  const hasMoreItems = hiddenItems.length > 0;
-  const handleShowMore: MouseEventHandler<HTMLButtonElement> = (event) => {
-    const nextItems = hiddenItems.slice(0, THREAD_ITEMS_EXPAND_SIZE);
-    setRevealedItemKeys(
-      new Set([
-        ...revealedItemKeys,
-        ...visibleItemKeys,
-        ...nextItems.map(getItemKey),
-      ]),
-    );
-    setFocusItemKey(
-      event.detail === 0 && nextItems[0] ? getItemKey(nextItems[0]) : undefined,
-    );
-  };
 
   if (threadListState.status === "loading") {
     return <ThreadTreeLoadingSkeleton />;
   }
 
-  if (rootItems.length === 0) {
+  if (disclosure.visibleItems.length === 0) {
     const emptyState = (
       <EmptyState
         message={
@@ -1979,8 +2028,8 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
   return (
     <>
       <SectionThreadTreeItems
-        items={rootItems}
-        focusItemKey={focusItemKey}
+        items={disclosure.visibleItems}
+        focusItemKey={disclosure.focusItemKey}
         sectionDnd={null}
         variant={variant}
         projectId={projectId}
@@ -1992,19 +2041,11 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
         onToggleThreadCollapsed={onToggleThreadCollapsed}
         onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
       />
-      {hasMoreItems ? (
-        <button
-          type="button"
-          onClick={handleShowMore}
-          className={THREAD_DISCLOSURE_CONTROL_CLASS}
-          style={{
-            marginLeft: getSidebarThreadRowPaddingLeft(
-              getProjectThreadTreeRootDepthOffset(variant),
-            ),
-          }}
-        >
-          Show more
-        </button>
+      {disclosure.hasMoreItems ? (
+        <ThreadDisclosureButton
+          onClick={disclosure.handleShowMore}
+          depth={getProjectThreadTreeRootDepthOffset(variant)}
+        />
       ) : null}
     </>
   );
@@ -2012,6 +2053,7 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
 
 export const ChronologicalSectionThreadSections = memo(
   function ChronologicalSectionThreadSections({
+    progressiveDisclosureEnabled,
     threadListState,
     compareThreads,
     sections = EMPTY_THREAD_SECTIONS,
@@ -2136,10 +2178,17 @@ export const ChronologicalSectionThreadSections = memo(
       (item) => item.kind !== "section",
     );
     const looseThreads = getProjectThreadItemDescendants(looseItems);
+    const disclosure = useThreadItemDisclosure(
+      looseItems,
+      progressiveDisclosureEnabled,
+      selectedThreadId,
+      sectionDnd?.activeThread?.id,
+    );
 
     const renderItems = (items: readonly ProjectThreadItem[]) => (
       <SectionThreadTreeItems
         items={items}
+        focusItemKey={disclosure.focusItemKey}
         sectionDnd={renderedSectionDnd}
         variant="section"
         selectedThreadId={selectedThreadId}
@@ -2178,7 +2227,13 @@ export const ChronologicalSectionThreadSections = memo(
           items={looseItems.map(getSidebarDndItemId)}
           strategy={verticalListSortingStrategy}
         >
-          {renderItems(looseItems)}
+          {renderItems(disclosure.visibleItems)}
+          {disclosure.hasMoreItems ? (
+            <ThreadDisclosureButton
+              onClick={disclosure.handleShowMore}
+              depth={0}
+            />
+          ) : null}
         </SortableContext>
       ) : renderedSectionDnd ? (
         <div className="grid">
@@ -2270,7 +2325,12 @@ export const ChronologicalSectionThreadSections = memo(
           }
           const sectionItem = sectionItemsBySectionId.get(sectionId);
           return sectionItem ? (
-            <div key={sectionId}>{renderItems([sectionItem])}</div>
+            <ManualDisclosureContext
+              key={sectionId}
+              value={progressiveDisclosureEnabled}
+            >
+              <div>{renderItems([sectionItem])}</div>
+            </ManualDisclosureContext>
           ) : null;
         }}
       </SidebarSectionOrderList>

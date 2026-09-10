@@ -147,7 +147,7 @@ The default-off `sidebarProgressiveDisclosure` experiment shows the first five
 groups in the current sort order in **By project** and **By machine**, keeps
 attention groups visible, and reveals ten more per **Show more** click. Revealed
 groups stay visible through activity and sort-order changes.
-**Manually** is unchanged. Enable it with `bb settings experiment
+**Manually** applies the same limits independently to Threads and each custom section. Enable it with `bb settings experiment
 sidebarProgressiveDisclosure true`.
 
 The default-off `timelineWindowing` experiment mounts only nearby rows in long

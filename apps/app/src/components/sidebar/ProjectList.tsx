@@ -1187,6 +1187,8 @@ function SectionModeSections({
   threads,
   threadsSection,
 }: SectionModeSectionsProps) {
+  const progressiveDisclosureEnabled =
+    useSidebarProgressiveDisclosureEnabled();
   const nonPinnedThreads = useMemo(
     () => threads.filter((thread) => !effectivePinnedThreadIds.has(thread.id)),
     [effectivePinnedThreadIds, threads],
@@ -1210,6 +1212,7 @@ function SectionModeSections({
 
   return (
     <ChronologicalSectionThreadSections
+      progressiveDisclosureEnabled={progressiveDisclosureEnabled}
       threadListState={threadListState}
       compareThreads={compareThreads}
       sections={sections}

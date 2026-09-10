@@ -137,6 +137,7 @@ export function ChronologicalSections() {
       >
         <SidebarStage>
           <ChronologicalSectionThreadSections
+            progressiveDisclosureEnabled={false}
             threadListState={projectTree(sectionThreads)}
             compareThreads={compareStandardThreads}
             sections={STORY_SECTIONS}
