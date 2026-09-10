@@ -130,7 +130,7 @@ every window and client sees the same value.
 - In **By project** and **By machine**, it shows the first five groups in the
   current sort order, keeps attention groups visible, and reveals ten more per
   **Show more** click. Revealed groups stay visible through activity and
-  sort-order changes. **Manually** is unchanged.
+  sort-order changes. **Manually** applies the same limits independently to Threads and each custom section.
 
 ## Timeline windowing
 

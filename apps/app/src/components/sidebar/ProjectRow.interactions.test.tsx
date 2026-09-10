@@ -291,6 +291,7 @@ describe("ProjectRow interactions", () => {
           <QueryClientProvider client={queryClient}>
             <MemoryRouter>
               <ChronologicalSectionThreadSections
+                progressiveDisclosureEnabled={false}
                 threadListState={{ status: "ready", threads: [activeThread] }}
                 compareThreads={() => 0}
                 sections={[{ id: sectionId, name: "Active work" }]}
@@ -353,6 +354,7 @@ describe("ProjectRow interactions", () => {
           <QueryClientProvider client={queryClient}>
             <MemoryRouter>
               <ChronologicalSectionThreadSections
+                progressiveDisclosureEnabled={false}
                 threadListState={{ status: "ready", threads: [activeThread] }}
                 compareThreads={() => 0}
                 sections={[{ id: sectionId, name: "Draft work" }]}
