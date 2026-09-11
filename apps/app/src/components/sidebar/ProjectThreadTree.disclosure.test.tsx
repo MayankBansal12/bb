@@ -159,11 +159,52 @@ describe("ProjectThreadTree progressive disclosure", () => {
     expect(screen.getByText("Thread 14")).not.toBeNull();
     expect(screen.queryByText("Thread 15")).toBeNull();
     expect(screen.getByRole("button", { name: "Show more" })).not.toBeNull();
-    expect(screen.queryByRole("button", { name: "Show less" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Collapse" })).not.toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Show more" }));
     expect(screen.getByText("Thread 16")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+
+  it("collapses fully revealed items back to the initial attention view", () => {
+    const threads = makePlainThreads(18);
+    threads[15] = { ...threads[15], hasPendingInteraction: true };
+    renderThreadTree(threads, { selectedThreadId: "thr_item_17" });
+
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+
+    const collapse = screen.getByRole("button", { name: "Collapse" });
+    collapse.focus();
+    fireEvent.click(collapse, { detail: 0 });
+
+    expect(screen.getByText("Thread 4")).not.toBeNull();
+    expect(screen.queryByText("Thread 5")).toBeNull();
+    expect(screen.queryByText("Thread 16")).toBeNull();
+    expect(screen.getByText("Thread 15")).not.toBeNull();
+    expect(screen.getByText("Thread 17")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
+    expect(document.activeElement?.getAttribute("data-sidebar-thread-id")).toBe(
+      "thr_item_0",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(screen.getByText("Thread 14")).not.toBeNull();
+    expect(screen.queryByText("Thread 16")).toBeNull();
+  });
+
+  it("hides Collapse when revealed items all need attention or disappear", () => {
+    const threads = makePlainThreads(7);
+    const { rerenderThreads } = renderThreadTree(threads);
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(screen.getByRole("button", { name: "Collapse" })).not.toBeNull();
+    rerenderThreads(
+      threads.map((thread) => ({ ...thread, hasPendingInteraction: true })),
+    );
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
+    rerenderThreads(threads.slice(0, 5));
+    expect(screen.queryByRole("button", { name: "Collapse" })).toBeNull();
   });
 
   it("does not spend Show more slots on attention items", () => {

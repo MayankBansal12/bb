@@ -1932,6 +1932,13 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
     (item) => !visibleItemKeys.has(getItemKey(item)),
   );
   const hasMoreItems = hiddenItems.length > 0;
+  const hasCollapsibleItems =
+    progressiveDisclosureEnabled &&
+    rootItems.some(
+      (item, index) =>
+        index >= THREAD_ITEMS_INITIAL_LIMIT &&
+        !isAttentionProjectThreadItem(item, selectedThreadId),
+    );
   const handleShowMore: MouseEventHandler<HTMLButtonElement> = (event) => {
     const nextItems = hiddenItems.slice(0, THREAD_ITEMS_EXPAND_SIZE);
     setRevealedItemKeys(
@@ -1992,19 +1999,39 @@ export const ProjectThreadTree = memo(function ProjectThreadTree({
         onToggleThreadCollapsed={onToggleThreadCollapsed}
         onToggleEnvironmentCollapsed={onToggleEnvironmentCollapsed}
       />
-      {hasMoreItems ? (
-        <button
-          type="button"
-          onClick={handleShowMore}
-          className={THREAD_DISCLOSURE_CONTROL_CLASS}
+      {hasMoreItems || hasCollapsibleItems ? (
+        <div
+          className="flex items-center"
           style={{
             marginLeft: getSidebarThreadRowPaddingLeft(
               getProjectThreadTreeRootDepthOffset(variant),
             ),
           }}
         >
-          Show more
-        </button>
+          {hasMoreItems ? (
+            <button
+              type="button"
+              onClick={handleShowMore}
+              className={THREAD_DISCLOSURE_CONTROL_CLASS}
+            >
+              Show more
+            </button>
+          ) : null}
+          {hasCollapsibleItems ? (
+            <button
+              type="button"
+              onClick={(event) => {
+                setRevealedItemKeys(new Set());
+                setFocusItemKey(
+                  event.detail === 0 ? getItemKey(rootItems[0]) : undefined,
+                );
+              }}
+              className={cn(THREAD_DISCLOSURE_CONTROL_CLASS, "ml-auto")}
+            >
+              Collapse
+            </button>
+          ) : null}
+        </div>
       ) : null}
     </>
   );
