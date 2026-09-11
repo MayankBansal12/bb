@@ -50,6 +50,8 @@ This index lists every command path that the core CLI registers. Read the task-s
 - `bb project update`
 - `bb project delete`
 
+`bb project show <id>` accepts `proj_personal` to inspect Personal.
+
 ## provider
 
 - `bb provider`
