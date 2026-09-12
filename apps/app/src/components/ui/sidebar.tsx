@@ -1353,13 +1353,7 @@ const SidebarInset = React.forwardRef<
         return;
       }
 
-      const currentSession = swipeSessionRef.current;
-      if (currentSession !== null) {
-        if (currentSession.kind !== "pointer") {
-          return;
-        }
-        clearSwipeSession();
-      }
+      clearSwipeSession();
 
       const canPreventDefault = isSidebarSwipeEdgeZoneTouch(touch.clientX);
       swipeSessionRef.current = createSidebarInsetSwipeSession({
@@ -1400,15 +1394,16 @@ const SidebarInset = React.forwardRef<
         !isCompactViewport ||
         openMobile ||
         event.pointerType !== "touch" ||
+        !event.isPrimary ||
         event.button !== 0 ||
         event.clientX < SIDEBAR_MOBILE_SWIPE_BROWSER_EDGE_GUARD_PX ||
-        swipeSessionRef.current !== null ||
         !isSidebarInsetSwipeTarget(event.target) ||
         shouldIgnoreSidebarSwipeTarget(event.target)
       ) {
         return;
       }
 
+      clearSwipeSession();
       swipeSessionRef.current = createSidebarInsetSwipeSession({
         kind: "pointer",
         id: event.pointerId,
@@ -1431,7 +1426,13 @@ const SidebarInset = React.forwardRef<
       window.addEventListener("pointercancel", handleSwipeEnd);
       removeSwipeListenersRef.current = removeListeners;
     },
-    [handleSwipeEnd, handleSwipeMove, isCompactViewport, openMobile],
+    [
+      clearSwipeSession,
+      handleSwipeEnd,
+      handleSwipeMove,
+      isCompactViewport,
+      openMobile,
+    ],
   );
 
   React.useEffect(() => {
