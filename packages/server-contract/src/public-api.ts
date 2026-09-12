@@ -229,6 +229,8 @@ import type {
   QueuedMessageListQuery,
   ThreadQueuedMessageListResponse,
   ThreadResponse,
+  ThreadPluginMetadataQuery,
+  ThreadPluginMetadataResponse,
   ThreadSearchQuery,
   ThreadSearchResponse,
   ThreadStorageContentQuery,
@@ -251,6 +253,7 @@ import type {
   UpdateHostPermissionCeilingRequest,
   UpdateProjectRequest,
   UpdateProjectSourceRequest,
+  UpdateThreadPluginMetadataRequest,
   UpdateThreadRequest,
   UpdateQueuedMessageRequest,
   UploadedPromptAttachment,
@@ -286,6 +289,8 @@ import {
   updateQueuedMessageRequestSchema,
   createThreadRequestSchema,
   forkThreadRequestSchema,
+  updateThreadPluginMetadataRequestSchema,
+  threadPluginMetadataQuerySchema,
   deleteThreadRequestSchema,
   environmentActionRequestSchema,
   environmentDiffBranchesQuerySchema,
@@ -1187,6 +1192,24 @@ export const publicApiRoutes = {
       ),
       response: jsonResponse<ThreadResponse>(),
     }),
+    pluginMetadata: {
+      get: defineRoute({
+        path: "/threads/:id/plugin-metadata",
+        method: "get",
+        request: queryRequest<PathId, ThreadPluginMetadataQuery>(
+          threadPluginMetadataQuerySchema,
+        ),
+        response: jsonResponse<ThreadPluginMetadataResponse>(),
+      }),
+      update: defineRoute({
+        path: "/threads/:id/plugin-metadata",
+        method: "patch",
+        request: jsonRequest<PathId, UpdateThreadPluginMetadataRequest>(
+          updateThreadPluginMetadataRequestSchema,
+        ),
+        response: jsonResponse<ThreadPluginMetadataResponse>(),
+      }),
+    },
     delete: defineRoute({
       path: "/threads/:id",
       method: "delete",

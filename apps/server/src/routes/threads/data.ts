@@ -3,6 +3,8 @@ import { clearTimelineOrderingContextCache } from "../../services/threads/timeli
 import path from "node:path";
 import {
   getAppSettings,
+  getThreadPluginMetadata,
+  patchThreadPluginMetadata,
   getLatestCompletedThreadContextClearSequence,
   listContextWindowUsageRows,
   getLatestThreadSequence,
@@ -304,7 +306,7 @@ async function serveThreadWorktreeRawFile(
 }
 
 export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
-  const { get } = typedRoutes<PublicApiSchema>(app, {
+  const { get, patch } = typedRoutes<PublicApiSchema>(app, {
     onValidationError: (msg) => new ApiError(400, "invalid_request", msg),
   });
   const routes = publicApiRoutes.threads;
@@ -329,6 +331,44 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
     ThreadConversationOutlineResponse["items"]
   >();
   const CONVERSATION_OUTLINE_CACHE_MAX_ENTRIES = 128;
+
+  get(routes.pluginMetadata.get, (context, query) => {
+    const thread = requirePublicThread(deps.db, context.req.param("id"));
+    const { metadata, corrupt } = getThreadPluginMetadata(
+      deps.db,
+      thread.id,
+      query.pluginId,
+    );
+    if (corrupt) {
+      deps.logger.warn(
+        `Ignoring corrupt plugin metadata for thread ${thread.id}, plugin ${query.pluginId}`,
+      );
+    }
+    return context.json(metadata);
+  });
+
+  patch(routes.pluginMetadata.update, (context, payload) => {
+    const thread = requirePublicThread(deps.db, context.req.param("id"));
+    const result = patchThreadPluginMetadata(deps.db, {
+      threadId: thread.id,
+      pluginId: payload.pluginId,
+      set: payload.set ?? {},
+      remove: payload.remove ?? [],
+    });
+    if (!result.ok) {
+      throw new ApiError(
+        413,
+        "invalid_request",
+        "pluginMetadata exceeds 256 KiB",
+      );
+    }
+    if (result.replacedCorrupt) {
+      deps.logger.warn(
+        `Replaced corrupt plugin metadata for thread ${thread.id}, plugin ${payload.pluginId}`,
+      );
+    }
+    return context.json(result.metadata);
+  });
 
   get(routes.context, (context) => {
     const thread = requirePublicThread(deps.db, context.req.param("id"));
