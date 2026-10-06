@@ -1,7 +1,12 @@
 import { threadScope, turnScope } from "@bb/domain";
 import { createDeferredPromise } from "@bb/test-helpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createEventSink, type CreateEventSinkOptions } from "./event-sink.js";
+import {
+  createEventSink,
+  type CreateEventSinkOptions,
+  type EventPostResult,
+  type EventSink,
+} from "./event-sink.js";
 import { ServerResponseError } from "./server-client.js";
 
 function permanentRejection(bodyMessage: string): ServerResponseError {
@@ -388,9 +393,21 @@ describe("event sink", () => {
 });
 
 describe("event sink automatic retries", () => {
+  let postEvents: ReturnType<typeof acceptingPostEvents>;
+  let sink: EventSink;
+  let sessionOpen: boolean;
+
   beforeEach(() => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0.5);
+    sessionOpen = true;
+    postEvents = acceptingPostEvents();
+    sink = createEventSink({
+      isSessionOpen: () => sessionOpen,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
   });
 
   afterEach(() => {
@@ -400,19 +417,8 @@ describe("event sink automatic retries", () => {
   });
 
   it("delivers a completion queued during a failed upload without new activity", async () => {
-    const request =
-      createDeferredPromise<
-        Awaited<ReturnType<CreateEventSinkOptions["postEvents"]>>
-      >();
-    const postEvents = acceptingPostEvents().mockImplementationOnce(
-      () => request.promise,
-    );
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    const request = createDeferredPromise<EventPostResult>();
+    postEvents.mockImplementationOnce(() => request.promise);
     const flush = sink.flush();
     const completion = {
       type: "turn/completed",
@@ -425,9 +431,7 @@ describe("event sink automatic retries", () => {
     request.reject(new TypeError("fetch failed"));
     await flush;
 
-    await vi.advanceTimersByTimeAsync(749);
-    expect(postEvents).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(postEvents).toHaveBeenLastCalledWith([
       { threadId: "thr_1", event: systemErrorEvent("thr_1") },
       { threadId: "thr_1", event: completion },
@@ -436,59 +440,21 @@ describe("event sink automatic retries", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("backs off repeated failures and caps the retry interval", async () => {
-    const postEvents = acceptingPostEvents().mockRejectedValue(
-      new Error("503"),
-    );
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+  it("backs off repeated failures up to a capped interval despite urgent arrivals", async () => {
+    postEvents.mockRejectedValue(new Error("offline"));
     await sink.flush();
     let attempts = 1;
     for (const delay of [750, 1500, 3000, 6000, 12000, 22500, 22500]) {
+      sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
       await vi.advanceTimersByTimeAsync(delay - 1);
       expect(postEvents).toHaveBeenCalledTimes(attempts);
       await vi.advanceTimersByTimeAsync(1);
       expect(postEvents).toHaveBeenCalledTimes(++attempts);
     }
-    await sink.dispose();
-  });
-
-  it("does not let new urgent events bypass retry backoff", async () => {
-    const postEvents = acceptingPostEvents().mockRejectedValue(
-      new Error("502"),
-    );
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
-    await sink.flush();
-    for (let index = 0; index < 10; index += 1) {
-      sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
-      await vi.advanceTimersByTimeAsync(10);
-    }
-    expect(postEvents).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(650);
-    expect(postEvents).toHaveBeenCalledTimes(2);
-    await sink.dispose();
   });
 
   it("stops retrying while disconnected and resumes on a session-open flush", async () => {
-    let sessionOpen = true;
-    const postEvents = acceptingPostEvents().mockRejectedValueOnce(
-      new Error("offline"),
-    );
-    const sink = createEventSink({
-      isSessionOpen: () => sessionOpen,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    postEvents.mockRejectedValueOnce(new Error("offline"));
     await sink.flush();
     sessionOpen = false;
     await vi.advanceTimersByTimeAsync(60000);
@@ -500,15 +466,7 @@ describe("event sink automatic retries", () => {
   });
 
   it("cancels a scheduled retry when disposed", async () => {
-    const postEvents = acceptingPostEvents().mockRejectedValue(
-      new Error("offline"),
-    );
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    postEvents.mockRejectedValue(new Error("offline"));
     await sink.flush();
     await sink.dispose();
     await vi.advanceTimersByTimeAsync(60000);
@@ -517,15 +475,9 @@ describe("event sink automatic retries", () => {
   });
 
   it("resets backoff after the queue drains successfully", async () => {
-    const postEvents = acceptingPostEvents()
+    postEvents
       .mockRejectedValueOnce(new Error("offline"))
       .mockRejectedValueOnce(new Error("offline"));
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
     await sink.flush();
     await vi.advanceTimersByTimeAsync(2250);
     expect(postEvents).toHaveBeenCalledTimes(3);
@@ -538,19 +490,10 @@ describe("event sink automatic retries", () => {
   });
 
   it("keeps retries serialized when more events and flushes arrive during an upload", async () => {
-    const request =
-      createDeferredPromise<
-        Awaited<ReturnType<CreateEventSinkOptions["postEvents"]>>
-      >();
-    const postEvents = acceptingPostEvents()
+    const request = createDeferredPromise<EventPostResult>();
+    postEvents
       .mockRejectedValueOnce(new Error("offline"))
       .mockImplementationOnce(() => request.promise);
-    const sink = createEventSink({
-      isSessionOpen: () => true,
-      logger: createLogger(),
-      postEvents,
-    });
-    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
     await sink.flush();
     await vi.advanceTimersByTimeAsync(750);
     sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
