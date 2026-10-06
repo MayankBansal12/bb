@@ -1,5 +1,6 @@
 import { threadScope, turnScope } from "@bb/domain";
-import { describe, expect, it, vi } from "vitest";
+import { createDeferredPromise } from "@bb/test-helpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEventSink, type CreateEventSinkOptions } from "./event-sink.js";
 import { ServerResponseError } from "./server-client.js";
 
@@ -383,5 +384,184 @@ describe("event sink", () => {
         sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
       }
     }).not.toThrow();
+  });
+});
+
+describe("event sink automatic retries", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("delivers a completion queued during a failed upload without new activity", async () => {
+    const request =
+      createDeferredPromise<
+        Awaited<ReturnType<CreateEventSinkOptions["postEvents"]>>
+      >();
+    const postEvents = acceptingPostEvents().mockImplementationOnce(
+      () => request.promise,
+    );
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    const flush = sink.flush();
+    const completion = {
+      type: "turn/completed",
+      threadId: "thr_1",
+      providerThreadId: "provider-1",
+      scope: turnScope("turn-1"),
+      status: "completed",
+    } as const;
+    sink.emit({ threadId: "thr_1", event: completion });
+    request.reject(new TypeError("fetch failed"));
+    await flush;
+
+    await vi.advanceTimersByTimeAsync(749);
+    expect(postEvents).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(postEvents).toHaveBeenLastCalledWith([
+      { threadId: "thr_1", event: systemErrorEvent("thr_1") },
+      { threadId: "thr_1", event: completion },
+    ]);
+    expect(postEvents).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("backs off repeated failures and caps the retry interval", async () => {
+    const postEvents = acceptingPostEvents().mockRejectedValue(
+      new Error("503"),
+    );
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    let attempts = 1;
+    for (const delay of [750, 1500, 3000, 6000, 12000, 22500, 22500]) {
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(postEvents).toHaveBeenCalledTimes(attempts);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(postEvents).toHaveBeenCalledTimes(++attempts);
+    }
+    await sink.dispose();
+  });
+
+  it("does not let new urgent events bypass retry backoff", async () => {
+    const postEvents = acceptingPostEvents().mockRejectedValue(
+      new Error("502"),
+    );
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    for (let index = 0; index < 10; index += 1) {
+      sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(postEvents).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(650);
+    expect(postEvents).toHaveBeenCalledTimes(2);
+    await sink.dispose();
+  });
+
+  it("stops retrying while disconnected and resumes on a session-open flush", async () => {
+    let sessionOpen = true;
+    const postEvents = acceptingPostEvents().mockRejectedValueOnce(
+      new Error("offline"),
+    );
+    const sink = createEventSink({
+      isSessionOpen: () => sessionOpen,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    sessionOpen = false;
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(postEvents).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    sessionOpen = true;
+    await sink.flush();
+    expect(postEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a scheduled retry when disposed", async () => {
+    const postEvents = acceptingPostEvents().mockRejectedValue(
+      new Error("offline"),
+    );
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    await sink.dispose();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(postEvents).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("resets backoff after the queue drains successfully", async () => {
+    const postEvents = acceptingPostEvents()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"));
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    await vi.advanceTimersByTimeAsync(2250);
+    expect(postEvents).toHaveBeenCalledTimes(3);
+    postEvents.mockRejectedValueOnce(new Error("offline again"));
+    sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
+    await sink.flush();
+    await vi.advanceTimersByTimeAsync(750);
+    expect(postEvents).toHaveBeenCalledTimes(5);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps retries serialized when more events and flushes arrive during an upload", async () => {
+    const request =
+      createDeferredPromise<
+        Awaited<ReturnType<CreateEventSinkOptions["postEvents"]>>
+      >();
+    const postEvents = acceptingPostEvents()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockImplementationOnce(() => request.promise);
+    const sink = createEventSink({
+      isSessionOpen: () => true,
+      logger: createLogger(),
+      postEvents,
+    });
+    sink.emit({ threadId: "thr_1", event: systemErrorEvent("thr_1") });
+    await sink.flush();
+    await vi.advanceTimersByTimeAsync(750);
+    sink.emit({ threadId: "thr_2", event: systemErrorEvent("thr_2") });
+    const flush = sink.flush();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(postEvents).toHaveBeenCalledTimes(2);
+    request.resolve({ acceptedEvents: [], rejectedEvents: [] });
+    await flush;
+    expect(postEvents).toHaveBeenCalledTimes(3);
+    expect(postEvents).toHaveBeenLastCalledWith([
+      { threadId: "thr_2", event: systemErrorEvent("thr_2") },
+    ]);
   });
 });
