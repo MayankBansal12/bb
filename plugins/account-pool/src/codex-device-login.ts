@@ -7,6 +7,7 @@ import {
   codexAccessTokenExpiresAt,
 } from "./credentials.js";
 import type { AccountSummary } from "./contracts.js";
+import { DuplicateAccountError } from "./store.js";
 
 const LOGIN_SESSION_TTL_MS = 10 * 60 * 1_000;
 const DEVICE_CALLBACK_PATH = "/deviceauth/callback";
@@ -404,9 +405,11 @@ export class CodexDeviceLogin {
       return {
         status: "error",
         message:
-          error instanceof Error && error.message.startsWith("Codex ")
-            ? `${error.message} Start again.`
-            : "Codex account could not be saved. Start again.",
+          error instanceof DuplicateAccountError
+            ? error.message
+            : error instanceof Error && error.message.startsWith("Codex ")
+              ? `${error.message} Start again.`
+              : "Codex account could not be saved. Start again.",
       };
     }
   }

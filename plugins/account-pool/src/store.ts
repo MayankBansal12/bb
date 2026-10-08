@@ -53,6 +53,14 @@ export type RoutedThread = z.infer<typeof routedThreadSchema> & {
   threadId: string;
 };
 
+export class DuplicateAccountError extends Error {
+  constructor() {
+    super(
+      "This account is already connected. Use the existing account instead.",
+    );
+  }
+}
+
 export class AccountStore {
   private mutationLock: Promise<void> | null = null;
 
@@ -88,9 +96,32 @@ export class AccountStore {
         lastUsedAt: null,
         lastUsedHostId: null,
       });
+      const accounts = await this.list();
+      const identity =
+        account.provider === "codex" ? "codexAccountId" : "accountUuid";
+      for (const existing of accounts) {
+        if (
+          secret.kind !== "oauth" ||
+          existing.kind !== "oauth" ||
+          existing.provider !== account.provider
+        )
+          continue;
+        const duplicate =
+          account[identity] && existing[identity]
+            ? account[identity] === existing[identity]
+            : account.email && existing.email
+              ? account.email.toLowerCase() === existing.email.toLowerCase()
+              : await this.readSecret(existing.id).then(
+                  (stored) =>
+                    stored.kind === "oauth" &&
+                    (stored.accessToken === secret.accessToken ||
+                      stored.refreshToken === secret.refreshToken),
+                  () => false,
+                );
+        if (duplicate) throw new DuplicateAccountError();
+      }
       await this.writeSecret(account.id, secret);
       try {
-        const accounts = await this.list();
         accounts.push(account);
         await this.kv.set(ACCOUNTS_KEY, accounts);
       } catch (error) {
