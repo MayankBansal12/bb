@@ -1,5 +1,9 @@
 import type { ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { PassThrough, Writable, type Readable } from "node:stream";
+import { whichCommandSync } from "which-command";
+import { z } from "zod";
 import {
   experimental_isProviderBridgeRecording,
   experimental_killPortableProcess,
@@ -86,6 +90,51 @@ export function resolvePiLaunch(env: NodeJS.ProcessEnv): {
   return { command, args: parsed };
 }
 
+const piPackageManifestSchema = z.object({
+  bin: z.union([z.string().min(1), z.object({ pi: z.string().min(1) })]),
+});
+
+export function resolvePiProcessLaunch(
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): ReturnType<typeof resolvePiLaunch> {
+  const launch = resolvePiLaunch(process.env);
+  if (process.platform !== "win32") return launch;
+  const keys = Object.keys(env).sort();
+  const executable = whichCommandSync(launch.command, {
+    cwd,
+    path: env[keys.find((key) => key.toUpperCase() === "PATH") ?? "PATH"],
+    pathExt:
+      env[keys.find((key) => key.toUpperCase() === "PATHEXT") ?? "PATHEXT"],
+  });
+  if (!executable || path.basename(executable).toLowerCase() !== "pi.cmd") {
+    return launch;
+  }
+  const directory = path.dirname(executable);
+  const packageDir = path.join(
+    directory,
+    "node_modules",
+    "@earendil-works",
+    "pi-coding-agent",
+  );
+  let bin: z.infer<typeof piPackageManifestSchema>["bin"];
+  try {
+    ({ bin } = piPackageManifestSchema.parse(
+      JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8")),
+    ));
+  } catch {
+    return launch;
+  }
+  const node = path.join(directory, "node.exe");
+  return {
+    command: existsSync(node) ? node : "node",
+    args: [
+      path.resolve(packageDir, typeof bin === "string" ? bin : bin.pi),
+      ...launch.args,
+    ],
+  };
+}
+
 export function buildPiChildEnv(
   overrides: Record<string, string>,
 ): NodeJS.ProcessEnv {
@@ -116,7 +165,7 @@ export class PiRpcChild {
     this.settledExit = new Promise((resolve) => {
       resolveSettledExit = resolve;
     });
-    const launch = resolvePiLaunch(process.env);
+    const launch = resolvePiProcessLaunch(args.env, args.cwd);
     this.child = experimental_spawnPortableProcess({
       command: launch.command,
       args: [...launch.args, ...args.args],
