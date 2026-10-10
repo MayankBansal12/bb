@@ -1,5 +1,8 @@
 import type { ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { PassThrough, Writable, type Readable } from "node:stream";
+import { whichCommandSync } from "which-command";
 import {
   experimental_isProviderBridgeRecording,
   experimental_killPortableProcess,
@@ -86,6 +89,39 @@ export function resolvePiLaunch(env: NodeJS.ProcessEnv): {
   return { command, args: parsed };
 }
 
+export function resolvePiProcessLaunch(
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): ReturnType<typeof resolvePiLaunch> {
+  const launch = resolvePiLaunch(process.env);
+  if (process.platform !== "win32") return launch;
+  const keys = Object.keys(env).sort();
+  const executable = whichCommandSync(launch.command, {
+    cwd,
+    path: env[keys.find((key) => key.toUpperCase() === "PATH") ?? "PATH"],
+    pathExt:
+      env[keys.find((key) => key.toUpperCase() === "PATHEXT") ?? "PATHEXT"],
+  });
+  if (!executable || path.extname(executable).toLowerCase() !== ".cmd") {
+    return launch;
+  }
+  try {
+    const source = readFileSync(executable, "utf8");
+    const script = source.match(
+      /^endLocal .*& "%_prog%"\s+"%dp0%\\([^"\r\n]+\.[cm]?js)" %\*\r?$/imu,
+    )?.[1];
+    if (!script || !/^\s*SET "_prog=node"\r?$/imu.test(source)) return launch;
+    const directory = path.dirname(executable);
+    const node = path.join(directory, "node.exe");
+    return {
+      command: existsSync(node) ? node : "node",
+      args: [path.resolve(directory, script), ...launch.args],
+    };
+  } catch {
+    return launch;
+  }
+}
+
 export function buildPiChildEnv(
   overrides: Record<string, string>,
 ): NodeJS.ProcessEnv {
@@ -116,7 +152,7 @@ export class PiRpcChild {
     this.settledExit = new Promise((resolve) => {
       resolveSettledExit = resolve;
     });
-    const launch = resolvePiLaunch(process.env);
+    const launch = resolvePiProcessLaunch(args.env, args.cwd);
     this.child = experimental_spawnPortableProcess({
       command: launch.command,
       args: [...launch.args, ...args.args],

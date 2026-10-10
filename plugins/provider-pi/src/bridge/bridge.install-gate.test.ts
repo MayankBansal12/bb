@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PI_BRIDGE_ARGS_ENV, PI_BRIDGE_COMMAND_ENV } from "./rpc-child.js";
@@ -45,6 +46,67 @@ it("reports ready with the installed version after the get_state probe", async (
     },
   });
 }, 30_000);
+
+it.skipIf(process.platform !== "win32")(
+  "loads models through an npm shim resolved by PATH",
+  async () => {
+    const binDir = join(
+      harness.workspaceDir,
+      "npm prefix with spaces & symbols",
+    );
+    const script = join(
+      binDir,
+      "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    );
+    mkdirSync(dirname(script), { recursive: true });
+    writeFileSync(
+      script,
+      `import(${JSON.stringify(pathToFileURL(fakePiPath).href)});\n`,
+    );
+    writeFileSync(
+      join(binDir, "pi.cmd"),
+      [
+        "@ECHO off",
+        "GOTO start",
+        ":find_dp0",
+        "SET dp0=%~dp0",
+        "EXIT /b",
+        ":start",
+        "SETLOCAL",
+        "CALL :find_dp0",
+        "",
+        'IF EXIST "%dp0%\\node.exe" (',
+        '  SET "_prog=%dp0%\\node.exe"',
+        ") ELSE (",
+        '  SET "_prog=node"',
+        "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+        ")",
+        "",
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*',
+        "",
+        'REM previous version: "%dp0%\\old.js"',
+      ].join("\r\n"),
+    );
+    vi.stubEnv(PI_BRIDGE_COMMAND_ENV, "pi");
+    vi.stubEnv(PI_BRIDGE_ARGS_ENV, "[]");
+    const pathKey =
+      Object.keys(process.env)
+        .sort()
+        .find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+    vi.stubEnv(pathKey, `${binDir}${delimiter}${process.env[pathKey] ?? ""}`);
+
+    const models = await harness.request(nextRequestId(), "model/list", {
+      cwd: harness.workspaceDir,
+    });
+    expect(models.error).toBeUndefined();
+    expect(models.result).toMatchObject({
+      models: expect.arrayContaining([
+        expect.objectContaining({ id: "fake-provider/fake-model" }),
+      ]),
+    });
+  },
+  30_000,
+);
 
 it("refuses a pi older than the supported minimum before spawning it", async () => {
   vi.stubEnv("FAKE_PI_VERSION", "0.83.2");
