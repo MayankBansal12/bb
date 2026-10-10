@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -54,41 +54,24 @@ it.skipIf(process.platform !== "win32")(
       harness.workspaceDir,
       "npm prefix with spaces & symbols",
     );
-    const script = join(
+    const packageDir = join(
       binDir,
-      "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      "node_modules/@earendil-works/pi-coding-agent",
     );
-    mkdirSync(dirname(script), { recursive: true });
+    mkdirSync(join(packageDir, "dist"), { recursive: true });
     writeFileSync(
-      script,
+      join(packageDir, "package.json"),
+      JSON.stringify({ bin: { pi: "dist/cli.js" } }),
+    );
+    writeFileSync(
+      join(packageDir, "dist/cli.js"),
       `import(${JSON.stringify(pathToFileURL(fakePiPath).href)});\n`,
     );
     writeFileSync(
       join(binDir, "pi.cmd"),
-      [
-        "@ECHO off",
-        "GOTO start",
-        ":find_dp0",
-        "SET dp0=%~dp0",
-        "EXIT /b",
-        ":start",
-        "SETLOCAL",
-        "CALL :find_dp0",
-        "",
-        'IF EXIST "%dp0%\\node.exe" (',
-        '  SET "_prog=%dp0%\\node.exe"',
-        ") ELSE (",
-        '  SET "_prog=node"',
-        "  SET PATHEXT=%PATHEXT:;.JS;=;%",
-        ")",
-        "",
-        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*',
-        "",
-        'REM previous version: "%dp0%\\old.js"',
-      ].join("\r\n"),
+      '@node "%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js" %*\r\n',
     );
-    vi.stubEnv(PI_BRIDGE_COMMAND_ENV, "pi");
-    vi.stubEnv(PI_BRIDGE_ARGS_ENV, "[]");
+    vi.stubEnv(PI_BRIDGE_COMMAND_ENV, undefined);
     const pathKey =
       Object.keys(process.env)
         .sort()

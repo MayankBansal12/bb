@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { whichCommandSync } from "which-command";
+import { z } from "zod";
 import {
   experimental_isProviderBridgeRecording,
   experimental_killPortableProcess,
@@ -89,6 +90,10 @@ export function resolvePiLaunch(env: NodeJS.ProcessEnv): {
   return { command, args: parsed };
 }
 
+const piPackageManifestSchema = z.object({
+  bin: z.union([z.string().min(1), z.object({ pi: z.string().min(1) })]),
+});
+
 export function resolvePiProcessLaunch(
   env: NodeJS.ProcessEnv,
   cwd: string,
@@ -102,24 +107,32 @@ export function resolvePiProcessLaunch(
     pathExt:
       env[keys.find((key) => key.toUpperCase() === "PATHEXT") ?? "PATHEXT"],
   });
-  if (!executable || path.extname(executable).toLowerCase() !== ".cmd") {
+  if (!executable || path.basename(executable).toLowerCase() !== "pi.cmd") {
     return launch;
   }
+  const directory = path.dirname(executable);
+  const packageDir = path.join(
+    directory,
+    "node_modules",
+    "@earendil-works",
+    "pi-coding-agent",
+  );
+  let bin: z.infer<typeof piPackageManifestSchema>["bin"];
   try {
-    const source = readFileSync(executable, "utf8");
-    const script = source.match(
-      /^endLocal .*& "%_prog%"\s+"%dp0%\\([^"\r\n]+\.[cm]?js)" %\*\r?$/imu,
-    )?.[1];
-    if (!script || !/^\s*SET "_prog=node"\r?$/imu.test(source)) return launch;
-    const directory = path.dirname(executable);
-    const node = path.join(directory, "node.exe");
-    return {
-      command: existsSync(node) ? node : "node",
-      args: [path.resolve(directory, script), ...launch.args],
-    };
+    ({ bin } = piPackageManifestSchema.parse(
+      JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8")),
+    ));
   } catch {
     return launch;
   }
+  const node = path.join(directory, "node.exe");
+  return {
+    command: existsSync(node) ? node : "node",
+    args: [
+      path.resolve(packageDir, typeof bin === "string" ? bin : bin.pi),
+      ...launch.args,
+    ],
+  };
 }
 
 export function buildPiChildEnv(
