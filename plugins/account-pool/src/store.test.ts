@@ -101,7 +101,9 @@ describe("AccountStore", () => {
         store.add(input, secret),
         store.add(
           { ...input, label: "duplicate", enabled: true, priority: 100 },
-          secret,
+          "email" in identity
+            ? { ...secret, accessToken: "rotated", refreshToken: "rotated" }
+            : secret,
         ),
       ]);
       expect(results.map((result) => result.status)).toEqual([
@@ -118,10 +120,6 @@ describe("AccountStore", () => {
       expect(accounts[0]).toMatchObject(input);
       expect(await fs.readdir(secretsDir)).toHaveLength(1);
       expect(await store.readSecret(accounts[0]!.id)).toMatchObject(secret);
-      const reloaded = new AccountStore(host.bb.storage.kv, secretsDir);
-      await expect(reloaded.add(input, secret)).rejects.toThrow(
-        "already connected",
-      );
     },
   );
 

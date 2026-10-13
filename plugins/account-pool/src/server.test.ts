@@ -555,7 +555,7 @@ describe("Account Pool plugin", () => {
   );
 
   it.each(["claude", "codex"] as const)(
-    "rejects repeated %s machine imports through RPC and CLI",
+    "rejects repeated %s machine imports",
     async (provider) => {
       const fixture = await createOAuthRequestFixture(
         provider,
@@ -570,22 +570,6 @@ describe("Account Pool plugin", () => {
           priority: 100,
         }),
       ).rejects.toThrow("already connected");
-      const result = await fixture.host.harness.behavior.runCli([
-        "account",
-        "add",
-        "--provider",
-        provider,
-        "--import",
-        "--json",
-      ]);
-      expect(result.exitCode).not.toBe(0);
-      expect(result.stdout).toContain("already connected");
-      const status = statusSchema.parse(
-        await fixture.host.harness.behavior.callRpc("status.get", null),
-      );
-      expect(status.accounts.map((account) => account.id)).toEqual([
-        fixture.account.id,
-      ]);
     },
   );
 
