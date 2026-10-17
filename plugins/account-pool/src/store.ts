@@ -55,9 +55,7 @@ export type RoutedThread = z.infer<typeof routedThreadSchema> & {
 
 export class DuplicateAccountError extends Error {
   constructor() {
-    super(
-      "This account is already connected. Use the existing account instead.",
-    );
+    super("This account is already in the pool.");
   }
 }
 

@@ -258,8 +258,7 @@ describe("Codex device login", () => {
     now += 5_000;
     expect(await login.poll({ sessionId: duplicate.sessionId })).toEqual({
       status: "error",
-      message:
-        "This account is already connected. Use the existing account instead.",
+      message: "This account is already in the pool.",
     });
   });
 

@@ -57,11 +57,10 @@ process arguments, shell history, and agent transcripts. Prefer `--import` for
 an existing Claude Code login.
 
 Adding an OAuth account already in the pool, even a disabled one, fails with
-"already connected" and leaves it unchanged. Different Codex workspace account
-IDs remain separate accounts.
+"This account is already in the pool." and leaves it unchanged. Different
+Codex workspace account IDs remain separate accounts.
 
-The CLI Codex import path reads
-`~/.codex/auth.json` on the bb server host. OAuth quota refreshes on add or
+The CLI Codex import path reads `~/.codex/auth.json` on the bb server host. OAuth quota refreshes on add or
 enable and every five minutes while an account is idle. When a request finds no
 eligible account, the pool first refreshes the OAuth accounts it considers
 exhausted, at most once every 30 seconds per account, so a plan upgrade or an
