@@ -61,6 +61,11 @@ export class DuplicateAccountError extends Error {
   }
 }
 
+function providerAccountId(account: Account): string | null {
+  if (account.provider === "codex") return account.codexAccountId ?? null;
+  return account.accountUuid;
+}
+
 export class AccountStore {
   private mutationLock: Promise<void> | null = null;
 
@@ -97,28 +102,12 @@ export class AccountStore {
         lastUsedHostId: null,
       });
       const accounts = await this.list();
-      const identity =
-        account.provider === "codex" ? "codexAccountId" : "accountUuid";
-      for (const existing of accounts) {
-        if (
-          secret.kind !== "oauth" ||
-          existing.kind !== "oauth" ||
-          existing.provider !== account.provider
-        )
-          continue;
-        const duplicate =
-          account[identity] && existing[identity]
-            ? account[identity] === existing[identity]
-            : account.email && existing.email
-              ? account.email.toLowerCase() === existing.email.toLowerCase()
-              : await this.readSecret(existing.id).then(
-                  (stored) =>
-                    stored.kind === "oauth" &&
-                    (stored.accessToken === secret.accessToken ||
-                      stored.refreshToken === secret.refreshToken),
-                  () => false,
-                );
-        if (duplicate) throw new DuplicateAccountError();
+      if (secret.kind === "oauth") {
+        for (const existing of accounts) {
+          if (await this.isSameOAuthAccount(existing, account, secret)) {
+            throw new DuplicateAccountError();
+          }
+        }
       }
       await this.writeSecret(account.id, secret);
       try {
@@ -130,6 +119,28 @@ export class AccountStore {
       }
       return account;
     });
+  }
+
+  private async isSameOAuthAccount(
+    existing: Account,
+    account: Account,
+    secret: Extract<AccountSecret, { kind: "oauth" }>,
+  ): Promise<boolean> {
+    if (existing.kind !== "oauth" || existing.provider !== account.provider) {
+      return false;
+    }
+    const existingId = providerAccountId(existing);
+    const accountId = providerAccountId(account);
+    if (existingId && accountId) return existingId === accountId;
+    if (existing.email && account.email) {
+      return existing.email.toLowerCase() === account.email.toLowerCase();
+    }
+    const stored = await this.readSecret(existing.id).catch(() => null);
+    return (
+      stored?.kind === "oauth" &&
+      (stored.accessToken === secret.accessToken ||
+        stored.refreshToken === secret.refreshToken)
+    );
   }
 
   async remove(id: string): Promise<boolean> {

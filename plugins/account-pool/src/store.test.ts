@@ -7,7 +7,12 @@ import type { PluginKvStorage } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Account } from "./contracts.js";
-import { AccountStore, QUOTA_MIGRATIONS, QuotaStore } from "./store.js";
+import {
+  AccountStore,
+  DuplicateAccountError,
+  QUOTA_MIGRATIONS,
+  QuotaStore,
+} from "./store.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -31,7 +36,8 @@ function delayedAccountReads(kv: PluginKvStorage): PluginKvStorage {
 }
 
 describe("AccountStore", () => {
-  const oauthInput = {
+  const CLAUDE_UUID = "11111111-1111-4111-8111-111111111111";
+  const accountInput = {
     provider: "claude",
     kind: "oauth",
     label: "original",
@@ -47,6 +53,11 @@ describe("AccountStore", () => {
     accessToken: "access",
     refreshToken: "refresh",
     expiresAt: null,
+  };
+  const rotatedSecret = {
+    ...secret,
+    accessToken: "rotated",
+    refreshToken: "rotated",
   };
   let host: ReturnType<typeof createFakePluginHost>;
   let store: AccountStore;
@@ -84,65 +95,101 @@ describe("AccountStore", () => {
     ]);
   });
 
+  it("rejects a concurrent duplicate OAuth add without changing the original", async () => {
+    store = new AccountStore(
+      delayedAccountReads(host.bb.storage.kv),
+      secretsDir,
+    );
+    const results = await Promise.allSettled([
+      store.add(accountInput, secret),
+      store.add(
+        { ...accountInput, label: "duplicate", enabled: true, priority: 100 },
+        secret,
+      ),
+    ]);
+
+    expect(results[0]?.status).toBe("fulfilled");
+    expect(results[1]).toMatchObject({
+      status: "rejected",
+      reason: new DuplicateAccountError(),
+    });
+    const accounts = await store.list();
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]).toMatchObject(accountInput);
+    expect(await fs.readdir(secretsDir)).toHaveLength(1);
+  });
+
   it.each([
-    { provider: "claude", accountUuid: "11111111-1111-4111-8111-111111111111" },
-    { provider: "codex", codexAccountId: "chatgpt-account" },
-    { provider: "claude", email: "person@example.com" },
-    { provider: "claude" },
+    { provider: "claude", identity: { accountUuid: CLAUDE_UUID } },
+    { provider: "codex", identity: { codexAccountId: "workspace-1" } },
   ] as const)(
-    "rejects concurrent duplicate OAuth imports: %j",
-    async (identity) => {
-      store = new AccountStore(
-        delayedAccountReads(host.bb.storage.kv),
-        secretsDir,
-      );
-      const input = { ...oauthInput, ...identity };
-      const results = await Promise.allSettled([
-        store.add(input, secret),
-        store.add(
-          { ...input, label: "duplicate", enabled: true, priority: 100 },
-          "email" in identity
-            ? { ...secret, accessToken: "rotated", refreshToken: "rotated" }
-            : secret,
-        ),
-      ]);
-      expect(results.map((result) => result.status)).toEqual([
-        "fulfilled",
-        "rejected",
-      ]);
-      expect(results[1]).toMatchObject({
-        reason: new Error(
-          "This account is already connected. Use the existing account instead.",
-        ),
-      });
-      const accounts = await store.list();
-      expect(accounts).toHaveLength(1);
-      expect(accounts[0]).toMatchObject(input);
-      expect(await fs.readdir(secretsDir)).toHaveLength(1);
-      expect(await store.readSecret(accounts[0]!.id)).toMatchObject(secret);
+    "rejects the same $provider account ID with a new email and tokens",
+    async ({ provider, identity }) => {
+      const input = { ...accountInput, provider, ...identity };
+      await store.add({ ...input, email: "person@example.com" }, secret);
+
+      await expect(
+        store.add({ ...input, email: "changed@example.com" }, rotatedSecret),
+      ).rejects.toThrow(DuplicateAccountError);
     },
   );
 
-  it("uses provider identity across token rotation and keeps different Codex workspaces", async () => {
-    const input = {
-      ...oauthInput,
-      provider: "codex" as const,
-      email: "person@example.com",
-      codexAccountId: "workspace-1",
-    };
-    await store.add(input, secret);
-    await expect(
-      store.add(
-        { ...input, email: "changed@example.com" },
-        { ...secret, accessToken: "rotated", refreshToken: "rotated-refresh" },
-      ),
-    ).rejects.toThrow("already connected");
-    await store.add({ ...input, codexAccountId: "workspace-2" }, secret);
+  it("rejects a case-insensitive email match when one account UUID is missing", async () => {
     await store.add(
-      { ...input, provider: "claude", codexAccountId: undefined },
+      {
+        ...accountInput,
+        accountUuid: CLAUDE_UUID,
+        email: "Person@Example.com",
+      },
       secret,
     );
-    expect(await store.list()).toHaveLength(3);
+
+    await expect(
+      store.add(
+        { ...accountInput, email: "person@example.com" },
+        rotatedSecret,
+      ),
+    ).rejects.toThrow(DuplicateAccountError);
+  });
+
+  it("rejects the same tokens when one email is missing", async () => {
+    await store.add({ ...accountInput, email: "person@example.com" }, secret);
+
+    await expect(store.add(accountInput, secret)).rejects.toThrow(
+      DuplicateAccountError,
+    );
+  });
+
+  it("keeps different Codex workspace IDs separate despite the same email and tokens", async () => {
+    const input = {
+      ...accountInput,
+      provider: "codex",
+      email: "person@example.com",
+    } as const;
+    await store.add({ ...input, codexAccountId: "workspace-1" }, secret);
+    await store.add({ ...input, codexAccountId: "workspace-2" }, secret);
+
+    expect(await store.list()).toHaveLength(2);
+  });
+
+  it("keeps different providers separate despite the same email and tokens", async () => {
+    const input = { ...accountInput, email: "person@example.com" };
+    await store.add(input, secret);
+    await store.add(
+      { ...input, provider: "codex", codexAccountId: "workspace-1" },
+      secret,
+    );
+
+    expect(await store.list()).toHaveLength(2);
+  });
+
+  it("adds an account when an existing account's secret is unreadable", async () => {
+    await store.add(accountInput, secret);
+    await fs.rm(secretsDir, { recursive: true });
+
+    await store.add(accountInput, rotatedSecret);
+
+    expect(await store.list()).toHaveLength(2);
   });
 
   it("preserves both accounts added concurrently", async () => {
@@ -154,7 +201,7 @@ describe("AccountStore", () => {
     const account = (
       label: string,
     ): Omit<Account, "id" | "createdAt" | "lastUsedAt" | "lastUsedHostId"> => ({
-      ...oauthInput,
+      ...accountInput,
       kind: "api-key",
       label,
     });

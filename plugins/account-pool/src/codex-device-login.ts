@@ -402,14 +402,15 @@ export class CodexDeviceLogin {
       });
       return { status: "complete", account };
     } catch (error) {
+      if (error instanceof DuplicateAccountError) {
+        return { status: "error", message: error.message };
+      }
       return {
         status: "error",
         message:
-          error instanceof DuplicateAccountError
-            ? error.message
-            : error instanceof Error && error.message.startsWith("Codex ")
-              ? `${error.message} Start again.`
-              : "Codex account could not be saved. Start again.",
+          error instanceof Error && error.message.startsWith("Codex ")
+            ? `${error.message} Start again.`
+            : "Codex account could not be saved. Start again.",
       };
     }
   }

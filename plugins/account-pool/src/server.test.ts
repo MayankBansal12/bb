@@ -554,25 +554,6 @@ describe("Account Pool plugin", () => {
     },
   );
 
-  it.each(["claude", "codex"] as const)(
-    "rejects repeated %s machine imports",
-    async (provider) => {
-      const fixture = await createOAuthRequestFixture(
-        provider,
-        async () => Response.json({}),
-        Date.now,
-      );
-      await expect(
-        fixture.host.harness.behavior.callRpc("account.add", {
-          provider,
-          source: { kind: "import" },
-          label: "duplicate",
-          priority: 100,
-        }),
-      ).rejects.toThrow("already connected");
-    },
-  );
-
   it("imports, refreshes, and routes Codex HTTP sessions by provider", async () => {
     const seen: Array<{
       path: string;
