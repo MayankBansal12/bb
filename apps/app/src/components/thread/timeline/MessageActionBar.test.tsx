@@ -17,6 +17,7 @@ import { COMPACT_VIEWPORT_QUERY } from "@bb/shared-ui/hooks/use-compact-viewport
 import { POINTER_COARSE_QUERY } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import {
   findMessageActionTooltipCollisionBoundary,
+  formatShortMessageTime,
   MessageActionBar,
 } from "./MessageActionBar";
 
@@ -162,9 +163,7 @@ describe("MessageActionBar", () => {
         .map((item) => item.textContent),
     ).toEqual(["Copy link", "Add to chat", "Fork into new thread"]);
     expect(menu.getAttribute("data-side")).toBe("bottom");
-    fireEvent.click(
-      within(menu).getByRole("menuitem", { name: "Copy link" }),
-    );
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Copy link" }));
     expect(onCopyLink).toHaveBeenCalledTimes(1);
   });
 
@@ -261,6 +260,38 @@ describe("MessageActionBar", () => {
     expect(time.getAttribute("datetime")).toBe("2026-09-30T16:05:00.000Z");
     expect(time.textContent).not.toBe("");
     expect(metadata?.textContent).not.toMatch(/model|reasoning/i);
+  });
+
+  it("shows the message time beside the actions on fine pointers", () => {
+    render(
+      <MessageActionBar
+        timestamp={TIMESTAMP}
+        messageText="Hi"
+        alignment="end"
+        mobileActionDisplay="inline"
+      />,
+    );
+
+    const time = screen.getByRole("time");
+    expect(time.getAttribute("datetime")).toBe("2026-09-30T16:05:00.000Z");
+    expect(time.textContent).toBe(
+      formatShortMessageTime(TIMESTAMP, new Date()),
+    );
+    expect(time.title).toContain("2026");
+  });
+
+  it("leaves the message time to the menu on coarse pointers", () => {
+    mockMobileCoarsePointer();
+    render(
+      <MessageActionBar
+        timestamp={TIMESTAMP}
+        messageText="An answer."
+        alignment="start"
+        mobileActionDisplay="inline"
+      />,
+    );
+
+    expect(screen.queryByRole("time")).toBeNull();
   });
 
   it("lists every action in the latest touch message drawer even when actions fit inline", async () => {
