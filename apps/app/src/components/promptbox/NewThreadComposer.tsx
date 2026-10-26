@@ -717,6 +717,7 @@ export function NewThreadComposer({
         path: seededReuseEnvironmentRow.path,
         environmentProviderId:
           seededReuseEnvironmentRow.environmentProviderId ?? null,
+        hostId: seededReuseEnvironmentRow.hostId,
         hostName:
           worktreeHostNameById?.get(seededReuseEnvironmentRow.hostId) ?? null,
         threads: [],

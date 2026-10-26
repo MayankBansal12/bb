@@ -92,6 +92,7 @@ export interface EnvironmentPickerUIProps {
   ) => void;
   onSelectHost?: (hostId: string) => void;
   onSelectReuse?: () => void;
+  reusedEnvironmentHostId?: string | null;
 }
 
 export const PROVIDER_INPUTS_CONTROL_MISSING_REASON =
@@ -214,6 +215,7 @@ export function EnvironmentPickerUI({
   onSelectProvider,
   onSelectHost,
   onSelectReuse,
+  reusedEnvironmentHostId = null,
 }: EnvironmentPickerUIProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(
     defaultOpen ?? false,
@@ -236,7 +238,15 @@ export function EnvironmentPickerUI({
           },
     [machines],
   );
-  const availableHost = host?.type === "ephemeral" ? null : host;
+  const parsed = useMemo(() => parseEnvironmentValue(value), [value]);
+  const reusedEnvironmentHost =
+    parsed?.type === "reuse" && reusedEnvironmentHostId !== null
+      ? availableMachines?.hosts.find(
+          (machineHost) => machineHost.id === reusedEnvironmentHostId,
+        )
+      : undefined;
+  const availableHost =
+    reusedEnvironmentHost ?? (host?.type === "ephemeral" ? null : host);
   const hostId = availableHost?.id ?? null;
   const hasMultipleMachines = (availableMachines?.hosts.length ?? 0) > 1;
   const showSearch =
@@ -259,7 +269,6 @@ export function EnvironmentPickerUI({
     : !hostConnected
       ? "Host is offline"
       : null;
-  const parsed = useMemo(() => parseEnvironmentValue(value), [value]);
 
   const selectedMachineName = useMemo(() => {
     if (!hasMultipleMachines || !availableMachines) return null;
@@ -335,11 +344,17 @@ export function EnvironmentPickerUI({
       };
     }
     if (parsed?.type === "reuse") {
-      return {
-        modeLabel: "Reuse",
-        compactModeLabel: "Reuse",
-        icon: REUSE_ENVIRONMENT_ICON_NAME,
-      };
+      return hasMultipleMachines && reusedEnvironmentHost
+        ? {
+            modeLabel: reusedEnvironmentHost.name,
+            compactModeLabel: reusedEnvironmentHost.name,
+            icon: "Laptop" as const,
+          }
+        : {
+            modeLabel: "Reuse",
+            compactModeLabel: "Reuse",
+            icon: REUSE_ENVIRONMENT_ICON_NAME,
+          };
     }
     return {
       modeLabel: "Environment",
@@ -348,6 +363,8 @@ export function EnvironmentPickerUI({
     };
   }, [
     parsed,
+    hasMultipleMachines,
+    reusedEnvironmentHost,
     hostUnavailableReason,
     availableHost,
     selectedMachineName,

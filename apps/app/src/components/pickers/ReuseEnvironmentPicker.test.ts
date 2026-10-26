@@ -32,6 +32,7 @@ const option: ReuseThreadOption = {
   name: null,
   path: "/workspace/bb",
   environmentProviderId: "project-checkout",
+  hostId: "host_m4",
   hostName: "Michael-M4",
   threads: [],
 };

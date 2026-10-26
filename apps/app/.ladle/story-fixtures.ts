@@ -303,6 +303,7 @@ export const STORY_WORKTREE_OPTIONS: readonly ReuseThreadOption[] = [
     name: null,
     path: null,
     environmentProviderId: "git-worktree",
+    hostId: null,
     threads: [
       { id: "thr_review", title: "Review flow cleanup" },
       { id: "thr_tests", title: "Backfill promptbox tests" },
@@ -314,6 +315,7 @@ export const STORY_WORKTREE_OPTIONS: readonly ReuseThreadOption[] = [
     name: "Timeline workspace",
     path: null,
     environmentProviderId: "git-worktree",
+    hostId: null,
     threads: [{ id: "thr_timeline", title: "Timeline pagination" }],
   },
 ];

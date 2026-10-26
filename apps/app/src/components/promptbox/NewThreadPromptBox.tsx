@@ -410,6 +410,10 @@ export function EnvironmentSlot({
         )
       : undefined;
   const showReuseEnvironmentPicker = parsedEnvironment?.type === "reuse";
+  const reusedEnvironmentHostId = showReuseEnvironmentPicker
+    ? worktree.options.find((option) => option.environmentId === worktree.value)
+        ?.hostId
+    : undefined;
   const [environmentPickerOpen, setEnvironmentPickerOpen] = useState(false);
   const showEnvironmentPicker =
     !projectless ||
@@ -445,6 +449,7 @@ export function EnvironmentSlot({
         onSelectProvider={environment.onSelectProvider}
         onSelectHost={environment.onSelectHost}
         onSelectReuse={environment.onSelectReuse}
+        reusedEnvironmentHostId={reusedEnvironmentHostId ?? null}
         className="shrink-0"
         muted
       />

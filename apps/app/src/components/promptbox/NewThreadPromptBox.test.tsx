@@ -234,6 +234,7 @@ describe("EnvironmentSlot", () => {
     value?: string;
     providers?: readonly SystemEnvironmentProvider[];
     machineProviders?: readonly SystemMachineProvider[];
+    hosts?: readonly Host[];
     onSelectProvider?: (
       provider: SystemEnvironmentProvider,
       hostId: string | null,
@@ -245,7 +246,7 @@ describe("EnvironmentSlot", () => {
       host,
       isLocal: true,
       machines: {
-        hosts: [host, secondHost],
+        hosts: overrides.hosts ?? [host, secondHost],
         localDaemonHostId: host.id,
         primaryHostId: host.id,
       },
@@ -257,7 +258,7 @@ describe("EnvironmentSlot", () => {
     };
   }
 
-  function makeWorktree(value: string | null = null) {
+  function makeWorktree(value: string | null = null, hostId = host.id) {
     return {
       options: [
         {
@@ -266,6 +267,7 @@ describe("EnvironmentSlot", () => {
           name: "Scratch space",
           path: null,
           environmentProviderId: "personal-workspace",
+          hostId,
           threads: [{ id: "thr_1", title: "Earlier personal thread" }],
         },
       ],
@@ -348,8 +350,65 @@ describe("EnvironmentSlot", () => {
     expect(screen.queryByRole("button", { name: "Machine" })).toBeNull();
     const triggers = screen.getAllByRole("button", { name: "Environment" });
     expect(triggers).toHaveLength(2);
-    expect(triggers[0]?.textContent).toContain("Reuse");
+    expect(triggers[0]?.textContent).toContain("Local host");
     expect(triggers[1]?.textContent).toContain("Scratch space");
+  });
+
+  it("names and marks the machine the reused environment lives on, not the primary one", () => {
+    const thirdHost: Host = { ...host, id: "host_third", name: "Build box" };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <EnvironmentSlot
+          projectless={false}
+          environment={makeEnvironment({
+            value: "reuse:env_personal",
+            providers: [sandboxProvider],
+            hosts: [host, secondHost, thirdHost],
+          })}
+          worktree={makeWorktree("env_personal", secondHost.id)}
+        />
+      </QueryClientProvider>,
+    );
+
+    const [machineTrigger] = screen.getAllByRole("button", {
+      name: "Environment",
+    });
+    expect(machineTrigger?.textContent).toContain("Mac Studio");
+    fireEvent.click(machineTrigger!, { button: 0 });
+    expect(screen.getByText("On Mac Studio")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("option", { name: "Mac Studio" })
+        .getAttribute("aria-current"),
+    ).toBe("true");
+    expect(
+      screen
+        .getByRole("option", { name: "Local host" })
+        .getAttribute("aria-current"),
+    ).toBeNull();
+  });
+
+  it("keeps the Reuse label until the reused environment's machine is known", () => {
+    const thirdHost: Host = { ...host, id: "host_third", name: "Build box" };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <EnvironmentSlot
+          projectless={false}
+          environment={makeEnvironment({
+            value: "reuse",
+            providers: [sandboxProvider],
+            hosts: [host, secondHost, thirdHost],
+          })}
+          worktree={makeWorktree(null, secondHost.id)}
+        />
+      </QueryClientProvider>,
+    );
+
+    const [machineTrigger] = screen.getAllByRole("button", {
+      name: "Environment",
+    });
+    expect(machineTrigger?.textContent).toContain("Reuse");
+    expect(machineTrigger?.textContent).not.toContain("Local host");
   });
 
   it("keeps an open environment menu mounted while project scope replays", () => {
