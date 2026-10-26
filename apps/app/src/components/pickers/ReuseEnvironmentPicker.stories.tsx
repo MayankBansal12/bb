@@ -21,6 +21,7 @@ function makeOption(
     name: null,
     path: `/Users/michael/worktrees/${branchName}`,
     environmentProviderId: "git-worktree",
+    hostId: null,
     hostName,
     threads: threadTitles.map((title, index) => ({
       id: `thr_${branchName}_${index}`,

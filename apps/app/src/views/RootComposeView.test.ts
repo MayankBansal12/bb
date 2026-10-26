@@ -427,6 +427,7 @@ function makeReuseThreadOption(environmentId: string): ReuseThreadOption {
     name: null,
     path: null,
     environmentProviderId: "git-worktree",
+    hostId: null,
     threads: [{ id: "thr_1", title: "Thread" }],
   };
 }
