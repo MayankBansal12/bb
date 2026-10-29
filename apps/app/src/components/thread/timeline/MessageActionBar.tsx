@@ -190,7 +190,11 @@ const ACTION_TOOLTIP_SIDE = "bottom";
 const MENU_CONTENT_WIDTH_CLASS = "max-w-[min(16rem,calc(100vw-1rem))]";
 
 const ACTION_ROW_CLASS =
-  "absolute top-0 flex max-w-full items-center gap-2 overflow-hidden data-[menu-open]:[&_button]:opacity-100";
+  "flex max-w-full items-center gap-2 overflow-hidden data-[menu-open]:[&_button]:opacity-100";
+const INLINE_TIME_CLASS = cn(
+  "absolute top-0 whitespace-nowrap text-xs leading-5 tabular-nums text-subtle-foreground",
+  HOVER_REVEAL_CLASS,
+);
 
 const BUBBLE_ALIGN_INSET_CLASS = "pr-[13px] max-md:pointer-coarse:pr-[11px]";
 const BUBBLE_ALIGN_OFFSET_CLASS =
@@ -274,35 +278,56 @@ function formatMessageDay(date: Date, now: Date): string {
   });
 }
 
-export function formatShortMessageTime(timestamp: number, now: Date): string {
-  const date = new Date(timestamp);
-  const time = date.toLocaleTimeString(undefined, {
+function formatClockTime(date: Date): string {
+  return date.toLocaleTimeString(undefined, {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+export function formatShortMessageTime(timestamp: number, now: Date): string {
+  const date = new Date(timestamp);
+  const time = formatClockTime(date);
   return date.toDateString() === now.toDateString()
     ? time
     : `${formatMessageDay(date, now)}, ${time}`;
 }
 
+export function MessageTime({
+  timestamp,
+  label,
+  className,
+}: {
+  timestamp: number;
+  label: string;
+  className?: string;
+}) {
+  const date = new Date(timestamp);
+  return (
+    <time
+      className={className}
+      dateTime={date.toISOString()}
+      title={date.toLocaleString(undefined, {
+        dateStyle: "full",
+        timeStyle: "long",
+      })}
+    >
+      {label}
+    </time>
+  );
+}
+
 function MessageTimestampFooter({ timestamp }: { timestamp: number }) {
   const date = new Date(timestamp);
-  const time = date.toLocaleTimeString(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-  const fullDate = date.toLocaleString(undefined, {
-    dateStyle: "full",
-    timeStyle: "long",
-  });
   return (
     <div
       className="mt-1 border-t border-border px-2 pt-2 pb-1 text-xs text-subtle-foreground"
       data-message-metadata=""
     >
-      <time dateTime={date.toISOString()} title={fullDate}>
-        {formatMessageDay(date, new Date())}, {time}
-      </time>
+      <MessageTime
+        timestamp={timestamp}
+        label={`${formatMessageDay(date, new Date())}, ${formatClockTime(date)}`}
+      />
     </div>
   );
 }
@@ -434,8 +459,8 @@ export function MessageActionBar({
     ...trailingMenuActions,
   ];
 
-  const rowClass = cn(
-    ACTION_ROW_CLASS,
+  const anchorClass = cn(
+    "absolute top-0 max-w-full",
     alignment === "end"
       ? BUBBLE_ALIGN_OFFSET_CLASS
       : cn("left-0", PROSE_ALIGN_INSET_CLASS),
@@ -451,49 +476,64 @@ export function MessageActionBar({
         ref={slotRef}
         className={cn(slotClass, "h-5 max-md:pointer-coarse:h-7")}
       >
-        <div className={rowClass} data-menu-open={isMenuOpen ? "" : undefined}>
-          {isCompactTouch ? (
-            <MobileInlineActions
-              actions={inlineCandidates.slice(0, inlineCount)}
-            />
-          ) : (
-            inlineCandidates
-              .slice(0, inlineCount)
-              .map((action) => (
-                <DesktopMessageAction
-                  key={action.key ?? action.label}
-                  action={action}
-                  className={cn(HOVER_REVEAL_CLASS, mobileDirectActionClass)}
-                  collisionBoundary={collisionBoundary}
-                />
-              ))
-          )}
-          <DropdownMenu onOpenChange={setIsMenuOpen}>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  MOBILE_INLINE_ACTION_CLASS,
-                  inlineCount > 0 && OVERFLOW_TRIGGER_TIGHTEN_CLASS,
-                  "data-[state=open]:text-foreground data-[state=open]:opacity-100",
-                )}
-                aria-label="Message actions"
-                data-no-sidebar-swipe=""
+        <div className={anchorClass}>
+          <div
+            className={ACTION_ROW_CLASS}
+            data-menu-open={isMenuOpen ? "" : undefined}
+          >
+            {isCompactTouch ? (
+              <MobileInlineActions
+                actions={inlineCandidates.slice(0, inlineCount)}
+              />
+            ) : (
+              inlineCandidates
+                .slice(0, inlineCount)
+                .map((action) => (
+                  <DesktopMessageAction
+                    key={action.key ?? action.label}
+                    action={action}
+                    className={cn(HOVER_REVEAL_CLASS, mobileDirectActionClass)}
+                    collisionBoundary={collisionBoundary}
+                  />
+                ))
+            )}
+            <DropdownMenu onOpenChange={setIsMenuOpen}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    ACTION_BUTTON_CLASS,
+                    HOVER_REVEAL_CLASS,
+                    MOBILE_INLINE_ACTION_CLASS,
+                    inlineCount > 0 && OVERFLOW_TRIGGER_TIGHTEN_CLASS,
+                    "data-[state=open]:text-foreground data-[state=open]:opacity-100",
+                  )}
+                  aria-label="Message actions"
+                  data-no-sidebar-swipe=""
+                >
+                  <Icon name="MoreHorizontal" className="size-3" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align={alignment === "end" ? "end" : "start"}
+                mobileTitle="Message actions"
+                className={MENU_CONTENT_WIDTH_CLASS}
               >
-                <Icon name="MoreHorizontal" className="size-3" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align={alignment === "end" ? "end" : "start"}
-              mobileTitle="Message actions"
-              className={MENU_CONTENT_WIDTH_CLASS}
-            >
-              <MessageActionMenuItems actions={menuActions} />
-              <MessageTimestampFooter timestamp={timestamp} />
-            </DropdownMenuContent>
-          </DropdownMenu>
+                <MessageActionMenuItems actions={menuActions} />
+                <MessageTimestampFooter timestamp={timestamp} />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+          {isPointerCoarse ? null : (
+            <MessageTime
+              timestamp={timestamp}
+              label={formatShortMessageTime(timestamp, new Date())}
+              className={cn(
+                INLINE_TIME_CLASS,
+                alignment === "end" ? "right-full mr-2" : "left-full ml-2",
+              )}
+            />
+          )}
         </div>
       </div>
     </TooltipProvider>
